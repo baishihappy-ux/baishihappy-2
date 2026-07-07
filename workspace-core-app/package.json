@@ -1,0 +1,26 @@
+{
+  "name": "workspace-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-profile web workspace core.",
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "vue-tsc --noEmit && vite build && tsc -p electron/tsconfig.json",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "electron": "35.5.1",
+    "vue": "^3.5.17"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0",
+    "cross-env": "^7.0.3",
+    "typescript": "^5.8.3",
+    "vite": "^5.4.19",
+    "vue-tsc": "^2.2.10",
+    "wait-on": "^8.0.3"
+  }
+}
