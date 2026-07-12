@@ -1,6 +1,18 @@
-node_modules/
+.runtime/
+.tmp/
+.package-secrets/
 dist/
 dist-electron/
+release/
+node_modules/
 *.log
 
-look world/
+# Customer/runtime/security outputs
+TranslationCache/
+SignalInstances/
+Partitions/
+taozhuang/
+license.dat
+*.exe
+*.zip
+*.7z

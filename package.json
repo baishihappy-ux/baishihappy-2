@@ -1,0 +1,98 @@
+{
+  "name": "maoyi",
+  "productName": "maoyi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "maoyi international chat translation workspace.",
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "vue-tsc --noEmit && vite build && tsc -p electron/tsconfig.json",
+    "start": "electron .",
+    "start:issuer": "npm run build && electron dist-electron/license-issuer.js",
+    "test:license-core": "npm run build && node tools/test-license-core.mjs",
+    "test:runtime-security": "npm run build && node tools/test-runtime-security.mjs",
+    "test:signal-control": "npm run build && node tools/patch-signal-control-channel.cjs --rebuild-from-backup && node tools/test-signal-control-channel.cjs",
+    "test:signal-render-cache": "node tools/test-signal-render-cache-runtime.cjs",
+    "test:electron-fuses": "node tools/test-electron-fuses.cjs",
+    "test:electron-smoke": "npm run build && node tools/test-electron-smoke.cjs",
+    "test:security": "npm run build && npm run security:check && node tools/test-license-core.mjs && node tools/test-runtime-security.mjs && node tools/test-translation-cache-crypto.mjs && node tools/test-payment-address.mjs && node tools/test-sensitive-send-authorization.mjs && npm run test:electron-fuses",
+    "prepare:signal-runtime": "node tools/patch-signal-control-channel.cjs",
+    "suite:create": "node tools/create-license-suite.cjs",
+    "suite:package": "node tools/package-license-suite.cjs",
+    "prepare:client-suite": "node tools/prepare-client-license-suite.cjs",
+    "security:check": "node tools/security-gate.cjs",
+    "package:win": "node tools/prepare-client-license-suite.cjs && npm run prepare:signal-runtime && npm run build && npm run security:check && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "@electron/asar": "^4.2.0",
+    "@electron/fuses": "2.1.3",
+    "@vitejs/plugin-vue": "6.0.7",
+    "concurrently": "^9.2.0",
+    "cross-env": "^7.0.3",
+    "electron": "43.1.0",
+    "electron-builder": "26.15.3",
+    "typescript": "^5.8.3",
+    "vite": "8.1.4",
+    "vue": "^3.5.17",
+    "vue-tsc": "^2.2.10",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.maoyi.translator",
+    "productName": "maoyi",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/main.js",
+      "dist-electron/client-license.js",
+      "dist-electron/license-core.js",
+      "dist-electron/clone-reset.js",
+      "dist-electron/runtime-security.js",
+      "dist-electron/runtime-security-core.js",
+      "dist-electron/translation-cache-crypto.js",
+      "dist-electron/payment-address.js",
+      "dist-electron/sensitive-send-authorization.js",
+      "dist-electron/shared.js",
+      "electron/preload.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".package-secrets/client-license-suite.json",
+        "to": "license-suite-public.json"
+      },
+      {
+        "from": ".runtime/signal-desktop",
+        "to": "signal",
+        "filter": [
+          "**/*",
+          "!resources/app.before-signal-control.asar",
+          "!resources/app.before-signal-control.asar.unpacked/**/*",
+          "!resources/df-runtime-binding.dat"
+        ]
+      }
+    ],
+    "afterPack": "./tools/electron-builder-after-pack.cjs",
+    "win": {
+      "target": "nsis",
+      "artifactName": "maoyi-${version}-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "maoyi"
+    }
+  },
+  "dependencies": {
+    "@noble/hashes": "2.2.0",
+    "@scure/base": "2.2.0"
+  }
+}

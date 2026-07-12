@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Before Implementation"
+  short_description: "Confirm critical design before coding"
+  default_prompt: "Use -before-implementation to confirm the design, parameters, and validation plan before changing critical code."

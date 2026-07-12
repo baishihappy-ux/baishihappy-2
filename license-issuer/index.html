@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>授权程序</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">maoyi</div>
+          <h1>授权程序</h1>
+        </div>
+        <div class="window-actions">
+          <button id="minimizeBtn" class="window-minimize" title="最小化" aria-label="最小化"></button>
+          <button id="closeBtn" title="关闭">×</button>
+        </div>
+      </header>
+
+      <main>
+        <section id="setupPanel" class="panel hidden">
+          <h2>首次设置授权程序密码</h2>
+          <p class="notice">该密码用于保护授权程序，请务必牢记。密码遗失后无法进入授权程序。</p>
+          <label>设置密码<input id="setupPassword" type="password" autocomplete="new-password" /></label>
+          <label>确认密码<input id="setupPasswordConfirm" type="password" autocomplete="new-password" /></label>
+          <button id="setupBtn" class="primary">保存密码</button>
+        </section>
+
+        <section id="loginPanel" class="panel hidden">
+          <h2>授权程序登录</h2>
+          <p id="lockText" class="notice hidden"></p>
+          <label>授权程序密码<input id="loginPassword" type="password" autocomplete="current-password" /></label>
+          <button id="loginBtn" class="primary">进入授权程序</button>
+        </section>
+
+        <section id="issuerPanel" class="panel hidden">
+          <div class="suite">
+            <span>套装 ID</span><strong id="suiteIdText">-</strong>
+            <span>密钥 ID</span><strong id="keyIdText">-</strong>
+          </div>
+          <div class="grid">
+            <label>本机码<textarea id="machineCode" rows="3"></textarea></label>
+            <label>用户名<input id="username" /></label>
+            <label>请输入密钥<textarea id="serviceSecret" rows="3"></textarea></label>
+            <label>授权天数<input id="authorizedDays" type="number" min="1" value="30" /></label>
+          </div>
+          <button id="issueBtn" class="primary">生成授权码</button>
+
+          <div id="resultPanel" class="result hidden">
+            <div class="result-header">
+              <h2>授权码</h2>
+              <div>
+                <button id="copyCodeBtn">复制授权码</button>
+                <button id="saveDatBtn">保存 license.dat</button>
+              </div>
+            </div>
+            <textarea id="licenseCode" rows="8" readonly></textarea>
+          </div>
+        </section>
+
+        <p id="statusText" class="status"></p>
+      </main>
+    </div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>
