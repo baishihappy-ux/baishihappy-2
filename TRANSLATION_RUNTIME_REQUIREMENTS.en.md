@@ -169,7 +169,7 @@ Parameters:
 
 Acceptance:
 
-- Short messages such as `Talk to you later`, `Just checking in`, and `See you soon` must not be filtered out.
+- Short messages such as `No voice. So sad`, `Nothing just a voice message`, and `Happy Ending` must not be filtered out.
 - Composer placeholders and chat lists must not be translated as bubbles.
 
 ### 2. Instant Cache Display
@@ -319,7 +319,7 @@ Parameters:
 
 Acceptance:
 
-- Records like `Meeting is over` translated as `Meeting is over` must not keep displaying.
+- Records like `Race is over` translated as `Race is over` must not keep displaying.
 
 ### 8. Conversation Identity
 

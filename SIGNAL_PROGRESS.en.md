@@ -5,7 +5,7 @@
 Confirmed:
 
 - A local official Signal Desktop executable was available during early research.
-- The competitor embeds its own Signal runtime under `external-reference-runtime\signal\Signal.exe`.
+- The competitor embeds its own Signal runtime under `look-world-pro-embed\signal\Signal.exe`.
 - This project added an initial Signal launch path that starts `Signal.exe` with a per-profile `--user-data-dir`.
 - Closing a Signal profile must stop the corresponding Signal child process and remove the matching `signalDataDir` only when the profile is deleted.
 - `npm.cmd run build` passed during that stage.

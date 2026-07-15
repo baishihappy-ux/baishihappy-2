@@ -21,6 +21,20 @@ async function main() {
   if (!fsSync.existsSync(asarPath)) throw new Error(`app.asar was not found: ${asarPath}`);
 
   if (exeHashOverride && !/^[a-f0-9]{64}$/i.test(exeHashOverride)) throw new Error('Invalid --exe-old-hash value.');
+  if (await isSourceHardenedAsar(asarPath)) {
+    const currentHeaderHash = headerHash(asarPath);
+    console.log(JSON.stringify({
+      runtimeDir,
+      patched: true,
+      sourceHardened: true,
+      rebuildFromBackup: false,
+      usedExeHashOverride: false,
+      changes: [],
+      oldHeaderHash: currentHeaderHash,
+      newHeaderHash: currentHeaderHash
+    }, null, 2));
+    return;
+  }
   const oldHeaderHash = exeHashOverride || headerHash(asarPath);
   if (!fsSync.existsSync(backupPath)) {
     await fs.copyFile(asarPath, backupPath);
@@ -225,6 +239,31 @@ async function main() {
     oldHeaderHash,
     newHeaderHash
   }, null, 2));
+}
+
+async function isSourceHardenedAsar(asarPath) {
+  try {
+    const entries = await asar.listPackage(asarPath);
+    const bridgeEntry = entries.find((entry) => entry.includes('messageBridge.main-') && entry.includes('bundles'));
+    if (!bridgeEntry) return false;
+    const extract = async (entry) => Buffer.from(await asar.extractFile(asarPath, entry.replace(/^[/\\]/, ''))).toString('utf8');
+    const packageJson = JSON.parse(await extract('package.json'));
+    const production = JSON.parse(await extract('config/local-production.json'));
+    const main = await extract('bundles/main.js');
+    const bridge = await extract(bridgeEntry);
+    return Boolean(
+      packageJson.main === 'bundles/main.js' &&
+      production.updatesEnabled === false &&
+      main.includes('dfLaunchPipe') &&
+      main.includes('local-direct-blocked') &&
+      main.includes('credential-accepted') &&
+      bridge.includes('maoyi-signal-control-auth-v1') &&
+      bridge.includes('script.execute') &&
+      bridge.includes('security.visibility')
+    );
+  } catch {
+    return false;
+  }
 }
 
 function headerHash(asarPath) {

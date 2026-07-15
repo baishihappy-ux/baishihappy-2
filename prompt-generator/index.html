@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>提示词文件生成器</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">maoyi</div>
+          <h1>提示词文件生成器</h1>
+        </div>
+        <div class="window-actions">
+          <button id="minimize" class="window-minimize" title="最小化" aria-label="最小化"></button>
+          <button id="close" title="关闭" aria-label="关闭">×</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="panel">
+          <p class="notice">此工具仅供内部使用。输入内容只在本机内存中用于生成加密文件，不会联网或自动保存。</p>
+          <p class="replace-hint"><strong>客户端替换位置：</strong>客户端安装目录\resources\translation-prompts.dfp<br />请完全退出maoyi，再替换原文件并重新启动。文件放在 EXE 根目录不会生效。</p>
+          <label>客户端当前密钥
+            <span class="secret-row"><input id="secret" type="password" autocomplete="off" spellcheck="false" /><button id="toggle-secret" type="button">显示</button></span>
+          </label>
+          <div class="grid prompt-grid">
+            <label>中译英提示词<textarea id="zh-en" rows="12" spellcheck="false"></textarea><small id="zh-en-count">0 字符</small></label>
+            <label>英译中提示词<textarea id="en-zh" rows="12" spellcheck="false"></textarea><small id="en-zh-count">0 字符</small></label>
+          </div>
+          <button id="generate" class="primary">生成加密提示词文件</button>
+        </section>
+        <p id="status" class="status" role="status"></p>
+      </main>
+    </div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

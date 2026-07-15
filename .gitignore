@@ -1,18 +1,16 @@
 .runtime/
 .tmp/
 .package-secrets/
+.package-staging/
 dist/
 dist-electron/
 release/
+internal-tools/*.exe
 node_modules/
 *.log
 
-# Customer/runtime/security outputs
-TranslationCache/
-SignalInstances/
-Partitions/
-taozhuang/
-license.dat
-*.exe
-*.zip
-*.7z
+# The exact Signal 8.18.0 source archive is retained for disaster recovery.
+# Extracted sources and generated build trees remain local-only.
+reference-sources/*/
+reference-sources/*.zip
+!reference-sources/Signal-Desktop-v8.18.0.zip

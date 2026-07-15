@@ -7,7 +7,7 @@
 - Packaged applications disable RunAsNode, NODE_OPTIONS, Node inspection, and related Electron Fuses while enabling ASAR integrity and OnlyLoadAppFromAsar.
 - The renderer no longer receives the service secret. Customer packages exclude trial secret files, issuer private keys, and issuer entry points.
 - The obsolete `prepare-trial-config.cjs` tool that extracted a plaintext key from legacy configuration is removed and covered by a regression gate.
-- Licensing now uses `MYM2 + MYLIC2`: DPAPI protects the device X25519 key, X25519/HKDF-SHA256/AES-256-GCM encrypts the payload, and the suite Ed25519 key signs the complete envelope.
+- Licensing now uses `DFM2 + DFLIC2`: DPAPI protects the device X25519 key, X25519/HKDF-SHA256/AES-256-GCM encrypts the payload, and the suite Ed25519 key signs the complete envelope.
 - Disk translation cache now uses `TranslationCache/v3`: each record has independent AES-256-GCM encryption, and the DPAPI-protected key is bound to the suite and data root. Legacy plaintext cache is deleted rather than migrated.
 - The main renderer and fingerprint-browser pages no longer persist translation plaintext in `localStorage`. Page-side rendering keeps only an in-process hot cache capped at 1,500 entries or 15 MB; restart recovery is batched from the machine-bound encrypted `TranslationCache/v3`.
 - The main-renderer legacy key is removed at startup, WhatsApp/Telegram keys are removed when their WebViews become ready, and each Signal key is removed on that instance's next authorized launch. Cleanup does not migrate translations or clear platform login state.
@@ -27,7 +27,7 @@
 
 - Verify translated second-Enter dispatch and post-send bubble comparison in real WhatsApp, Telegram, and Signal sessions.
 - On all three platforms, verify numeric accounts, TRC20, ERC20/BEP20 network selection, and Solana through first confirmation, second dispatch, and invalidation after any content change.
-- In a future full-suite output, verify issuer-side `MYLIC2` issuance, client activation, restart verification, and actual uninstall on the fifth invalid code.
+- In a future full-suite output, verify issuer-side `DFLIC2` issuance, client activation, restart verification, and actual uninstall on the fifth invalid code.
 - Verify foreign Signal and full data-root initialization on a second physical Windows computer.
 
 ## Serverless Boundary

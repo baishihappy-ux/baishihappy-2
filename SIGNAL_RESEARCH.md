@@ -9,13 +9,13 @@
 参考目录：
 
 ```text
-<external-reference-root>\
+D:\DF fanyiqi\look world\look-world-pro-embed\
 ```
 
 关键结构：
 
 ```text
-external-reference-runtime/
+look-world-pro-embed/
   signal/
     Signal.exe
     resources/app.asar
@@ -47,7 +47,7 @@ external-reference-runtime/
 ```text
 Signal.exe
   --proxy=
-  --user-data-dir=<external-reference-root>\Signal-Zh1T4pyBHEc6NK3wDkpR_
+  --user-data-dir=D:\DF fanyiqi\look world\look-world-pro-embed\Signal-Zh1T4pyBHEc6NK3wDkpR_
   --appId=Signal-Zh1T4pyBHEc6NK3wDkpR_
   --wsPort=23510
   --title=Signal01
@@ -59,7 +59,7 @@ Signal.exe
 ```text
 Signal.exe
   --proxy=
-  --user-data-dir=<external-reference-root>\Signal-ux5d6dbL17c1vQCUsUDSG
+  --user-data-dir=D:\DF fanyiqi\look world\look-world-pro-embed\Signal-ux5d6dbL17c1vQCUsUDSG
   --appId=Signal-ux5d6dbL17c1vQCUsUDSG
   --wsPort=23510
   --title=Signal03
@@ -112,7 +112,7 @@ ws://localhost:${wsPort}?appId=${appId}
 5. 主程序启动内置：
 
    ```text
-   external-reference-runtime\signal\Signal.exe
+   look-world-pro-embed\signal\Signal.exe
    ```
 
 6. 启动时带上：

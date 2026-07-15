@@ -20,21 +20,19 @@ module.exports = {
     'dist-electron/translation-cache-crypto.js',
     'dist-electron/payment-address.js',
     'dist-electron/sensitive-send-authorization.js',
+    'dist-electron/translation-sensitive-tokens.js',
+    'dist-electron/translation-prompt-bundle.js',
+    'dist-electron/translation-english-style.js',
     'dist-electron/shared.js',
     'electron/preload.cjs',
     'package.json'
   ],
   extraResources: [
     { from: '.package-secrets/client-license-suite.json', to: 'license-suite-public.json' },
+    { from: '.package-secrets/translation-prompts.dfp', to: 'translation-prompts.dfp' },
     {
-      from: '.runtime/signal-desktop',
-      to: 'signal',
-      filter: [
-        '**/*',
-        '!resources/app.before-signal-control.asar',
-        '!resources/app.before-signal-control.asar.unpacked/**/*',
-        '!resources/df-runtime-binding.dat'
-      ]
+      from: '.package-staging/signal',
+      to: 'signal'
     }
   ],
   afterPack: './tools/electron-builder-after-pack.cjs',

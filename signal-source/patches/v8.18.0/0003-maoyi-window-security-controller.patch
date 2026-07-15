@@ -1,0 +1,1923 @@
+diff --git a/app/maoyi/bootstrap.main.ts b/app/maoyi/bootstrap.main.ts
+index 850facd86a28e8d5610392939def3920f13c502c..b8eccb4ea36c7a4a575abcc8e7b84569e2354058 100644
+--- a/app/maoyi/bootstrap.main.ts
++++ b/app/maoyi/bootstrap.main.ts
+@@ -1,3 +1,4 @@
++// Copyright 2026 Signal Messenger, LLC
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import { createRequire } from 'node:module';
+@@ -6,13 +7,18 @@ import { app, dialog } from 'electron';
+ 
+ import { startMaoyiControlBridge } from './controlBridge.main.ts';
+ import { runMaoyiStartupGuard } from './launchGuard.main.ts';
++import { startMaoyiWindowController } from './windowController.main.ts';
+ 
+ try {
+   if (runMaoyiStartupGuard(app, dialog)) {
+     const controlBridge = startMaoyiControlBridge();
++    const windowController = startMaoyiWindowController(controlBridge);
+     app.once('before-quit', () => {
++      windowController.stop();
+       controlBridge.stop();
+     });
++    // The bootstrap and signal-main bundles are emitted into the same directory.
++    // oxlint-disable-next-line no-restricted-globals
+     createRequire(__filename)(join(__dirname, 'signal-main.js'));
+   }
+ } catch {
+diff --git a/app/maoyi/controlBridge.main.ts b/app/maoyi/controlBridge.main.ts
+index 432fea7dd7152d9a47e33c49c60496280662f572..f66c9317df438b97f34e8874e728179fb17b8763 100644
+--- a/app/maoyi/controlBridge.main.ts
++++ b/app/maoyi/controlBridge.main.ts
+@@ -1,3 +1,4 @@
++// Copyright 2026 Signal Messenger, LLC
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import {
+@@ -10,13 +11,15 @@ import {
+   verifyMaoyiLauncherEnvelope,
+   type MaoyiControlCommand,
+   type MaoyiControlEvent,
+-} from './controlProtocol.main.ts';
++} from './controlProtocol.node.ts';
+ import { takeMaoyiLaunchContext } from './launchContext.main.ts';
+ 
+ const controlBridgeKey = Symbol.for('maoyi.signal.control-bridge.v1');
+ 
+ export type MaoyiControlBridge = Readonly<{
+   onCommand: (handler: (command: MaoyiControlCommand) => void) => () => void;
++  onTransportState: (handler: (authenticated: boolean) => void) => () => void;
++  setHeartbeatVisibleProvider: (provider: () => boolean) => void;
+   send: (event: MaoyiControlEvent) => boolean;
+   stop: () => void;
+ }>;
+@@ -51,6 +54,8 @@ export function startMaoyiControlBridge(): MaoyiControlBridge {
+   const controlKey = Buffer.from(context.controlKey);
+   context.controlKey.fill(0);
+   const handlers = new Set<(command: MaoyiControlCommand) => void>();
++  const transportStateHandlers = new Set<(authenticated: boolean) => void>();
++  let heartbeatVisibleProvider = (): boolean => false;
+   let socket: WebSocket | undefined;
+   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+@@ -59,6 +64,16 @@ export function startMaoyiControlBridge(): MaoyiControlBridge {
+   let sendSequence = 0;
+   let receiveSequence = 0;
+ 
++  const notifyTransportState = (state: boolean): void => {
++    for (const handler of transportStateHandlers) {
++      try {
++        handler(state);
++      } catch {
++        // Transport observers cannot weaken or stop the authenticated bridge.
++      }
++    }
++  };
++
+   const clearTimers = (): void => {
+     if (reconnectTimer) {
+       clearTimeout(reconnectTimer);
+@@ -101,6 +116,8 @@ export function startMaoyiControlBridge(): MaoyiControlBridge {
+     }
+     socket = undefined;
+     handlers.clear();
++    transportStateHandlers.clear();
++    heartbeatVisibleProvider = (): boolean => false;
+     controlKey.fill(0);
+     Reflect.deleteProperty(globalThis, controlBridgeKey);
+   };
+@@ -161,9 +178,15 @@ export function startMaoyiControlBridge(): MaoyiControlBridge {
+           )
+         );
+         authenticated = true;
+-        send({ type: 'ready', title: context.title || undefined });
++        notifyTransportState(true);
+         heartbeatTimer = setInterval(() => {
+-          send({ type: 'heartbeat', visible: false });
++          let visible = false;
++          try {
++            visible = heartbeatVisibleProvider();
++          } catch {
++            // A status provider cannot interrupt transport liveness.
++          }
++          send({ type: 'heartbeat', visible });
+         }, maoyiControlHeartbeatMs);
+         heartbeatTimer.unref();
+         return;
+@@ -195,6 +218,7 @@ export function startMaoyiControlBridge(): MaoyiControlBridge {
+     });
+     socket.addEventListener('close', () => {
+       authenticated = false;
++      notifyTransportState(false);
+       if (heartbeatTimer) {
+         clearInterval(heartbeatTimer);
+         heartbeatTimer = undefined;
+@@ -213,6 +237,16 @@ export function startMaoyiControlBridge(): MaoyiControlBridge {
+         handlers.delete(handler);
+       };
+     },
++    onTransportState(handler: (authenticated: boolean) => void) {
++      transportStateHandlers.add(handler);
++      handler(authenticated);
++      return () => {
++        transportStateHandlers.delete(handler);
++      };
++    },
++    setHeartbeatVisibleProvider(provider: () => boolean) {
++      heartbeatVisibleProvider = provider;
++    },
+     send,
+     stop,
+   });
+diff --git a/app/maoyi/controlProtocol.main.ts b/app/maoyi/controlProtocol.main.ts
+deleted file mode 100644
+index 39f526a497e37cd0ecf96d4e51102ebcd3df828e..0000000000000000000000000000000000000000
+--- a/app/maoyi/controlProtocol.main.ts
++++ /dev/null
+@@ -1,332 +0,0 @@
+-// SPDX-License-Identifier: AGPL-3.0-only
+-
+-import { createHmac, timingSafeEqual } from 'node:crypto';
+-
+-export const maoyiControlProtocolVersion = 1;
+-export const maoyiControlMaxMessageBytes = 1024 * 1024;
+-export const maoyiControlHeartbeatMs = 5_000;
+-export const maoyiControlReconnectMs = 1_000;
+-
+-export type MaoyiWindowBounds = Readonly<{
+-  x: number;
+-  y: number;
+-  width: number;
+-  height: number;
+-}>;
+-
+-export type MaoyiControlCommand =
+-  | Readonly<{ type: 'hello'; appId: string; at: number }>
+-  | Readonly<{ type: 'heartbeat.ack'; at: number }>
+-  | Readonly<{ type: 'window.show'; bounds?: MaoyiWindowBounds }>
+-  | Readonly<{ type: 'window.focus' }>
+-  | Readonly<{ type: 'window.hide' }>
+-  | Readonly<{
+-      type: 'window.bounds-changed';
+-      bounds: MaoyiWindowBounds;
+-    }>
+-  | Readonly<{ type: 'protocol.open'; url: string; requestId?: string }>
+-  | Readonly<{ type: 'shutdown' }>
+-  | Readonly<{ type: 'script.execute'; requestId: string; script: string }>;
+-
+-export type MaoyiControlEvent =
+-  | Readonly<{ type: 'ready'; title?: string }>
+-  | Readonly<{ type: 'heartbeat'; visible: boolean }>
+-  | Readonly<{ type: 'transport.error'; code: string }>;
+-
+-type MaoyiControlPayload<T> = Readonly<{
+-  appId: string;
+-  at: number;
+-}> &
+-  T;
+-
+-type MaoyiControlEnvelope<T> = Readonly<{
+-  version: 1;
+-  sequence: number;
+-  payload: T;
+-  mac: string;
+-}>;
+-
+-type MaoyiAuthChallenge = Readonly<{
+-  type: 'auth.challenge';
+-  appId: string;
+-  challenge: string;
+-}>;
+-
+-function isRecord(value: unknown): value is Record<string, unknown> {
+-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+-}
+-
+-function hasOnlyKeys(
+-  value: Record<string, unknown>,
+-  allowed: ReadonlyArray<string>
+-): boolean {
+-  const allowedKeys = new Set(allowed);
+-  return Object.keys(value).every(key => allowedKeys.has(key));
+-}
+-
+-function isFiniteIntegerInRange(
+-  value: unknown,
+-  minimum: number,
+-  maximum: number
+-): value is number {
+-  return (
+-    typeof value === 'number' &&
+-    Number.isFinite(value) &&
+-    Number.isInteger(value) &&
+-    value >= minimum &&
+-    value <= maximum
+-  );
+-}
+-
+-function parseBounds(value: unknown): MaoyiWindowBounds | undefined {
+-  if (
+-    !isRecord(value) ||
+-    !hasOnlyKeys(value, ['x', 'y', 'width', 'height']) ||
+-    !isFiniteIntegerInRange(value.x, -100_000, 100_000) ||
+-    !isFiniteIntegerInRange(value.y, -100_000, 100_000) ||
+-    !isFiniteIntegerInRange(value.width, 1, 20_000) ||
+-    !isFiniteIntegerInRange(value.height, 1, 20_000)
+-  ) {
+-    return undefined;
+-  }
+-  return {
+-    x: value.x,
+-    y: value.y,
+-    width: value.width,
+-    height: value.height,
+-  };
+-}
+-
+-function isBoundedString(
+-  value: unknown,
+-  maximumBytes: number
+-): value is string {
+-  return (
+-    typeof value === 'string' &&
+-    Buffer.byteLength(value, 'utf8') <= maximumBytes
+-  );
+-}
+-
+-export function parseMaoyiControlCommand(
+-  value: unknown
+-): MaoyiControlCommand | undefined {
+-  if (!isRecord(value) || typeof value.type !== 'string') {
+-    return undefined;
+-  }
+-
+-  switch (value.type) {
+-    case 'hello':
+-      if (
+-        hasOnlyKeys(value, ['type', 'appId', 'at']) &&
+-        isBoundedString(value.appId, 160) &&
+-        isFiniteIntegerInRange(value.at, 0, Number.MAX_SAFE_INTEGER)
+-      ) {
+-        return { type: 'hello', appId: value.appId, at: value.at };
+-      }
+-      return undefined;
+-    case 'heartbeat.ack':
+-      if (
+-        hasOnlyKeys(value, ['type', 'at']) &&
+-        isFiniteIntegerInRange(value.at, 0, Number.MAX_SAFE_INTEGER)
+-      ) {
+-        return { type: 'heartbeat.ack', at: value.at };
+-      }
+-      return undefined;
+-    case 'window.show': {
+-      if (!hasOnlyKeys(value, ['type', 'bounds'])) {
+-        return undefined;
+-      }
+-      if (value.bounds == null) {
+-        return { type: 'window.show' };
+-      }
+-      const bounds = parseBounds(value.bounds);
+-      return bounds ? { type: 'window.show', bounds } : undefined;
+-    }
+-    case 'window.focus':
+-    case 'window.hide':
+-    case 'shutdown':
+-      return hasOnlyKeys(value, ['type'])
+-        ? ({ type: value.type } as MaoyiControlCommand)
+-        : undefined;
+-    case 'window.bounds-changed': {
+-      if (!hasOnlyKeys(value, ['type', 'bounds'])) {
+-        return undefined;
+-      }
+-      const bounds = parseBounds(value.bounds);
+-      return bounds ? { type: 'window.bounds-changed', bounds } : undefined;
+-    }
+-    case 'protocol.open': {
+-      if (
+-        !hasOnlyKeys(value, ['type', 'url', 'requestId']) ||
+-        !isBoundedString(value.url, 4_096) ||
+-        !/^(?:sgnl|signalcaptcha):/i.test(value.url) ||
+-        (value.requestId != null && !isBoundedString(value.requestId, 160))
+-      ) {
+-        return undefined;
+-      }
+-      return {
+-        type: 'protocol.open',
+-        url: value.url,
+-        requestId:
+-          typeof value.requestId === 'string' ? value.requestId : undefined,
+-      };
+-    }
+-    case 'script.execute':
+-      if (
+-        hasOnlyKeys(value, ['type', 'requestId', 'script']) &&
+-        isBoundedString(value.requestId, 160) &&
+-        isBoundedString(value.script, 900 * 1024)
+-      ) {
+-        return {
+-          type: 'script.execute',
+-          requestId: value.requestId,
+-          script: value.script,
+-        };
+-      }
+-      return undefined;
+-    default:
+-      return undefined;
+-  }
+-}
+-
+-function controlMac(key: Buffer, values: ReadonlyArray<unknown>): string {
+-  return createHmac('sha256', key)
+-    .update(JSON.stringify(values))
+-    .digest('base64url');
+-}
+-
+-function constantTimeBase64UrlEqual(
+-  actual: unknown,
+-  expected: string
+-): boolean {
+-  if (typeof actual !== 'string') {
+-    return false;
+-  }
+-  try {
+-    const actualBuffer = Buffer.from(actual, 'base64url');
+-    const expectedBuffer = Buffer.from(expected, 'base64url');
+-    return (
+-      actualBuffer.length === expectedBuffer.length &&
+-      timingSafeEqual(actualBuffer, expectedBuffer)
+-    );
+-  } catch {
+-    return false;
+-  }
+-}
+-
+-export function parseMaoyiAuthChallenge(
+-  raw: string,
+-  expectedAppId: string
+-): MaoyiAuthChallenge | undefined {
+-  if (Buffer.byteLength(raw, 'utf8') > maoyiControlMaxMessageBytes) {
+-    return undefined;
+-  }
+-  try {
+-    const value = JSON.parse(raw) as unknown;
+-    if (
+-      !isRecord(value) ||
+-      !hasOnlyKeys(value, ['type', 'appId', 'challenge']) ||
+-      value.type !== 'auth.challenge' ||
+-      value.appId !== expectedAppId ||
+-      typeof value.challenge !== 'string' ||
+-      !/^[A-Za-z0-9_-]{43}$/.test(value.challenge) ||
+-      Buffer.from(value.challenge, 'base64url').length !== 32
+-    ) {
+-      return undefined;
+-    }
+-    return {
+-      type: 'auth.challenge',
+-      appId: value.appId,
+-      challenge: value.challenge,
+-    };
+-  } catch {
+-    return undefined;
+-  }
+-}
+-
+-export function createMaoyiAuthResponse(
+-  key: Buffer,
+-  appId: string,
+-  processId: number,
+-  challenge: string
+-): string {
+-  return JSON.stringify({
+-    type: 'auth.response',
+-    processId,
+-    mac: controlMac(key, [
+-      'maoyi-signal-control-auth-v1',
+-      appId,
+-      processId,
+-      challenge,
+-    ]),
+-  });
+-}
+-
+-export function createMaoyiSignalEnvelope(
+-  key: Buffer,
+-  appId: string,
+-  processId: number,
+-  sequence: number,
+-  event: MaoyiControlEvent,
+-  now = Date.now()
+-): string {
+-  const payload: MaoyiControlPayload<MaoyiControlEvent> = {
+-    appId,
+-    at: now,
+-    ...event,
+-  };
+-  const envelope: MaoyiControlEnvelope<typeof payload> = {
+-    version: maoyiControlProtocolVersion,
+-    sequence,
+-    payload,
+-    mac: controlMac(key, [
+-      'maoyi-signal-control-message-v1',
+-      'signal-to-main',
+-      appId,
+-      processId,
+-      sequence,
+-      payload,
+-    ]),
+-  };
+-  return JSON.stringify(envelope);
+-}
+-
+-export function verifyMaoyiLauncherEnvelope(
+-  raw: string,
+-  key: Buffer,
+-  appId: string,
+-  processId: number,
+-  expectedSequence: number
+-): MaoyiControlCommand | undefined {
+-  if (Buffer.byteLength(raw, 'utf8') > maoyiControlMaxMessageBytes) {
+-    return undefined;
+-  }
+-  try {
+-    const envelope = JSON.parse(raw) as unknown;
+-    if (
+-      !isRecord(envelope) ||
+-      !hasOnlyKeys(envelope, ['version', 'sequence', 'payload', 'mac']) ||
+-      envelope.version !== maoyiControlProtocolVersion ||
+-      envelope.sequence !== expectedSequence
+-    ) {
+-      return undefined;
+-    }
+-    const command = parseMaoyiControlCommand(envelope.payload);
+-    if (!command) {
+-      return undefined;
+-    }
+-    const expectedMac = controlMac(key, [
+-      'maoyi-signal-control-message-v1',
+-      'main-to-signal',
+-      appId,
+-      processId,
+-      expectedSequence,
+-      envelope.payload,
+-    ]);
+-    return constantTimeBase64UrlEqual(envelope.mac, expectedMac)
+-      ? command
+-      : undefined;
+-  } catch {
+-    return undefined;
+-  }
+-}
+diff --git a/app/maoyi/controlProtocol.node.ts b/app/maoyi/controlProtocol.node.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebc9dceec94d1bd92a2d15cc12a9cd6857bff657
+--- /dev/null
++++ b/app/maoyi/controlProtocol.node.ts
+@@ -0,0 +1,400 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import { createHmac, timingSafeEqual } from 'node:crypto';
++
++export const maoyiControlProtocolVersion = 1;
++export const maoyiControlMaxMessageBytes = 1024 * 1024;
++export const maoyiControlHeartbeatMs = 5_000;
++export const maoyiControlReconnectMs = 1_000;
++
++export type MaoyiWindowBounds = Readonly<{
++  x: number;
++  y: number;
++  width: number;
++  height: number;
++}>;
++
++export type MaoyiControlCommand =
++  | Readonly<{ type: 'hello'; appId: string; at: number }>
++  | Readonly<{ type: 'heartbeat.ack'; at: number }>
++  | Readonly<{
++      type: 'security.visibility';
++      locked: boolean;
++      revision: number;
++    }>
++  | Readonly<{
++      type: 'window.owner';
++      handle: string;
++      ownerProcessId: number;
++    }>
++  | Readonly<{ type: 'window.show'; bounds?: MaoyiWindowBounds }>
++  | Readonly<{ type: 'window.focus' }>
++  | Readonly<{ type: 'window.hide' }>
++  | Readonly<{
++      type: 'window.bounds-changed';
++      bounds: MaoyiWindowBounds;
++    }>
++  | Readonly<{ type: 'protocol.open'; url: string; requestId?: string }>
++  | Readonly<{ type: 'shutdown' }>
++  | Readonly<{ type: 'script.execute'; requestId: string; script: string }>;
++
++export type MaoyiControlEvent =
++  | Readonly<{ type: 'ready'; title?: string }>
++  | Readonly<{ type: 'heartbeat'; visible: boolean }>
++  | Readonly<{ type: 'window.group-focused' }>
++  | Readonly<{ type: 'window.group-blurred' }>
++  | Readonly<{
++      type: 'window.state';
++      visible: boolean;
++      bounds?: MaoyiWindowBounds;
++    }>
++  | Readonly<{ type: 'window.bounds'; bounds: MaoyiWindowBounds }>
++  | Readonly<{ type: 'window.visibility-changed'; visible: boolean }>
++  | Readonly<{
++      type: 'window.bounds-changed';
++      bounds: MaoyiWindowBounds;
++    }>
++  | Readonly<{ type: 'window.closed' }>
++  | Readonly<{ type: 'closed' }>
++  | Readonly<{ type: 'window.owner-attached'; ownerProcessId: number }>
++  | Readonly<{
++      type: 'security.visibility-applied';
++      locked: boolean;
++      revision: number;
++      visibleWindowCount: number;
++    }>
++  | Readonly<{ type: 'shutdown.ack' }>
++  | Readonly<{ type: 'protocol.opened'; requestId?: string }>
++  | Readonly<{ type: 'script.result'; requestId: string; result: unknown }>
++  | Readonly<{ type: 'error'; requestId?: string; message: string }>
++  | Readonly<{ type: 'transport.error'; code: string }>;
++
++type MaoyiControlPayload<T> = Readonly<{
++  appId: string;
++  at: number;
++}> &
++  T;
++
++type MaoyiControlEnvelope<T> = Readonly<{
++  version: 1;
++  sequence: number;
++  payload: T;
++  mac: string;
++}>;
++
++type MaoyiAuthChallenge = Readonly<{
++  type: 'auth.challenge';
++  appId: string;
++  challenge: string;
++}>;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value != null && !Array.isArray(value);
++}
++
++function hasOnlyKeys(
++  value: Record<string, unknown>,
++  allowed: ReadonlyArray<string>
++): boolean {
++  const allowedKeys = new Set(allowed);
++  return Object.keys(value).every(key => allowedKeys.has(key));
++}
++
++function isFiniteIntegerInRange(
++  value: unknown,
++  minimum: number,
++  maximum: number
++): value is number {
++  return (
++    typeof value === 'number' &&
++    Number.isFinite(value) &&
++    Number.isInteger(value) &&
++    value >= minimum &&
++    value <= maximum
++  );
++}
++
++function parseBounds(value: unknown): MaoyiWindowBounds | undefined {
++  if (
++    !isRecord(value) ||
++    !hasOnlyKeys(value, ['x', 'y', 'width', 'height']) ||
++    !isFiniteIntegerInRange(value.x, -100_000, 100_000) ||
++    !isFiniteIntegerInRange(value.y, -100_000, 100_000) ||
++    !isFiniteIntegerInRange(value.width, 1, 20_000) ||
++    !isFiniteIntegerInRange(value.height, 1, 20_000)
++  ) {
++    return undefined;
++  }
++  return {
++    x: value.x,
++    y: value.y,
++    width: value.width,
++    height: value.height,
++  };
++}
++
++function isBoundedString(
++  value: unknown,
++  maximumBytes: number
++): value is string {
++  return (
++    typeof value === 'string' &&
++    Buffer.byteLength(value, 'utf8') <= maximumBytes
++  );
++}
++
++export function parseMaoyiControlCommand(
++  value: unknown
++): MaoyiControlCommand | undefined {
++  if (!isRecord(value) || typeof value.type !== 'string') {
++    return undefined;
++  }
++
++  switch (value.type) {
++    case 'hello':
++      if (
++        hasOnlyKeys(value, ['type', 'appId', 'at']) &&
++        isBoundedString(value.appId, 160) &&
++        isFiniteIntegerInRange(value.at, 0, Number.MAX_SAFE_INTEGER)
++      ) {
++        return { type: 'hello', appId: value.appId, at: value.at };
++      }
++      return undefined;
++    case 'heartbeat.ack':
++      if (
++        hasOnlyKeys(value, ['type', 'at']) &&
++        isFiniteIntegerInRange(value.at, 0, Number.MAX_SAFE_INTEGER)
++      ) {
++        return { type: 'heartbeat.ack', at: value.at };
++      }
++      return undefined;
++    case 'security.visibility':
++      if (
++        hasOnlyKeys(value, ['type', 'locked', 'revision']) &&
++        typeof value.locked === 'boolean' &&
++        isFiniteIntegerInRange(value.revision, 0, Number.MAX_SAFE_INTEGER)
++      ) {
++        return {
++          type: 'security.visibility',
++          locked: value.locked,
++          revision: value.revision,
++        };
++      }
++      return undefined;
++    case 'window.owner':
++      if (
++        hasOnlyKeys(value, ['type', 'handle', 'ownerProcessId']) &&
++        typeof value.handle === 'string' &&
++        /^[A-Za-z0-9_-]{11}$/.test(value.handle) &&
++        Buffer.from(value.handle, 'base64url').length === 8 &&
++        isFiniteIntegerInRange(value.ownerProcessId, 1, 0xffffffff)
++      ) {
++        return {
++          type: 'window.owner',
++          handle: value.handle,
++          ownerProcessId: value.ownerProcessId,
++        };
++      }
++      return undefined;
++    case 'window.show': {
++      if (!hasOnlyKeys(value, ['type', 'bounds'])) {
++        return undefined;
++      }
++      if (value.bounds == null) {
++        return { type: 'window.show' };
++      }
++      const bounds = parseBounds(value.bounds);
++      return bounds ? { type: 'window.show', bounds } : undefined;
++    }
++    case 'window.focus':
++    case 'window.hide':
++    case 'shutdown':
++      return hasOnlyKeys(value, ['type'])
++        ? ({ type: value.type } as MaoyiControlCommand)
++        : undefined;
++    case 'window.bounds-changed': {
++      if (!hasOnlyKeys(value, ['type', 'bounds'])) {
++        return undefined;
++      }
++      const bounds = parseBounds(value.bounds);
++      return bounds ? { type: 'window.bounds-changed', bounds } : undefined;
++    }
++    case 'protocol.open': {
++      if (
++        !hasOnlyKeys(value, ['type', 'url', 'requestId']) ||
++        !isBoundedString(value.url, 4_096) ||
++        !/^(?:sgnl|signalcaptcha):/i.test(value.url) ||
++        (value.requestId != null && !isBoundedString(value.requestId, 160))
++      ) {
++        return undefined;
++      }
++      return {
++        type: 'protocol.open',
++        url: value.url,
++        requestId:
++          typeof value.requestId === 'string' ? value.requestId : undefined,
++      };
++    }
++    case 'script.execute':
++      if (
++        hasOnlyKeys(value, ['type', 'requestId', 'script']) &&
++        isBoundedString(value.requestId, 160) &&
++        isBoundedString(value.script, 900 * 1024)
++      ) {
++        return {
++          type: 'script.execute',
++          requestId: value.requestId,
++          script: value.script,
++        };
++      }
++      return undefined;
++    default:
++      return undefined;
++  }
++}
++
++function controlMac(
++  key: Buffer<ArrayBuffer>,
++  values: ReadonlyArray<unknown>
++): string {
++  return createHmac('sha256', key)
++    .update(JSON.stringify(values))
++    .digest('base64url');
++}
++
++function constantTimeBase64UrlEqual(
++  actual: unknown,
++  expected: string
++): boolean {
++  if (typeof actual !== 'string') {
++    return false;
++  }
++  try {
++    const actualBuffer = Buffer.from(actual, 'base64url');
++    const expectedBuffer = Buffer.from(expected, 'base64url');
++    return (
++      actualBuffer.length === expectedBuffer.length &&
++      timingSafeEqual(actualBuffer, expectedBuffer)
++    );
++  } catch {
++    return false;
++  }
++}
++
++export function parseMaoyiAuthChallenge(
++  raw: string,
++  expectedAppId: string
++): MaoyiAuthChallenge | undefined {
++  if (Buffer.byteLength(raw, 'utf8') > maoyiControlMaxMessageBytes) {
++    return undefined;
++  }
++  try {
++    const value = JSON.parse(raw) as unknown;
++    if (
++      !isRecord(value) ||
++      !hasOnlyKeys(value, ['type', 'appId', 'challenge']) ||
++      value.type !== 'auth.challenge' ||
++      value.appId !== expectedAppId ||
++      typeof value.challenge !== 'string' ||
++      !/^[A-Za-z0-9_-]{43}$/.test(value.challenge) ||
++      Buffer.from(value.challenge, 'base64url').length !== 32
++    ) {
++      return undefined;
++    }
++    return {
++      type: 'auth.challenge',
++      appId: value.appId,
++      challenge: value.challenge,
++    };
++  } catch {
++    return undefined;
++  }
++}
++
++export function createMaoyiAuthResponse(
++  key: Buffer<ArrayBuffer>,
++  appId: string,
++  processId: number,
++  challenge: string
++): string {
++  return JSON.stringify({
++    type: 'auth.response',
++    processId,
++    mac: controlMac(key, [
++      'maoyi-signal-control-auth-v1',
++      appId,
++      processId,
++      challenge,
++    ]),
++  });
++}
++
++export function createMaoyiSignalEnvelope(
++  key: Buffer<ArrayBuffer>,
++  appId: string,
++  processId: number,
++  sequence: number,
++  event: MaoyiControlEvent,
++  now = Date.now()
++): string {
++  const payload: MaoyiControlPayload<MaoyiControlEvent> = {
++    appId,
++    at: now,
++    ...event,
++  };
++  const envelope: MaoyiControlEnvelope<typeof payload> = {
++    version: maoyiControlProtocolVersion,
++    sequence,
++    payload,
++    mac: controlMac(key, [
++      'maoyi-signal-control-message-v1',
++      'signal-to-main',
++      appId,
++      processId,
++      sequence,
++      payload,
++    ]),
++  };
++  return JSON.stringify(envelope);
++}
++
++export function verifyMaoyiLauncherEnvelope(
++  raw: string,
++  key: Buffer<ArrayBuffer>,
++  appId: string,
++  processId: number,
++  expectedSequence: number
++): MaoyiControlCommand | undefined {
++  if (Buffer.byteLength(raw, 'utf8') > maoyiControlMaxMessageBytes) {
++    return undefined;
++  }
++  try {
++    const envelope = JSON.parse(raw) as unknown;
++    if (
++      !isRecord(envelope) ||
++      !hasOnlyKeys(envelope, ['version', 'sequence', 'payload', 'mac']) ||
++      envelope.version !== maoyiControlProtocolVersion ||
++      envelope.sequence !== expectedSequence
++    ) {
++      return undefined;
++    }
++    const command = parseMaoyiControlCommand(envelope.payload);
++    if (!command) {
++      return undefined;
++    }
++    const expectedMac = controlMac(key, [
++      'maoyi-signal-control-message-v1',
++      'main-to-signal',
++      appId,
++      processId,
++      expectedSequence,
++      envelope.payload,
++    ]);
++    return constantTimeBase64UrlEqual(envelope.mac, expectedMac)
++      ? command
++      : undefined;
++  } catch {
++    return undefined;
++  }
++}
+diff --git a/app/maoyi/launchContext.main.ts b/app/maoyi/launchContext.main.ts
+index 0902f9e3d852c41071afaf88a58ec4eb88227430..f1ff9fc4012cfda661e44c60f905acaed0fed0f5 100644
+--- a/app/maoyi/launchContext.main.ts
++++ b/app/maoyi/launchContext.main.ts
+@@ -1,3 +1,4 @@
++// Copyright 2026 Signal Messenger, LLC
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ const launchContextKey = Symbol.for('maoyi.signal.launch-context.v1');
+@@ -8,7 +9,7 @@ export type MaoyiLaunchContext = Readonly<{
+   profileId: string;
+   wsPort: number;
+   title: string;
+-  controlKey: Buffer;
++  controlKey: Buffer<ArrayBuffer>;
+ }>;
+ 
+ export function setMaoyiLaunchContext(context: MaoyiLaunchContext): void {
+diff --git a/app/maoyi/launchGuard.main.ts b/app/maoyi/launchGuard.main.ts
+index 09d1e01661cb4065e8d44589addccfefb9c652fe..ec7bc7491acd3b90139d104887dd13cfd6603092 100644
+--- a/app/maoyi/launchGuard.main.ts
++++ b/app/maoyi/launchGuard.main.ts
+@@ -1,3 +1,4 @@
++// Copyright 2026 Signal Messenger, LLC
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import { execFileSync, spawn } from 'node:child_process';
+diff --git a/app/maoyi/windowController.main.ts b/app/maoyi/windowController.main.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e410868e78ab7ba44cedbd6a669b44613241aa7
+--- /dev/null
++++ b/app/maoyi/windowController.main.ts
+@@ -0,0 +1,546 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import { app, type BrowserWindow } from 'electron';
++
++import {
++  getMaoyiControlBridge,
++  type MaoyiControlBridge,
++} from './controlBridge.main.ts';
++import type {
++  MaoyiControlCommand,
++  MaoyiWindowBounds,
++} from './controlProtocol.node.ts';
++import {
++  applyMaoyiWindowOwner,
++  type MaoyiOwnerDescriptor,
++} from './windowsOwner.node.ts';
++
++const windowControllerKey = Symbol.for('maoyi.signal.window-controller.v1');
++
++type GuardedWindowMethods = Readonly<{
++  show: () => void;
++  showInactive: () => void;
++  focus: () => void;
++  restore: () => void;
++  maximize: () => void;
++  hide: () => void;
++}>;
++
++type ProtocolHandler = (url: string) => void;
++
++export type MaoyiWindowController = Readonly<{
++  attachMainWindow: (window: BrowserWindow) => void;
++  markRuntimeReady: () => void;
++  setProtocolHandler: (handler: ProtocolHandler) => void;
++  canExposeWindows: () => boolean;
++  stop: () => void;
++}>;
++
++function sameBounds(
++  left: MaoyiWindowBounds | undefined,
++  right: MaoyiWindowBounds
++): boolean {
++  return Boolean(
++    left &&
++    left.x === right.x &&
++    left.y === right.y &&
++    left.width === right.width &&
++    left.height === right.height
++  );
++}
++
++function safeErrorMessage(error: unknown): string {
++  const message = error instanceof Error ? error.message : String(error);
++  return message.slice(0, 512) || 'Signal control operation failed';
++}
++
++export function getMaoyiWindowController():
++  | MaoyiWindowController
++  | undefined {
++  return Reflect.get(globalThis, windowControllerKey) as
++    | MaoyiWindowController
++    | undefined;
++}
++
++export function startMaoyiWindowController(
++  bridgeArgument?: MaoyiControlBridge
++): MaoyiWindowController {
++  const existing = getMaoyiWindowController();
++  if (existing) {
++    return existing;
++  }
++  const bridge = bridgeArgument ?? getMaoyiControlBridge();
++  if (!bridge) {
++    throw new Error('Maoyi control bridge is unavailable');
++  }
++
++  const windows = new Set<BrowserWindow>();
++  const guardedMethods = new WeakMap<BrowserWindow, GuardedWindowMethods>();
++  const pendingProtocolUrls: Array<string> = [];
++  let mainWindow: BrowserWindow | undefined;
++  let pendingBounds: MaoyiWindowBounds | undefined;
++  let ownerDescriptor: MaoyiOwnerDescriptor | undefined;
++  let ownerAttached = false;
++  let securityLocked = true;
++  let visibilityRevision = -1;
++  let desiredVisible = false;
++  let runtimeReady = false;
++  let transportAuthenticated = false;
++  let protocolHandler: ProtocolHandler | undefined;
++  let activeScriptCount = 0;
++  let scriptGeneration = 0;
++  let pendingLockAcknowledgement = false;
++  let stopped = false;
++
++  const canExposeWindows = (): boolean =>
++    Boolean(
++      !stopped &&
++      transportAuthenticated &&
++      runtimeReady &&
++      !securityLocked &&
++      ownerAttached &&
++      desiredVisible &&
++      mainWindow &&
++      !mainWindow.isDestroyed()
++    );
++
++  const rawHide = (window: BrowserWindow): void => {
++    if (window.isDestroyed()) {
++      return;
++    }
++    try {
++      guardedMethods.get(window)?.hide();
++    } catch {
++      // A destroyed native window is already hidden from the user.
++    }
++  };
++
++  const hideAllWindows = (): void => {
++    for (const window of windows) {
++      rawHide(window);
++    }
++  };
++
++  const visibleWindowCount = (): number => {
++    let count = 0;
++    for (const window of windows) {
++      if (!window.isDestroyed() && window.isVisible()) {
++        count += 1;
++      }
++    }
++    return count;
++  };
++
++  const sendWindowState = (): void => {
++    if (!mainWindow || mainWindow.isDestroyed()) {
++      bridge.send({ type: 'window.state', visible: false });
++      return;
++    }
++    const bounds = mainWindow.getBounds();
++    const visible = mainWindow.isVisible() && canExposeWindows();
++    bridge.send({ type: 'window.state', visible, bounds });
++  };
++
++  const sendVisibilityApplied = (): void => {
++    if (securityLocked && activeScriptCount > 0) {
++      pendingLockAcknowledgement = true;
++      return;
++    }
++    pendingLockAcknowledgement = false;
++    bridge.send({
++      type: 'security.visibility-applied',
++      locked: securityLocked,
++      revision: Math.max(0, visibilityRevision),
++      visibleWindowCount: visibleWindowCount(),
++    });
++  };
++
++  const applyBounds = (bounds: MaoyiWindowBounds): void => {
++    pendingBounds = bounds;
++    if (!mainWindow || mainWindow.isDestroyed()) {
++      return;
++    }
++    const current = mainWindow.getBounds();
++    if (sameBounds(current, bounds)) {
++      return;
++    }
++    if (mainWindow.isMaximized()) {
++      mainWindow.unmaximize();
++    }
++    mainWindow.setBounds(bounds, false);
++  };
++
++  const attachOwnerToWindow = (window: BrowserWindow): boolean => {
++    if (!ownerDescriptor || window.isDestroyed()) {
++      return false;
++    }
++    const parent = window.getParentWindow();
++    if (parent && parent !== window) {
++      return true;
++    }
++    return applyMaoyiWindowOwner(window, ownerDescriptor);
++  };
++
++  const applyOwner = (): void => {
++    ownerAttached = false;
++    hideAllWindows();
++    if (!mainWindow || mainWindow.isDestroyed() || !ownerDescriptor) {
++      return;
++    }
++    try {
++      ownerAttached = attachOwnerToWindow(mainWindow);
++      if (!ownerAttached) {
++        bridge.send({ type: 'transport.error', code: 'owner-rejected' });
++        return;
++      }
++      for (const window of windows) {
++        if (window !== mainWindow) {
++          attachOwnerToWindow(window);
++        }
++      }
++      bridge.send({
++        type: 'window.owner-attached',
++        ownerProcessId: ownerDescriptor.ownerProcessId,
++      });
++    } catch {
++      ownerAttached = false;
++      bridge.send({ type: 'transport.error', code: 'owner-rejected' });
++    }
++  };
++
++  const showMainWindow = (): void => {
++    if (!canExposeWindows() || !mainWindow || mainWindow.isDestroyed()) {
++      hideAllWindows();
++      return;
++    }
++    if (pendingBounds) {
++      applyBounds(pendingBounds);
++    }
++    if (!mainWindow.isVisible()) {
++      guardedMethods.get(mainWindow)?.show();
++    }
++  };
++
++  const guardWindow = (window: BrowserWindow): void => {
++    if (guardedMethods.has(window)) {
++      return;
++    }
++    const originals: GuardedWindowMethods = {
++      show: window.show.bind(window),
++      showInactive: window.showInactive.bind(window),
++      focus: window.focus.bind(window),
++      restore: window.restore.bind(window),
++      maximize: window.maximize.bind(window),
++      hide: window.hide.bind(window),
++    };
++    guardedMethods.set(window, originals);
++    windows.add(window);
++
++    const hideWhenBlocked = (): void => {
++      if (!canExposeWindows()) {
++        rawHide(window);
++      }
++    };
++    Object.defineProperties(window, {
++      show: {
++        configurable: true,
++        value: () => {
++          if (canExposeWindows()) originals.show();
++          else originals.hide();
++        },
++      },
++      showInactive: {
++        configurable: true,
++        value: () => {
++          if (canExposeWindows()) originals.showInactive();
++          else originals.hide();
++        },
++      },
++      focus: {
++        configurable: true,
++        value: () => {
++          if (canExposeWindows()) originals.focus();
++          else originals.hide();
++        },
++      },
++      restore: {
++        configurable: true,
++        value: () => {
++          if (canExposeWindows()) originals.restore();
++          else originals.hide();
++        },
++      },
++      maximize: {
++        configurable: true,
++        value: () => {
++          if (canExposeWindows()) originals.maximize();
++        },
++      },
++    });
++
++    window.on('show', () => {
++      hideWhenBlocked();
++      bridge.send({
++        type: 'window.visibility-changed',
++        visible: window.isVisible() && canExposeWindows(),
++      });
++      sendWindowState();
++    });
++    window.on('hide', () => {
++      bridge.send({ type: 'window.visibility-changed', visible: false });
++      sendWindowState();
++    });
++    window.on('focus', () => {
++      if (canExposeWindows()) {
++        bridge.send({ type: 'window.group-focused' });
++      } else {
++        rawHide(window);
++      }
++    });
++    window.on('blur', () => {
++      bridge.send({ type: 'window.group-blurred' });
++    });
++    window.on('closed', () => {
++      windows.delete(window);
++      if (mainWindow === window) {
++        mainWindow = undefined;
++        ownerAttached = false;
++        desiredVisible = false;
++        bridge.send({ type: 'window.closed' });
++        bridge.send({ type: 'closed' });
++      }
++    });
++    if (window.isVisible()) {
++      rawHide(window);
++    }
++  };
++
++  const sendBounds = (): void => {
++    if (!mainWindow || mainWindow.isDestroyed()) {
++      return;
++    }
++    const bounds = mainWindow.getBounds();
++    bridge.send({ type: 'window.bounds-changed', bounds });
++    bridge.send({ type: 'window.bounds', bounds });
++  };
++
++  const runProtocolHandler = (url: string, requestId?: string): void => {
++    if (securityLocked || !runtimeReady || !protocolHandler) {
++      bridge.send({
++        type: 'error',
++        requestId,
++        message: 'Signal protocol handling is unavailable while locked',
++      });
++      return;
++    }
++    try {
++      protocolHandler(url);
++      bridge.send({ type: 'protocol.opened', requestId });
++    } catch (error) {
++      bridge.send({
++        type: 'error',
++        requestId,
++        message: safeErrorMessage(error),
++      });
++    }
++  };
++
++  const executeScript = async (
++    command: Extract<MaoyiControlCommand, { type: 'script.execute' }>
++  ): Promise<void> => {
++    if (
++      securityLocked ||
++      !runtimeReady ||
++      !mainWindow ||
++      mainWindow.isDestroyed()
++    ) {
++      bridge.send({
++        type: 'error',
++        requestId: command.requestId,
++        message: 'Signal script execution is unavailable while locked',
++      });
++      return;
++    }
++    const generation = scriptGeneration;
++    activeScriptCount += 1;
++    try {
++      const result = await mainWindow.webContents.executeJavaScript(
++        command.script,
++        true
++      );
++      if (generation === scriptGeneration && !securityLocked) {
++        bridge.send({
++          type: 'script.result',
++          requestId: command.requestId,
++          result,
++        });
++      }
++    } catch (error) {
++      if (generation === scriptGeneration) {
++        bridge.send({
++          type: 'error',
++          requestId: command.requestId,
++          message: safeErrorMessage(error),
++        });
++      }
++    } finally {
++      activeScriptCount = Math.max(0, activeScriptCount - 1);
++      if (pendingLockAcknowledgement) {
++        sendVisibilityApplied();
++      }
++    }
++  };
++
++  const handleCommand = (command: MaoyiControlCommand): void => {
++    switch (command.type) {
++      case 'hello':
++        if (runtimeReady) {
++          bridge.send({ type: 'ready' });
++          sendWindowState();
++        }
++        return;
++      case 'heartbeat.ack':
++        return;
++      case 'security.visibility':
++        if (command.locked) {
++          visibilityRevision = Math.max(visibilityRevision, command.revision);
++          securityLocked = true;
++          desiredVisible = false;
++          scriptGeneration += 1;
++          hideAllWindows();
++          sendVisibilityApplied();
++          return;
++        }
++        if (command.revision > visibilityRevision) {
++          visibilityRevision = command.revision;
++          securityLocked = false;
++        }
++        sendVisibilityApplied();
++        return;
++      case 'window.owner':
++        ownerDescriptor = {
++          handle: command.handle,
++          ownerProcessId: command.ownerProcessId,
++        };
++        applyOwner();
++        return;
++      case 'window.bounds-changed':
++        applyBounds(command.bounds);
++        return;
++      case 'window.show':
++        if (command.bounds) {
++          applyBounds(command.bounds);
++        }
++        if (securityLocked || !ownerAttached) {
++          desiredVisible = false;
++          hideAllWindows();
++          return;
++        }
++        desiredVisible = true;
++        showMainWindow();
++        return;
++      case 'window.focus':
++        if (canExposeWindows() && mainWindow && !mainWindow.isDestroyed()) {
++          guardedMethods.get(mainWindow)?.focus();
++        }
++        return;
++      case 'window.hide':
++        desiredVisible = false;
++        hideAllWindows();
++        return;
++      case 'protocol.open':
++        runProtocolHandler(command.url, command.requestId);
++        return;
++      case 'script.execute':
++        void executeScript(command);
++        return;
++      case 'shutdown':
++        desiredVisible = false;
++        securityLocked = true;
++        hideAllWindows();
++        bridge.send({ type: 'shutdown.ack' });
++        app.quit();
++        return;
++      default:
++        return;
++    }
++  };
++
++  const removeCommandHandler = bridge.onCommand(handleCommand);
++  const removeTransportHandler = bridge.onTransportState(authenticated => {
++    transportAuthenticated = authenticated;
++    if (!authenticated) {
++      securityLocked = true;
++      visibilityRevision = -1;
++      desiredVisible = false;
++      scriptGeneration += 1;
++      hideAllWindows();
++    }
++  });
++  bridge.setHeartbeatVisibleProvider(
++    () => Boolean(mainWindow?.isVisible()) && canExposeWindows()
++  );
++
++  const onBrowserWindowCreated = (
++    _event: Electron.Event,
++    window: BrowserWindow
++  ): void => {
++    try {
++      guardWindow(window);
++      if (ownerDescriptor) {
++        attachOwnerToWindow(window);
++      }
++    } catch {
++      rawHide(window);
++      bridge.send({ type: 'transport.error', code: 'window-guard-failed' });
++    }
++  };
++  app.on('browser-window-created', onBrowserWindowCreated);
++
++  const controller: MaoyiWindowController = Object.freeze({
++    attachMainWindow(window: BrowserWindow) {
++      mainWindow = window;
++      guardWindow(window);
++      rawHide(window);
++      if (pendingBounds) {
++        applyBounds(pendingBounds);
++      }
++      if (ownerDescriptor) {
++        applyOwner();
++      }
++      window.on('move', sendBounds);
++      window.on('resize', sendBounds);
++    },
++    markRuntimeReady() {
++      runtimeReady = true;
++      bridge.send({ type: 'ready' });
++      sendWindowState();
++      while (pendingProtocolUrls.length > 0 && protocolHandler) {
++        const url = pendingProtocolUrls.shift();
++        if (url) runProtocolHandler(url);
++      }
++      showMainWindow();
++    },
++    setProtocolHandler(handler: ProtocolHandler) {
++      protocolHandler = handler;
++    },
++    canExposeWindows,
++    stop() {
++      if (stopped) {
++        return;
++      }
++      stopped = true;
++      securityLocked = true;
++      desiredVisible = false;
++      hideAllWindows();
++      removeCommandHandler();
++      removeTransportHandler();
++      app.off('browser-window-created', onBrowserWindowCreated);
++      bridge.setHeartbeatVisibleProvider(() => false);
++      Reflect.deleteProperty(globalThis, windowControllerKey);
++    },
++  });
++  Reflect.set(globalThis, windowControllerKey, controller);
++  return controller;
++}
+diff --git a/app/maoyi/windowsOwner.node.ts b/app/maoyi/windowsOwner.node.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c35cc7bb759ab59752a6ad4029d360fed40796d4
+--- /dev/null
++++ b/app/maoyi/windowsOwner.node.ts
+@@ -0,0 +1,25 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import { setWindowOwner } from '@signalapp/windows-ucv';
++import type { BrowserWindow } from 'electron';
++
++export type MaoyiOwnerDescriptor = Readonly<{
++  handle: string;
++  ownerProcessId: number;
++}>;
++
++export function applyMaoyiWindowOwner(
++  window: BrowserWindow,
++  descriptor: MaoyiOwnerDescriptor
++): boolean {
++  if (process.platform !== 'win32') {
++    return false;
++  }
++  const childHandle = Buffer.from(window.getNativeWindowHandle());
++  const ownerHandle = Buffer.from(descriptor.handle, 'base64url');
++  if (childHandle.length !== 8 || ownerHandle.length !== 8) {
++    return false;
++  }
++  return setWindowOwner(childHandle, ownerHandle, descriptor.ownerProcessId);
++}
+diff --git a/app/main.main.ts b/app/main.main.ts
+index e1a087f3712b93816c4f2f6bcea50c2c555ef629..a7b89bc6d63c9824b5eb7684c7770a67d2318083 100644
+--- a/app/main.main.ts
++++ b/app/main.main.ts
+@@ -51,6 +51,7 @@ import * as debugLog from '../ts/logging/debuglogs.node.ts';
+ import * as uploadDebugLog from '../ts/logging/uploadDebugLog.node.ts';
+ import { explodePromise } from '../ts/util/explodePromise.std.ts';
+ import { isMaoyiEmbedLaunch } from './maoyi/launchContext.main.ts';
++import { getMaoyiWindowController } from './maoyi/windowController.main.ts';
+ 
+ import './startup_config.main.ts';
+ 
+@@ -163,6 +164,7 @@ if (OS.isMacOS()) {
+ let mainWindow: BrowserWindow | undefined;
+ let mainWindowCreated = false;
+ let loadingWindow: BrowserWindow | undefined;
++const maoyiWindowController = getMaoyiWindowController();
+ 
+ // These will be set after app fires the 'ready' event
+ let preferredSystemLocales: Array<string> | undefined;
+@@ -239,6 +241,9 @@ const CLI_LANG = cliOptions.lang as string | undefined;
+ setupCrashReports(log, showDebugLogWindow, FORCE_ENABLE_CRASH_REPORTS);
+ 
+ function showWindow() {
++  if (isMaoyiEmbedLaunch()) {
++    return;
++  }
+   if (!mainWindow) {
+     return;
+   }
+@@ -558,9 +563,11 @@ async function handleCommonWindowEvents(window: BrowserWindow) {
+   window.on('blur', setWindowFocus);
+ 
+   window.once('ready-to-show', setWindowFocus);
+-  // This is a fallback in case we drop an event for some reason.
+-  const focusInterval = setInterval(setWindowFocus, 10000);
+-  window.on('closed', () => clearInterval(focusInterval));
++  if (!isMaoyiEmbedLaunch()) {
++    // This is a fallback in case we drop an event for some reason.
++    const focusInterval = setInterval(setWindowFocus, 10000);
++    window.on('closed', () => clearInterval(focusInterval));
++  }
+ 
+   const contentProtection = ephemeralConfig.get('contentProtection');
+   // Apply content protection by default on Windows, unless explicitly disabled
+@@ -725,6 +732,20 @@ async function createWindow() {
+     ...pick(windowConfig, ['autoHideMenuBar', 'x', 'y']),
+   };
+ 
++  if (isMaoyiEmbedLaunch()) {
++    Object.assign(windowOptions, {
++      show: false,
++      frame: false,
++      hasShadow: false,
++      thickFrame: false,
++      skipTaskbar: true,
++      autoHideMenuBar: true,
++      titleBarStyle: 'hidden',
++      minWidth: MIN_WIDTH,
++      minHeight: MIN_HEIGHT,
++    });
++  }
++
+   if (!isNumber(windowOptions.width) || windowOptions.width < MIN_WIDTH) {
+     windowOptions.width = DEFAULT_WIDTH;
+   }
+@@ -767,6 +788,11 @@ async function createWindow() {
+ 
+   // Create the browser window.
+   mainWindow = new BrowserWindow(windowOptions);
++  maoyiWindowController?.attachMainWindow(mainWindow);
++  if (isMaoyiEmbedLaunch()) {
++    mainWindow.setMenu(null);
++    mainWindow.setMenuBarVisibility(false);
++  }
+   if (settingsChannel) {
+     settingsChannel.setMainWindow(mainWindow);
+   }
+@@ -779,10 +805,20 @@ async function createWindow() {
+     getResolvedMessagesLocale().i18n,
+     log
+   );
+-  if (!startInTray && windowConfig && windowConfig.maximized) {
++  if (
++    !isMaoyiEmbedLaunch() &&
++    !startInTray &&
++    windowConfig &&
++    windowConfig.maximized
++  ) {
+     mainWindow.maximize();
+   }
+-  if (!startInTray && windowConfig && windowConfig.fullscreen) {
++  if (
++    !isMaoyiEmbedLaunch() &&
++    !startInTray &&
++    windowConfig &&
++    windowConfig.fullscreen
++  ) {
+     mainWindow.setFullScreen(true);
+   }
+   if (systemTrayService) {
+@@ -839,10 +875,12 @@ async function createWindow() {
+     }
+   }
+ 
+-  mainWindow.on('resize', captureWindowStats);
+-  mainWindow.on('move', captureWindowStats);
+-  mainWindow.on('maximize', captureWindowStats);
+-  mainWindow.on('unmaximize', captureWindowStats);
++  if (!isMaoyiEmbedLaunch()) {
++    mainWindow.on('resize', captureWindowStats);
++    mainWindow.on('move', captureWindowStats);
++    mainWindow.on('maximize', captureWindowStats);
++    mainWindow.on('unmaximize', captureWindowStats);
++  }
+ 
+   if (
+     !ciMode &&
+@@ -1016,7 +1054,7 @@ async function createWindow() {
+ 
+     mainWindow.webContents.send('ci:event', 'db-initialized', {});
+ 
+-    if (shouldShowWindow) {
++    if (shouldShowWindow && !isMaoyiEmbedLaunch()) {
+       log.info('showing main window');
+       if (isMockEnvironment() && process.env.SIGNAL_MOCK_TESTS_BACKGROUND) {
+         mainWindow.showInactive();
+@@ -2294,6 +2332,9 @@ app.on('ready', async () => {
+       if (maybeTimeout !== 'timeout') {
+         return;
+       }
++      if (isMaoyiEmbedLaunch()) {
++        return;
++      }
+ 
+       log.info(
+         'sql.initialize is taking more than three seconds; showing loading dialog'
+@@ -2395,15 +2436,19 @@ app.on('ready', async () => {
+ 
+   ready = true;
+ 
++  maoyiWindowController?.markRuntimeReady();
++
+   setupMenu();
+ 
+-  systemTrayService = new SystemTrayService({
+-    i18n: getResolvedMessagesLocale().i18n,
+-  });
+-  systemTrayService.setMainWindow(mainWindow);
+-  systemTrayService.setEnabled(
+-    shouldMinimizeToSystemTray(await systemTraySettingCache.get())
+-  );
++  if (!isMaoyiEmbedLaunch()) {
++    systemTrayService = new SystemTrayService({
++      i18n: getResolvedMessagesLocale().i18n,
++    });
++    systemTrayService.setMainWindow(mainWindow);
++    systemTrayService.setEnabled(
++      shouldMinimizeToSystemTray(await systemTraySettingCache.get())
++    );
++  }
+ 
+   await ensureFilePermissions([
+     'config.json',
+@@ -2414,6 +2459,11 @@ app.on('ready', async () => {
+ });
+ 
+ function setupMenu(options?: Partial<CreateTemplateOptionsType>) {
++  if (isMaoyiEmbedLaunch()) {
++    Menu.setApplicationMenu(null);
++    mainWindow?.setMenu(null);
++    return;
++  }
+   const { platform } = process;
+   const platformForMenu =
+     platform === 'linux' && process.env.APPIMAGE != null
+@@ -2648,6 +2698,9 @@ app.on('activate', () => {
+ 
+   // On OS X it's common to re-create a window in the app when the
+   // dock icon is clicked and there are no other windows open.
++  if (isMaoyiEmbedLaunch()) {
++    return;
++  }
+   if (mainWindow) {
+     mainWindow.show();
+   } else {
+@@ -2666,7 +2719,7 @@ app.on(
+   }
+ );
+ 
+-if (!app.isDefaultProtocolClient('sgnl')) {
++if (!isMaoyiEmbedLaunch() && !app.isDefaultProtocolClient('sgnl')) {
+   log.info('setting signal as the default app for the sgnl url scheme');
+   app.setAsDefaultProtocolClient('sgnl');
+ } else {
+@@ -2674,7 +2727,7 @@ if (!app.isDefaultProtocolClient('sgnl')) {
+     'signal is already registered as the default app for the sgnl url scheme.'
+   );
+ }
+-if (!app.isDefaultProtocolClient('signalcaptcha')) {
++if (!isMaoyiEmbedLaunch() && !app.isDefaultProtocolClient('signalcaptcha')) {
+   log.info(
+     'setting signal as the default app for the signalcaptcha url scheme'
+   );
+@@ -3111,6 +3164,14 @@ function handleSignalRoute(route: ParsedSignalRoute) {
+   }
+ }
+ 
++maoyiWindowController?.setProtocolHandler(rawUrl => {
++  const route = parseSignalRoute(rawUrl);
++  if (!route) {
++    throw new Error('Unsupported Signal protocol route');
++  }
++  handleSignalRoute(route);
++});
++
+ ipc.handle('install-sticker-pack', (_event, packId, packKeyHex) => {
+   const packKey = Buffer.from(packKeyHex, 'hex').toString('base64');
+   if (mainWindow) {
+diff --git a/packages/windows-ucv/addon.cpp b/packages/windows-ucv/addon.cpp
+index 54f6f496081df8fb6fcfd51aea192741285f3810..e5fdf13c185a42dd0eaefd3eb72155bf115b7162 100644
+--- a/packages/windows-ucv/addon.cpp
++++ b/packages/windows-ucv/addon.cpp
+@@ -1,4 +1,6 @@
+ #include <assert.h>
++#include <stdint.h>
++#include <string.h>
+ #include <windows.h>
+ #include <winrt/windows.foundation.metadata.h>
+ #include <winrt/windows.security.credentials.ui.h>
+@@ -137,11 +139,80 @@ void RequestVerification(const Napi::CallbackInfo& info) {
+   });
+ }
+ 
++Napi::Value SetWindowOwner(const Napi::CallbackInfo& info) {
++  auto env = info.Env();
++  if (info.Length() != 3 || !info[0].IsBuffer() || !info[1].IsBuffer() ||
++      !info[2].IsNumber()) {
++    Napi::TypeError::New(
++        env,
++        "Expected child handle, owner handle, and owner process identifier")
++        .ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++
++  auto child_buffer = info[0].As<Napi::Buffer<uint8_t>>();
++  auto owner_buffer = info[1].As<Napi::Buffer<uint8_t>>();
++  if (child_buffer.Length() != sizeof(uintptr_t) ||
++      owner_buffer.Length() != sizeof(uintptr_t)) {
++    Napi::TypeError::New(env, "Window handles have an invalid size")
++        .ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++
++  uintptr_t child_value = 0;
++  uintptr_t owner_value = 0;
++  memcpy(&child_value, child_buffer.Data(), sizeof(child_value));
++  memcpy(&owner_value, owner_buffer.Data(), sizeof(owner_value));
++  auto child = reinterpret_cast<HWND>(child_value);
++  auto owner = reinterpret_cast<HWND>(owner_value);
++  if (!IsWindow(child) || !IsWindow(owner)) {
++    Napi::Error::New(env, "A window handle is no longer valid")
++        .ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++
++  DWORD child_process_id = 0;
++  DWORD owner_process_id = 0;
++  DWORD child_session_id = 0;
++  DWORD owner_session_id = 0;
++  GetWindowThreadProcessId(child, &child_process_id);
++  GetWindowThreadProcessId(owner, &owner_process_id);
++  auto expected_owner_process_id = info[2].As<Napi::Number>().Uint32Value();
++  if (child_process_id != GetCurrentProcessId() || owner_process_id == 0 ||
++      owner_process_id != expected_owner_process_id ||
++      GetAncestor(owner, GA_ROOT) != owner ||
++      !ProcessIdToSessionId(child_process_id, &child_session_id) ||
++      !ProcessIdToSessionId(owner_process_id, &owner_session_id) ||
++      child_session_id != owner_session_id) {
++    Napi::Error::New(env, "Window ownership validation failed")
++        .ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++
++  SetLastError(ERROR_SUCCESS);
++  auto previous = SetWindowLongPtrW(
++      child, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
++  auto last_error = GetLastError();
++  if ((previous == 0 && last_error != ERROR_SUCCESS) ||
++      GetWindow(child, GW_OWNER) != owner) {
++    Napi::Error::New(env, "Windows rejected the owner relationship")
++        .ThrowAsJavaScriptException();
++    return env.Undefined();
++  }
++  SetWindowPos(child, nullptr, 0, 0, 0, 0,
++               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
++                   SWP_FRAMECHANGED);
++
++  return Napi::Boolean::New(env, true);
++}
++
+ Napi::Object Init(Napi::Env env, Napi::Object exports) {
+   exports.Set(Napi::String::New(env, "checkAvailability"),
+               Napi::Function::New(env, CheckAvailability));
+   exports.Set(Napi::String::New(env, "requestVerification"),
+               Napi::Function::New(env, RequestVerification));
++  exports.Set(Napi::String::New(env, "setWindowOwner"),
++              Napi::Function::New(env, SetWindowOwner));
+   return exports;
+ }
+ 
+diff --git a/packages/windows-ucv/binding.gyp b/packages/windows-ucv/binding.gyp
+index 141b1d52f5ce7c045a8fe4b89f883b6344f6a30a..ce52eb88a6e8b741e993c3e3247e2763301b1268 100644
+--- a/packages/windows-ucv/binding.gyp
++++ b/packages/windows-ucv/binding.gyp
+@@ -11,7 +11,8 @@
+         ],
+         "libraries": [
+           "credui.lib",
+-          "runtimeobject.lib"
++          "runtimeobject.lib",
++          "user32.lib"
+         ],
+         "msvs_settings": {
+           "VCCLCompilerTool": {
+diff --git a/packages/windows-ucv/index.ts b/packages/windows-ucv/index.ts
+index d1eae25fbca801bf070fdf489edd773e6f610492..16a224a7074f4974872be70c8e925b815bc97007 100644
+--- a/packages/windows-ucv/index.ts
++++ b/packages/windows-ucv/index.ts
+@@ -31,6 +31,11 @@ type BindingType = Readonly<{
+     message: string,
+     callback: (result: Verification | AsyncError) => void,
+   ): void;
++  setWindowOwner(
++    childHandle: Buffer<ArrayBuffer>,
++    ownerHandle: Buffer<ArrayBuffer>,
++    ownerProcessId: number,
++  ): boolean;
+ }>;
+ 
+ let binding: BindingType | undefined;
+@@ -91,3 +96,21 @@ export async function requestVerification(
+     });
+   });
+ }
++
++/**
++ * Assign a verified top-level owner to a window in this process.
++ *
++ * The native implementation validates both HWND process identifiers and uses
++ * GWLP_HWNDPARENT. It intentionally does not use SetParent, which would turn a
++ * top-level Electron window into a cross-process child window.
++ */
++export function setWindowOwner(
++  childHandle: Buffer<ArrayBuffer>,
++  ownerHandle: Buffer<ArrayBuffer>,
++  ownerProcessId: number,
++): boolean {
++  if (!binding) {
++    throw new Error('This library works only on Windows');
++  }
++  return binding.setWindowOwner(childHandle, ownerHandle, ownerProcessId);
++}
+diff --git a/ts/test-node/maoyi/controlProtocol_test.node.ts b/ts/test-node/maoyi/controlProtocol_test.node.ts
+index 0b2c3b7d6d7c299fe61ce1f1a3976db0e5bd156e..76256c47c485d266a62e43c79d060c14400b25b1 100644
+--- a/ts/test-node/maoyi/controlProtocol_test.node.ts
++++ b/ts/test-node/maoyi/controlProtocol_test.node.ts
+@@ -1,3 +1,4 @@
++// Copyright 2026 Signal Messenger, LLC
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import assert from 'node:assert/strict';
+@@ -9,7 +10,7 @@ import {
+   parseMaoyiAuthChallenge,
+   parseMaoyiControlCommand,
+   verifyMaoyiLauncherEnvelope,
+-} from '../../../app/maoyi/controlProtocol.main.ts';
++} from '../../../app/maoyi/controlProtocol.node.ts';
+ 
+ describe('Maoyi typed control protocol', () => {
+   const appId = 'Signal-00000000-0000-4000-8000-000000000001';
+@@ -27,6 +28,46 @@ describe('Maoyi typed control protocol', () => {
+         bounds: { x: 10, y: 20, width: 800, height: 600 },
+       }
+     );
++    const ownerHandle = Buffer.from('0102030405060708', 'hex').toString(
++      'base64url'
++    );
++    assert.deepEqual(
++      parseMaoyiControlCommand({
++        type: 'window.owner',
++        handle: ownerHandle,
++        ownerProcessId: 1234,
++      }),
++      {
++        type: 'window.owner',
++        handle: ownerHandle,
++        ownerProcessId: 1234,
++      }
++    );
++    assert.deepEqual(
++      parseMaoyiControlCommand({
++        type: 'security.visibility',
++        locked: true,
++        revision: 9,
++      }),
++      { type: 'security.visibility', locked: true, revision: 9 }
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'security.visibility',
++        locked: false,
++        revision: 9,
++        bypass: true,
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'window.owner',
++        handle: Buffer.alloc(4).toString('base64url'),
++        ownerProcessId: 1234,
++      }),
++      undefined
++    );
+     assert.equal(
+       parseMaoyiControlCommand({
+         type: 'window.bounds-changed',
+diff --git a/ts/test-node/maoyi/launchGuard_test.node.ts b/ts/test-node/maoyi/launchGuard_test.node.ts
+index 7e716caaafcaf8af1a4d9202ff67a96061d822e3..46ac387a987b5691ed3b9e88ebc617b8bb7816f6 100644
+--- a/ts/test-node/maoyi/launchGuard_test.node.ts
++++ b/ts/test-node/maoyi/launchGuard_test.node.ts
+@@ -1,3 +1,4 @@
++// Copyright 2026 Signal Messenger, LLC
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import assert from 'node:assert/strict';

@@ -1,0 +1,661 @@
+diff --git a/app/maoyi/controlProtocol.node.ts b/app/maoyi/controlProtocol.node.ts
+index dbd8afb..4bef19d 100644
+--- a/app/maoyi/controlProtocol.node.ts
++++ b/app/maoyi/controlProtocol.node.ts
+@@ -103,6 +103,8 @@ export type MaoyiControlEvent =
+   | Readonly<{ type: 'protocol.opened'; requestId?: string }>
+   | Readonly<{ type: 'conversation.changed'; conversationId: string }>
+   | (Readonly<{ type: 'message.added' }> & MaoyiVisibleMessage)
++  | (Readonly<{ type: 'translation.refresh.request'; requestId: string }> &
++      MaoyiVisibleMessage)
+   | Readonly<{
+       type: 'message.visibleBatch';
+       requestId: string;
+@@ -471,6 +473,7 @@ export function parseMaoyiMessageControlEvent(value: unknown):
+         type:
+           | 'conversation.changed'
+           | 'message.added'
++          | 'translation.refresh.request'
+           | 'message.visibleBatch'
+           | 'translation.cacheResultApplied';
+       }
+@@ -538,6 +541,54 @@ export function parseMaoyiMessageControlEvent(value: unknown):
+         ? { type: 'message.added', ...parsed }
+         : undefined;
+     }
++    case 'translation.refresh.request': {
++      if (
++        !hasOnlyKeys(value, [
++          'type',
++          'requestId',
++          'conversationId',
++          'messageId',
++          'sourceHash',
++          'sourceText',
++          'direction',
++          'timestamp',
++        ]) ||
++        !isMaoyiControlUuid(value.requestId) ||
++        !isMaoyiControlUuid(value.conversationId)
++      ) {
++        return undefined;
++      }
++      const parsed = parseVisibleMessage(
++        {
++          conversationId: value.conversationId,
++          messageId: value.messageId,
++          sourceHash: value.sourceHash,
++          sourceText: value.sourceText,
++          direction: value.direction,
++          timestamp: value.timestamp,
++        },
++        value.conversationId
++      );
++      if (!parsed) {
++        return undefined;
++      }
++      const projected = projectMaoyiMessage({
++        id: parsed.messageId,
++        conversationId: parsed.conversationId,
++        text: parsed.sourceText,
++        direction: parsed.direction,
++        timestamp: parsed.timestamp,
++      });
++      return projected &&
++        projected.sourceText === parsed.sourceText &&
++        projected.sourceHash === parsed.sourceHash
++        ? {
++            type: 'translation.refresh.request',
++            requestId: value.requestId,
++            ...parsed,
++          }
++        : undefined;
++    }
+     case 'message.visibleBatch': {
+       if (
+         !hasOnlyKeys(value, [
+diff --git a/app/maoyi/messageBridge.main.ts b/app/maoyi/messageBridge.main.ts
+index 703bffa..667698d 100644
+--- a/app/maoyi/messageBridge.main.ts
++++ b/app/maoyi/messageBridge.main.ts
+@@ -270,6 +270,7 @@ export function startMaoyiMessageBridge(
+ 
+   const requestLedger = new MaoyiRequestLedger();
+   const addedMessageLedger = new MaoyiAddedMessageLedger();
++  const refreshRequestLedger = new MaoyiAddedMessageLedger();
+   let mainWindow: BrowserWindow | undefined;
+   let currentConversationId: string | undefined;
+   let transportAuthenticated = false;
+@@ -295,6 +296,7 @@ export function startMaoyiMessageBridge(
+     currentConversationId = undefined;
+     requestLedger.invalidateAll();
+     addedMessageLedger.clear();
++    refreshRequestLedger.clear();
+     sendRendererCommand({ type: 'translation.runtime.clear' });
+   };
+ 
+@@ -331,6 +333,7 @@ export function startMaoyiMessageBridge(
+         if (currentConversationId !== parsed.conversationId) {
+           requestLedger.invalidateForConversationChange();
+           addedMessageLedger.clear();
++          refreshRequestLedger.clear();
+         }
+         currentConversationId = parsed.conversationId;
+         if (!controlBridge.send(parsed)) {
+@@ -352,6 +355,19 @@ export function startMaoyiMessageBridge(
+         }
+         return true;
+       }
++      case 'translation.refresh.request': {
++        if (
++          currentConversationId !== parsed.conversationId ||
++          !refreshRequestLedger.accept(parsed.requestId)
++        ) {
++          return false;
++        }
++        if (!controlBridge.send(parsed)) {
++          refreshRequestLedger.remove(parsed.requestId);
++          return false;
++        }
++        return true;
++      }
+       case 'message.visibleBatch': {
+         if (
+           currentConversationId !== parsed.conversationId ||
+diff --git a/stylesheets/_modules.scss b/stylesheets/_modules.scss
+index 417d140..c966e47 100644
+--- a/stylesheets/_modules.scss
++++ b/stylesheets/_modules.scss
+@@ -1180,13 +1180,53 @@ $message-padding-horizontal: 12px;
+ 
+   border-block-start: 1px solid
+     color-mix(in srgb, currentColor 24%, transparent);
+-  color: inherit;
++  color: #0b7654;
+   margin-block-start: 5px;
+   overflow-wrap: break-word;
+   padding-block-start: 5px;
+   text-align: start;
+   white-space: pre-wrap;
+   word-break: auto-phrase;
++
++  .module-message__container--outgoing & {
++    color: #f8fbff;
++  }
++}
++
++.module-message__maoyi-translation-tail {
++  align-items: center;
++  display: inline-flex;
++  white-space: nowrap;
++}
++
++.module-message__maoyi-translation-refresh {
++  @include mixins.font-body-1;
++
++  align-items: center;
++  appearance: none;
++  background: transparent;
++  border: 0;
++  border-radius: 50%;
++  color: inherit;
++  cursor: pointer;
++  display: inline-flex;
++  height: 24px;
++  justify-content: center;
++  flex: 0 0 auto;
++  margin: 0 0 0 3px;
++  opacity: 0.72;
++  padding: 0;
++  width: 24px;
++
++  &:hover {
++    background: color-mix(in srgb, currentColor 12%, transparent);
++    opacity: 1;
++  }
++
++  &:focus-visible {
++    outline: 2px solid currentColor;
++    outline-offset: 1px;
++  }
+ }
+ 
+ .module-message__metadata {
+diff --git a/ts/components/conversation/Message.dom.tsx b/ts/components/conversation/Message.dom.tsx
+index 2c8ed8c..64c9b41 100644
+--- a/ts/components/conversation/Message.dom.tsx
++++ b/ts/components/conversation/Message.dom.tsx
+@@ -403,6 +403,7 @@ export type PropsActions = {
+ 
+   onToggleSelect: (selected: boolean, shift: boolean) => void;
+   onReplyToMessage: () => void;
++  onMaoyiTranslationRefresh?: () => void;
+ };
+ 
+ export type Props = PropsData & PropsHousekeeping & PropsActions;
+@@ -806,6 +807,7 @@ export class Message extends PureComponent<Props, State> {
+       attachments,
+       deletedForEveryone,
+       maoyiTranslationText,
++      onMaoyiTranslationRefresh,
+       direction,
+       expirationLength,
+       expirationTimestamp,
+@@ -2551,17 +2553,48 @@ export class Message extends PureComponent<Props, State> {
+       return null;
+     }
+ 
++    const characters = Array.from(maoyiTranslationText);
++    const lastCharacter = characters.pop() ?? '';
++
+     return (
+       <div
+         className="module-message__maoyi-translation"
+         dir="auto"
+         lang="zh-CN"
+       >
+-        {maoyiTranslationText}
++        {characters.join('')}
++        <span className="module-message__maoyi-translation-tail">
++          <span>{lastCharacter}</span>
++          {this.renderMaoyiTranslationRefresh()}
++        </span>
+       </div>
+     );
+   }
+ 
++  public renderMaoyiTranslationRefresh(): JSX.Element | null {
++    const { i18n, onMaoyiTranslationRefresh } = this.props;
++    if (!onMaoyiTranslationRefresh) {
++      return null;
++    }
++
++    const label = i18n('icu:FunPanelGifs__SearchResults__ErrorRetryButton');
++    return (
++      <button
++        type="button"
++        className="module-message__maoyi-translation-refresh"
++        aria-label={label}
++        title={label}
++        onClick={event => {
++          event.preventDefault();
++          event.stopPropagation();
++          onMaoyiTranslationRefresh();
++        }}
++      >
++        ↻
++      </button>
++    );
++  }
++
+   #shouldShowActionButton(): boolean {
+     const { previews } = this.props;
+ 
+diff --git a/ts/components/conversation/TimelineItem.dom.tsx b/ts/components/conversation/TimelineItem.dom.tsx
+index f72a059..39205eb 100644
+--- a/ts/components/conversation/TimelineItem.dom.tsx
++++ b/ts/components/conversation/TimelineItem.dom.tsx
+@@ -209,6 +209,7 @@ type PropsLocalType = {
+   containerElementRef: RefObject<HTMLElement | null>;
+   conversationId: string;
+   maoyiTranslationText?: string;
++  onMaoyiTranslationRefresh?: () => void;
+   getSharedGroupNames: GetSharedGroupNamesType;
+   item?: TimelineItemType;
+   id: string;
+@@ -268,6 +269,7 @@ export const TimelineItem = memo(function TimelineItem({
+   containerElementRef,
+   conversationId,
+   maoyiTranslationText,
++  onMaoyiTranslationRefresh,
+   getPreferredBadge,
+   getSharedGroupNames,
+   i18n,
+@@ -320,6 +322,7 @@ export const TimelineItem = memo(function TimelineItem({
+         {...reducedProps}
+         {...item.data}
+         maoyiTranslationText={maoyiTranslationText}
++        onMaoyiTranslationRefresh={onMaoyiTranslationRefresh}
+         interactivity={interactivity}
+         isTargeted={isTargeted}
+         targetMessage={targetMessage}
+diff --git a/ts/maoyi/messageBridge.preload.ts b/ts/maoyi/messageBridge.preload.ts
+index 4144b69..5c2a2ba 100644
+--- a/ts/maoyi/messageBridge.preload.ts
++++ b/ts/maoyi/messageBridge.preload.ts
+@@ -65,6 +65,9 @@ type MaoyiIpcRenderer = Readonly<{
+ 
+ export type MaoyiRendererMessageBridge = Readonly<{
+   publishAddedMessage: (message: MaoyiMessageProjection) => Promise<void>;
++  requestTranslationRefresh: (
++    message: MaoyiMessageProjection
++  ) => Promise<void>;
+   publishVisibleMessages: (
+     conversationId: string,
+     messages: ReadonlyArray<MaoyiMessageProjection>
+@@ -115,6 +118,20 @@ function isCanonicalProjection(
+   );
+ }
+ 
++function projectionsExactlyMatch(
++  left: MaoyiMessageProjection,
++  right: MaoyiMessageProjection
++): boolean {
++  return (
++    left.conversationId === right.conversationId &&
++    left.messageId === right.messageId &&
++    left.sourceHash === right.sourceHash &&
++    left.sourceText === right.sourceText &&
++    left.direction === right.direction &&
++    left.timestamp === right.timestamp
++  );
++}
++
+ function parseTranslationResult(
+   value: unknown,
+   conversationId: string
+@@ -483,6 +500,40 @@ export function createMaoyiRendererMessageBridge(
+         await sendEvent({ type: 'message.added', ...message });
+       });
+     },
++    requestTranslationRefresh(message: MaoyiMessageProjection) {
++      const generation = securityGeneration;
++      const revision = normalPublishRevision;
++      return enqueue(async () => {
++        if (
++          stopped ||
++          generation !== securityGeneration ||
++          revision !== normalPublishRevision ||
++          !isCanonicalProjection(message)
++        ) {
++          return;
++        }
++        const snapshot = snapshotProvider?.();
++        const matches = snapshot?.messages.filter(
++          item =>
++            item.messageId.toLowerCase() === message.messageId.toLowerCase()
++        );
++        const [match] = matches ?? [];
++        if (
++          announcedConversationId !== message.conversationId ||
++          snapshot?.conversationId !== message.conversationId ||
++          matches?.length !== 1 ||
++          !match ||
++          !projectionsExactlyMatch(match, message)
++        ) {
++          return;
++        }
++        await sendEvent({
++          type: 'translation.refresh.request',
++          requestId: randomUUID(),
++          ...message,
++        });
++      });
++    },
+     publishVisibleMessages(
+       conversationId: string,
+       messages: ReadonlyArray<MaoyiMessageProjection>
+@@ -571,6 +622,15 @@ export function publishMaoyiAddedMessage(
+   );
+ }
+ 
++export function requestMaoyiTranslationRefresh(
++  message: MaoyiMessageProjection
++): Promise<void> {
++  return (
++    getRendererMessageBridge()?.requestTranslationRefresh(message) ??
++    Promise.resolve()
++  );
++}
++
+ export function setMaoyiSnapshotProvider(
+   provider: SnapshotProvider
+ ): () => void {
+diff --git a/ts/state/smart/TimelineItem.preload.tsx b/ts/state/smart/TimelineItem.preload.tsx
+index 2eac6fd..5d31a53 100644
+--- a/ts/state/smart/TimelineItem.preload.tsx
++++ b/ts/state/smart/TimelineItem.preload.tsx
+@@ -49,6 +49,7 @@ import { isInternalFeaturesEnabled } from '../../util/isInternalFeaturesEnabled.
+ import type { CollapseSet } from '../../util/CollapseSet.std.ts';
+ import { isSignalConversation } from '../../util/isSignalConversation.dom.ts';
+ import { projectMaoyiMessage } from '../../maoyi/messageProjection.std.ts';
++import { requestMaoyiTranslationRefresh } from '../../maoyi/messageBridge.preload.ts';
+ import { useMaoyiTranslation } from '../../maoyi/translationRuntime.preload.ts';
+ 
+ export type RenderItemProps = Omit<SmartTimelineItemProps, 'renderItem'>;
+@@ -114,6 +115,11 @@ export const SmartTimelineItem = memo(function SmartTimelineItem(
+   const maoyiTranslationText = useMaoyiTranslation(
+     maoyiMessageProjection
+   );
++  const onMaoyiTranslationRefresh = useCallback(() => {
++    if (maoyiMessageProjection) {
++      void requestMaoyiTranslationRefresh(maoyiMessageProjection);
++    }
++  }, [maoyiMessageProjection]);
+   const targetedMessage = useSelector(getTargetedMessage);
+   const targetedMessageSource = useSelector(getTargetedMessageSource);
+   const isTargeted = Boolean(
+@@ -259,6 +265,9 @@ export const SmartTimelineItem = memo(function SmartTimelineItem(
+       item={processedTimelineItem}
+       id={messageId}
+       maoyiTranslationText={maoyiTranslationText}
++      onMaoyiTranslationRefresh={
++        maoyiMessageProjection ? onMaoyiTranslationRefresh : undefined
++      }
+       containerElementRef={containerElementRef}
+       containerWidthBreakpoint={containerWidthBreakpoint}
+       conversationId={conversationId}
+diff --git a/ts/test-node/maoyi/controlProtocol_test.node.ts b/ts/test-node/maoyi/controlProtocol_test.node.ts
+index 265d5f9..34a8af8 100644
+--- a/ts/test-node/maoyi/controlProtocol_test.node.ts
++++ b/ts/test-node/maoyi/controlProtocol_test.node.ts
+@@ -311,6 +311,14 @@ describe('Maoyi typed control protocol', () => {
+       }),
+       { type: 'message.added', ...addedMessage }
+     );
++    assert.deepEqual(
++      parseMaoyiMessageControlEvent({
++        type: 'translation.refresh.request',
++        requestId,
++        ...addedMessage,
++      }),
++      { type: 'translation.refresh.request', requestId, ...addedMessage }
++    );
+     assert.deepEqual(
+       parseMaoyiMessageControlEvent({
+         type: 'conversation.changed',
+@@ -347,6 +355,32 @@ describe('Maoyi typed control protocol', () => {
+   });
+ 
+   it('rejects malformed message events', () => {
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'translation.refresh.request',
++        requestId: 'not-a-uuid',
++        ...addedMessage,
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'translation.refresh.request',
++        requestId,
++        ...addedMessage,
++        sourceText: 'edited text',
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'translation.refresh.request',
++        requestId,
++        ...addedMessage,
++        extra: true,
++      }),
++      undefined
++    );
+     assert.equal(
+       parseMaoyiMessageControlEvent({
+         type: 'message.added',
+diff --git a/ts/test-node/maoyi/messageBridge_test.main.ts b/ts/test-node/maoyi/messageBridge_test.main.ts
+index 80cef7f..af1a1ab 100644
+--- a/ts/test-node/maoyi/messageBridge_test.main.ts
++++ b/ts/test-node/maoyi/messageBridge_test.main.ts
+@@ -204,6 +204,27 @@ describe('Maoyi main message bridge', () => {
+     assert.equal(ipc.handler(event, addedEvent), true);
+     assert.equal(ipc.handler(event, addedEvent), false);
+     assert.deepEqual(control.sent.at(-1), addedEvent);
++    const refreshEvent = {
++      type: 'translation.refresh.request',
++      requestId,
++      conversationId,
++      messageId,
++      sourceHash: legacyMaoyiSourceHash('hello'),
++      sourceText: 'hello',
++      direction: 'incoming',
++      timestamp: 1_800_000_000_000,
++    } as const;
++    assert.equal(ipc.handler(event, refreshEvent), true);
++    assert.deepEqual(control.sent.at(-1), refreshEvent);
++    assert.equal(ipc.handler(event, refreshEvent), false);
++    assert.equal(
++      ipc.handler(event, {
++        ...refreshEvent,
++        requestId: secondRequestId,
++        conversationId: '44444444-4444-4444-8444-444444444444',
++      }),
++      false
++    );
+     assert.equal(
+       ipc.handler(event, {
+         ...addedEvent,
+@@ -328,6 +349,10 @@ describe('Maoyi main message bridge', () => {
+       }),
+       false
+     );
++    assert.equal(
++      ipc.handler(event, { ...refreshEvent, requestId: secondRequestId }),
++      false
++    );
+ 
+     exposable = true;
+     window.visible = true;
+diff --git a/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts b/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts
+index 57f4635..ab1e669 100644
+--- a/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts
++++ b/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts
+@@ -69,6 +69,18 @@ function isVisibleBatch(value: unknown): value is Readonly<{
+   );
+ }
+ 
++function requestIdPlaceholder(value: object): '<uuid>' {
++  assert.ok(
++    'requestId' in value && typeof value.requestId === 'string',
++    'refresh request must carry a request UUID'
++  );
++  assert.match(
++    value.requestId,
++    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
++  );
++  return '<uuid>';
++}
++
+ class FakeRendererTransport {
+   public readonly invocations: Array<unknown> = [];
+   public listener:
+@@ -202,6 +214,55 @@ describe('Maoyi renderer message bridge', () => {
+     bridge.stop();
+   });
+ 
++  it('requests refresh only for one exact projection in the announced visible snapshot', async () => {
++    const transport = new FakeRendererTransport();
++    const bridge = createMaoyiRendererMessageBridge(transport);
++    const value = projection();
++    let snapshotMessages: ReadonlyArray<MaoyiMessageProjection> = [value];
++    let currentConversationId = conversationId;
++    bridge.setSnapshotProvider(() => ({
++      conversationId: currentConversationId,
++      messages: snapshotMessages,
++    }));
++
++    await bridge.publishVisibleMessages(conversationId, [value]);
++    await bridge.requestTranslationRefresh(value);
++    const refresh = transport.invocations.at(-1);
++    assert.deepEqual(
++      typeof refresh === 'object' && refresh != null
++        ? { ...refresh, requestId: requestIdPlaceholder(refresh) }
++        : refresh,
++      {
++        type: 'translation.refresh.request',
++        requestId: '<uuid>',
++        ...value,
++      }
++    );
++
++    const acceptedCount = transport.invocations.length;
++    snapshotMessages = [projection({ text: 'Edited English body' })];
++    await bridge.requestTranslationRefresh(value);
++    assert.equal(transport.invocations.length, acceptedCount);
++
++    snapshotMessages = [
++      value,
++      { ...value, messageId: messageId.toUpperCase() },
++    ];
++    await bridge.requestTranslationRefresh(value);
++    assert.equal(transport.invocations.length, acceptedCount);
++
++    currentConversationId = otherConversationId;
++    snapshotMessages = [value];
++    await bridge.requestTranslationRefresh(value);
++    assert.equal(transport.invocations.length, acceptedCount);
++
++    bridge.clear();
++    currentConversationId = conversationId;
++    await bridge.requestTranslationRefresh(value);
++    assert.equal(transport.invocations.length, acceptedCount);
++    bridge.stop();
++  });
++
+   it('applies only an exact one-time result and clears on the main-process gate', async () => {
+     const transport = new FakeRendererTransport();
+     const bridge = createMaoyiRendererMessageBridge(transport);
+diff --git a/ts/test-node/maoyi/sourceBubbleRefreshContract_test.node.ts b/ts/test-node/maoyi/sourceBubbleRefreshContract_test.node.ts
+new file mode 100644
+index 0000000..7f10cf1
+--- /dev/null
++++ b/ts/test-node/maoyi/sourceBubbleRefreshContract_test.node.ts
+@@ -0,0 +1,74 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++
++function source(relativeUrl: string): string {
++  return readFileSync(new URL(relativeUrl, import.meta.url), 'utf8');
++}
++
++describe('Maoyi source bubble refresh contract', () => {
++  const message = source('../../components/conversation/Message.dom.tsx');
++  const timelineItem = source(
++    '../../components/conversation/TimelineItem.dom.tsx'
++  );
++  const smartTimelineItem = source(
++    '../../state/smart/TimelineItem.preload.tsx'
++  );
++  const rendererBridge = source('../../maoyi/messageBridge.preload.ts');
++  const styles = source('../../../stylesheets/_modules.scss');
++
++  it('renders the native refresh button beside the final translated character', () => {
++    const start = message.indexOf('public renderMaoyiTranslationRefresh()');
++    const end = message.indexOf('#shouldShowActionButton()', start);
++    assert.notEqual(start, -1);
++    assert.notEqual(end, -1);
++    const method = message.slice(start, end);
++    assert.match(method, /if \(!onMaoyiTranslationRefresh\)/);
++    assert.match(method, /<button[\s\S]*?>[\s\S]*?↻[\s\S]*?<\/button>/);
++    assert.match(
++      message,
++      /const characters = Array\.from\(maoyiTranslationText\)[\s\S]*?const lastCharacter = characters\.pop\(\) \?\? ''[\s\S]*?module-message__maoyi-translation-tail[\s\S]*?renderMaoyiTranslationRefresh\(\)/
++    );
++    assert.doesNotMatch(message, /renderMaoyiTranslationFooter/);
++    assert.match(
++      styles,
++      /\.module-message__maoyi-translation-tail[\s\S]*?display: inline-flex;[\s\S]*?white-space: nowrap;/
++    );
++    assert.match(
++      styles,
++      /\.module-message__maoyi-translation-refresh[\s\S]*?margin: 0 0 0 3px;/
++    );
++  });
++
++  it('threads only a canonical projection callback through smart and native timeline items', () => {
++    assert.match(
++      smartTimelineItem,
++      /requestMaoyiTranslationRefresh\(maoyiMessageProjection\)/
++    );
++    assert.match(
++      smartTimelineItem,
++      /maoyiMessageProjection \? onMaoyiTranslationRefresh : undefined/
++    );
++    assert.match(
++      timelineItem,
++      /onMaoyiTranslationRefresh=\{onMaoyiTranslationRefresh\}/
++    );
++  });
++
++  it('uses the authenticated bridge path without restoring a DOM scanner', () => {
++    for (const value of [
++      message,
++      timelineItem,
++      smartTimelineItem,
++      rendererBridge,
++    ]) {
++      assert.doesNotMatch(value, /MutationObserver|querySelectorAll\(/);
++    }
++    assert.match(
++      rendererBridge,
++      /type: 'translation\.refresh\.request'[\s\S]*?requestId: randomUUID\(\)/
++    );
++  });
++});

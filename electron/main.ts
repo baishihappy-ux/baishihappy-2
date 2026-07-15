@@ -15,14 +15,14 @@ import {
   type IpcMainInvokeEvent,
   type Session
 } from 'electron';
-import { appendFile, cp, readdir, readFile, writeFile, mkdir, rename, rm } from 'node:fs/promises';
-import type { Dirent } from 'node:fs';
+import { appendFile, cp, readdir, readFile, writeFile, mkdir, rename, rm, stat } from 'node:fs/promises';
+import { createReadStream, lstatSync, readFileSync, realpathSync, statSync, type Dirent } from 'node:fs';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { createServer as createNetServer, type Server as NetServer, type Socket } from 'node:net';
-import { cpus, freemem, totalmem } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { cpus, freemem, networkInterfaces, totalmem } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type {
   AppConfig,
@@ -43,9 +43,25 @@ import type {
   NonEnglishContactRequest,
   LockScreenStatus,
   LockScreenSetPinResult,
-  LockScreenUnlockResult
+  LockScreenUnlockResult,
+  NetworkOfflineCheckResult,
+  LockScreenPinChangeMode,
+  LockScreenPinChangeAuthorizationResult
 } from './shared.js';
-import { ClientLicenseManager } from './client-license.js';
+import {
+  buildWindowsChromiumUserAgent,
+  buildSignalSourceOnlyAcceptanceDiagnostic,
+  sanitizeLastActiveProfileIds,
+  sanitizeProfileTabOrder,
+  resolveProfileUserAgent,
+  restoreComposerEnglishLayout,
+  sanitizeComposerEnglishTranslation,
+  signalSourceOnlyAcceptanceStages,
+  workspaceAppForPlatform,
+  type SignalSourceOnlyAcceptanceStage,
+  type SignalSourceOnlyAcceptanceStageCounts
+} from './shared.js';
+import { ClientLicenseManager, type ClientLicenseSnapshot } from './client-license.js';
 import {
   cloneResetArgument,
   cloneResetPlanPathFromArgs,
@@ -75,18 +91,113 @@ import {
   type WalletNetwork
 } from './payment-address.js';
 import { SensitiveSendAuthorizationStore } from './sensitive-send-authorization.js';
+import {
+  protectTranslationSensitiveTokens,
+  restoreTranslationSensitiveTokens
+} from './translation-sensitive-tokens.js';
+import {
+  decryptTranslationPromptBundle,
+  encryptTranslationPromptBundle,
+  translationPromptBundleFileName,
+  type TranslationPrompts
+} from './translation-prompt-bundle.js';
+import { normalizeComposerEnglishStyle } from './translation-english-style.js';
 
 const defaultModel = 'deepseek-v4-flash';
 const appDisplayName = 'maoyi';
 const appUserDataDirName = 'maoyi';
 const appDataFolderName = 'maoyi Data';
 const storageBootstrapDirName = 'maoyi Launcher';
-const windowsAppUserModelId = 'maoyi.translator';
+const windowsAppUserModelId = 'Maoyi.Translator';
 const legacyUserDataDirName = 'chat-translator';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const preloadPath = join(__dirname, '../electron/preload.cjs');
 const cloneResetPlanPath = cloneResetPlanPathFromArgs();
 const cloneResetWorkerMode = Boolean(cloneResetPlanPath);
+const developmentProjectRoot = resolve(app.getAppPath());
+const signalSourceExperimentValue = !app.isPackaged
+  ? process.env.MAOYI_SIGNAL_SOURCE_EXE?.trim() || ''
+  : '';
+const supportedSignalSourcePatchSets: Readonly<Record<string, string>> = Object.freeze({
+  '8.17.0': '6C6CE9E865BFD5904937FE77A76428021EFFDDA350CDE32D80EEE8FC65E83052',
+  '8.18.0': 'E25AA0F8308BF5DB04A41D3ED12E4F717884AFCC118BA639786A3AE523C7D1D6'
+});
+const signalSourceOnlyAcceptanceValue =
+  process.env.MAOYI_SIGNAL_SOURCE_ONLY_ACCEPTANCE?.trim() || '';
+if (signalSourceOnlyAcceptanceValue && !['0', '1'].includes(signalSourceOnlyAcceptanceValue)) {
+  throw new Error('MAOYI_SIGNAL_SOURCE_ONLY_ACCEPTANCE must be 0 or 1.');
+}
+const signalSourceOnlyAcceptanceRequested = signalSourceOnlyAcceptanceValue === '1';
+let signalSourceExperimentMetadata: {
+  version: string;
+  patchSetSha256: string;
+  isolatedRuntimeCopy: boolean;
+} | null = null;
+let signalSourceOnlyAcceptanceActive = false;
+
+function resolveSignalSourceOnlyAcceptance() {
+  if (!signalSourceOnlyAcceptanceRequested) return false;
+  const hasConflictingMode = Boolean(
+    cloneResetWorkerMode ||
+      process.env.VITE_DEV_SERVER_URL ||
+      process.argv.some(argument => argument.startsWith('--remote-debugging-')) ||
+      Object.keys(process.env).some(name => name.startsWith('MAOYI_SMOKE_') && process.env[name])
+  );
+  if (
+    app.isPackaged ||
+    process.platform !== 'win32' ||
+    !signalSourceExperimentValue ||
+    hasConflictingMode
+  ) {
+    throw new Error('Signal source-only acceptance requires an isolated Windows source experiment.');
+  }
+  signalExecutableCandidates();
+  if (
+    signalSourceExperimentMetadata?.version !== '8.18.0' ||
+    signalSourceExperimentMetadata.patchSetSha256 !== supportedSignalSourcePatchSets['8.18.0'] ||
+    !signalSourceExperimentMetadata.isolatedRuntimeCopy
+  ) {
+    throw new Error('Signal source-only acceptance requires the exact isolated v8.18.0 patch set.');
+  }
+  return true;
+}
+
+function isCanonicalChildPath(rootPath: string, targetPath: string) {
+  const childPath = relative(rootPath, targetPath);
+  return Boolean(
+    childPath &&
+      childPath !== '..' &&
+      !childPath.startsWith(`..${sep}`) &&
+      !isAbsolute(childPath)
+  );
+}
+
+function assertCanonicalChildPath(rootPath: string, targetPath: string, label: string) {
+  if (!isCanonicalChildPath(rootPath, targetPath)) {
+    throw new Error(`${label} must stay inside ${rootPath}.`);
+  }
+}
+
+function canonicalRealDirectory(path: string, label: string) {
+  const entry = lstatSync(path);
+  if (entry.isSymbolicLink() || !entry.isDirectory()) {
+    throw new Error(`${label} must be a real directory.`);
+  }
+  return realpathSync.native(path);
+}
+
+function validateSignalSourceExperimentUserData(userDataPath: string) {
+  if (!userDataPath || !isAbsolute(userDataPath)) {
+    throw new Error('Signal source experiments require an absolute MAOYI_USER_DATA_DIR.');
+  }
+  const allowedRoot = join(developmentProjectRoot, '.tmp', 'signal-source-ui');
+  const canonicalRoot = canonicalRealDirectory(allowedRoot, 'Signal source experiment root');
+  const canonicalUserData = realpathSync.native(userDataPath);
+  if (lstatSync(userDataPath).isSymbolicLink() || !statSync(canonicalUserData).isDirectory()) {
+    throw new Error('Signal source experiment user data must be a real directory.');
+  }
+  assertCanonicalChildPath(canonicalRoot, canonicalUserData, 'Signal source experiment user data');
+}
 
 protocol.registerSchemesAsPrivileged([{
   scheme: 'app',
@@ -107,12 +218,14 @@ const platformDefaults: Record<Platform, { label: string; url: string }> = {
   signal: { label: 'Signal', url: '' }
 };
 
-const whatsappUserAgent =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+const whatsappUserAgent = buildWindowsChromiumUserAgent(process.versions.chrome);
 const telegramUserAgent =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.243 Safari/537.36';
 const defaultBrowserUserAgent = whatsappUserAgent;
 const userDataOverride = process.env.MAOYI_USER_DATA_DIR?.trim() || '';
+if (signalSourceExperimentValue) {
+  validateSignalSourceExperimentUserData(userDataOverride);
+}
 const defaultUserDataPath = join(app.getPath('appData'), appUserDataDirName);
 const runtimeLoggingEnabled = !app.isPackaged;
 app.setName(appDisplayName);
@@ -139,7 +252,7 @@ let activeRuntimeSecurity: { payload: RuntimeBindingPayload; devicePrivateKeyPem
 const configuredPartitions = new Set<string>();
 const partitionPolicies = new Map<string, Platform>();
 const sessionPolicies = new Map<Session, Platform>();
-const translationCacheWriteQueues = new Map<string, Promise<void>>();
+const translationCacheWriteQueues = new Map<string, Promise<boolean>>();
 const translationCacheChunkRecordLimit = 1000;
 const translationCacheChunkByteLimit = 2 * 1024 * 1024;
 const visibleMessageDeepSeekDedupe = new Map<string, Promise<string>>();
@@ -192,6 +305,799 @@ type SignalControlClient = SignalControlSession & {
 };
 const signalControlSessions = new Map<string, SignalControlSession>();
 const signalControlClients = new Map<string, SignalControlClient>();
+type PendingSignalCacheSnapshotRequest = {
+  requestId: string;
+  conversationId: string;
+  client: SignalControlClient;
+  state: 'pending' | 'responding' | 'completed';
+  acceptanceTrigger?: {
+    messageId: string;
+    sourceHash: string;
+    resultSent: boolean;
+    forceCacheResult?: boolean;
+    refreshTaskKey?: string;
+  };
+};
+type ActiveSignalCacheConversation = {
+  conversationId: string;
+  client: SignalControlClient;
+};
+const signalCachePendingRequestLimit = 128;
+const signalCacheInFlightRequestLimit = 8;
+const pendingSignalCacheSnapshotRequests = new Map<
+  string,
+  Map<string, PendingSignalCacheSnapshotRequest>
+>();
+const signalCacheInFlightRequestCounts = new Map<string, number>();
+const activeSignalCacheConversations = new Map<string, ActiveSignalCacheConversation>();
+
+// SIGNAL_SOURCE_ONLY_ACCEPTANCE_DIAGNOSTICS_START
+const signalSourceOnlyAcceptanceStageCounts = Object.fromEntries(
+  signalSourceOnlyAcceptanceStages.map(stage => [stage, 0])
+) as SignalSourceOnlyAcceptanceStageCounts;
+let signalSourceOnlyAcceptanceStartedAt = 0;
+let signalSourceOnlyAcceptanceSummaryWriteQueue: Promise<void> = Promise.resolve();
+
+function initializeSignalSourceOnlyAcceptanceDiagnostics() {
+  for (const stage of signalSourceOnlyAcceptanceStages) {
+    signalSourceOnlyAcceptanceStageCounts[stage] = 0;
+  }
+  signalSourceOnlyAcceptanceStartedAt = Date.now();
+  appendSignalSourceOnlyAcceptanceStage('mode-active');
+}
+
+function appendSignalSourceOnlyAcceptanceStage(
+  stage: SignalSourceOnlyAcceptanceStage
+) {
+  if (!signalSourceOnlyAcceptanceActive || !runtimeLoggingEnabled) return;
+  signalSourceOnlyAcceptanceStageCounts[stage] += 1;
+  const summary = buildSignalSourceOnlyAcceptanceDiagnostic(
+    stage,
+    signalSourceOnlyAcceptanceStageCounts,
+    Math.max(0, Date.now() - signalSourceOnlyAcceptanceStartedAt)
+  );
+  signalSourceOnlyAcceptanceSummaryWriteQueue = signalSourceOnlyAcceptanceSummaryWriteQueue
+    .catch(() => undefined)
+    .then(async () => {
+      await mkdir(app.getPath('userData'), { recursive: true });
+      await writeJsonAtomic(signalSourceOnlyAcceptanceSummaryPath(), summary);
+    });
+}
+// SIGNAL_SOURCE_ONLY_ACCEPTANCE_DIAGNOSTICS_END
+
+// SIGNAL_LIVE_TRANSLATION_QUEUE_START
+const signalLiveTranslationGlobalConcurrency = 24;
+const signalLiveTranslationProfileConcurrency = 1;
+const signalLiveTranslationPendingLimit = signalCachePendingRequestLimit;
+const signalLiveTranslationSourceTextLimit = 4_000;
+const signalLiveTranslationRefreshCoalesceMs = 100;
+const signalLiveTranslationRetryDelaysMs = [5_000, 30_000] as const;
+const signalTranslationRefreshCooldownMs = 1_500;
+const signalTranslationRefreshStateLimit = 512;
+
+type SignalLiveTranslationMode = 'live' | 'manual-refresh';
+
+type SignalLiveTranslationTask = {
+  key: string;
+  mode: SignalLiveTranslationMode;
+  appId: string;
+  profileId: string;
+  conversationId: string;
+  client: SignalControlClient;
+  messageId: string;
+  sourceHash: string;
+  sourceText: string;
+  direction: 'incoming' | 'outgoing';
+  attempts: number;
+  createdAt: number;
+  cancelled: boolean;
+  abortController: AbortController;
+  translatedText?: string;
+  refreshIdentityKey?: string;
+  refreshProjectionKey?: string;
+  refreshRevision?: number;
+};
+
+type SignalLiveTranslationRetry = {
+  task: SignalLiveTranslationTask;
+  timer: NodeJS.Timeout;
+};
+
+type SignalLiveTranslationRefresh = {
+  appId: string;
+  task: SignalLiveTranslationTask;
+  timer: NodeJS.Timeout;
+};
+
+type SignalTranslationRefreshState = {
+  appId: string;
+  revision: number;
+  projectionKey: string;
+  acceptedAt: number;
+  taskKey: string;
+};
+
+type SignalTranslationRefreshObservation = {
+  taskKey?: string;
+  pending: boolean;
+};
+
+const signalLiveTranslationQueue: SignalLiveTranslationTask[] = [];
+const signalLiveTranslationPendingKeys = new Set<string>();
+const signalLiveTranslationRetryTimers = new Map<string, SignalLiveTranslationRetry>();
+const signalLiveTranslationRunningProfiles = new Map<string, number>();
+const signalLiveTranslationRunningTasks = new Map<string, SignalLiveTranslationTask>();
+const signalLiveTranslationRefreshTimers = new Map<string, SignalLiveTranslationRefresh>();
+const signalTranslationRefreshStates = new Map<string, SignalTranslationRefreshState>();
+let signalLiveTranslationRunningCount = 0;
+let signalLiveTranslationPumpTimer: NodeJS.Timeout | null = null;
+
+function signalLiveTranslationTaskKey(
+  profileId: string,
+  conversationId: string,
+  messageId: string,
+  sourceHash: string,
+  sourceText: string
+) {
+  const exactSourceDigest = createHash('sha256')
+    .update(normalizeSignalCacheSourceText(sourceText), 'utf8')
+    .digest('base64url');
+  return JSON.stringify([
+    profileId,
+    conversationId,
+    messageId,
+    sourceHash,
+    exactSourceDigest
+  ]);
+}
+
+function signalTranslationRefreshIdentityKey(
+  profileId: string,
+  conversationId: string,
+  messageId: string
+) {
+  return JSON.stringify([profileId, conversationId, messageId]);
+}
+
+function signalTranslationRefreshProjectionKey(message: SignalVisibleMessage) {
+  const exactSourceDigest = createHash('sha256')
+    .update(normalizeSignalCacheSourceText(message.sourceText), 'utf8')
+    .digest('base64url');
+  return JSON.stringify([
+    message.sourceHash,
+    exactSourceDigest,
+    message.direction,
+    message.timestamp
+  ]);
+}
+
+function observeSignalTranslationRefresh(
+  profileId: string,
+  conversationId: string,
+  messageId: string
+): SignalTranslationRefreshObservation {
+  const state = signalTranslationRefreshStates.get(
+    signalTranslationRefreshIdentityKey(profileId, conversationId, messageId)
+  );
+  return {
+    taskKey: state?.taskKey,
+    pending: Boolean(state?.taskKey && signalLiveTranslationPendingKeys.has(state.taskKey))
+  };
+}
+
+function isSignalTranslationRefreshObservationSettled(
+  profileId: string,
+  conversationId: string,
+  messageId: string,
+  observed: SignalTranslationRefreshObservation
+) {
+  const current = observeSignalTranslationRefresh(profileId, conversationId, messageId);
+  return Boolean(
+    !observed.pending &&
+      !current.pending &&
+      observed.taskKey === current.taskKey
+  );
+}
+
+function isSignalTranslationRefreshTriggerCurrent(
+  profileId: string,
+  pending: PendingSignalCacheSnapshotRequest
+) {
+  const refreshTaskKey = pending.acceptanceTrigger?.refreshTaskKey;
+  if (!refreshTaskKey || !pending.acceptanceTrigger) return true;
+  return observeSignalTranslationRefresh(
+    profileId,
+    pending.conversationId,
+    pending.acceptanceTrigger.messageId
+  ).taskKey === refreshTaskKey;
+}
+
+function sameSignalLiveTranslationMessage(
+  task: SignalLiveTranslationTask,
+  appId: string,
+  conversationId: string,
+  messageId: string
+) {
+  return Boolean(
+    task.appId === appId &&
+      task.conversationId === conversationId &&
+      task.messageId === messageId
+  );
+}
+
+function cancelSignalLiveTranslationTask(task: SignalLiveTranslationTask) {
+  task.cancelled = true;
+  task.abortController.abort();
+  signalLiveTranslationPendingKeys.delete(task.key);
+}
+
+function hasSignalLiveTranslationForMessage(
+  appId: string,
+  conversationId: string,
+  messageId: string
+) {
+  return Boolean(
+    signalLiveTranslationQueue.some(task =>
+      sameSignalLiveTranslationMessage(task, appId, conversationId, messageId)
+    ) ||
+      Array.from(signalLiveTranslationRetryTimers.values()).some(({ task }) =>
+        sameSignalLiveTranslationMessage(task, appId, conversationId, messageId)
+      ) ||
+      Array.from(signalLiveTranslationRunningTasks.values()).some(task =>
+        sameSignalLiveTranslationMessage(task, appId, conversationId, messageId)
+      )
+  );
+}
+
+function cancelSignalLiveTranslationsForMessage(
+  appId: string,
+  conversationId: string,
+  messageId: string
+) {
+  for (let index = signalLiveTranslationQueue.length - 1; index >= 0; index -= 1) {
+    const task = signalLiveTranslationQueue[index];
+    if (!sameSignalLiveTranslationMessage(task, appId, conversationId, messageId)) continue;
+    signalLiveTranslationQueue.splice(index, 1);
+    cancelSignalLiveTranslationTask(task);
+  }
+  for (const [key, retry] of signalLiveTranslationRetryTimers) {
+    if (!sameSignalLiveTranslationMessage(retry.task, appId, conversationId, messageId)) continue;
+    clearTimeout(retry.timer);
+    signalLiveTranslationRetryTimers.delete(key);
+    cancelSignalLiveTranslationTask(retry.task);
+  }
+  for (const task of signalLiveTranslationRunningTasks.values()) {
+    if (!sameSignalLiveTranslationMessage(task, appId, conversationId, messageId)) continue;
+    cancelSignalLiveTranslationTask(task);
+  }
+  for (const [key, refresh] of signalLiveTranslationRefreshTimers) {
+    if (!sameSignalLiveTranslationMessage(refresh.task, appId, conversationId, messageId)) continue;
+    clearTimeout(refresh.timer);
+    signalLiveTranslationRefreshTimers.delete(key);
+  }
+}
+
+function trimSignalTranslationRefreshStates() {
+  while (signalTranslationRefreshStates.size > signalTranslationRefreshStateLimit) {
+    let evicted = false;
+    for (const [key, state] of signalTranslationRefreshStates) {
+      if (state.taskKey && signalLiveTranslationPendingKeys.has(state.taskKey)) continue;
+      signalTranslationRefreshStates.delete(key);
+      evicted = true;
+      break;
+    }
+    if (!evicted) break;
+  }
+}
+
+function cancelSignalLiveTranslationsForApp(appId: string) {
+  for (let index = signalLiveTranslationQueue.length - 1; index >= 0; index -= 1) {
+    const task = signalLiveTranslationQueue[index];
+    if (task.appId !== appId) continue;
+    signalLiveTranslationQueue.splice(index, 1);
+    cancelSignalLiveTranslationTask(task);
+  }
+  for (const [key, retry] of signalLiveTranslationRetryTimers) {
+    if (retry.task.appId !== appId) continue;
+    clearTimeout(retry.timer);
+    signalLiveTranslationRetryTimers.delete(key);
+    cancelSignalLiveTranslationTask(retry.task);
+  }
+  for (const task of signalLiveTranslationRunningTasks.values()) {
+    if (task.appId !== appId) continue;
+    cancelSignalLiveTranslationTask(task);
+  }
+  for (const [key, refresh] of signalLiveTranslationRefreshTimers) {
+    if (refresh.appId !== appId) continue;
+    clearTimeout(refresh.timer);
+    signalLiveTranslationRefreshTimers.delete(key);
+  }
+  for (const [key, state] of signalTranslationRefreshStates) {
+    if (state.appId === appId) signalTranslationRefreshStates.delete(key);
+  }
+}
+
+function cancelAllSignalLiveTranslations() {
+  const appIds = new Set<string>();
+  for (const task of signalLiveTranslationQueue) appIds.add(task.appId);
+  for (const retry of signalLiveTranslationRetryTimers.values()) appIds.add(retry.task.appId);
+  for (const task of signalLiveTranslationRunningTasks.values()) appIds.add(task.appId);
+  for (const refresh of signalLiveTranslationRefreshTimers.values()) appIds.add(refresh.appId);
+  for (const state of signalTranslationRefreshStates.values()) appIds.add(state.appId);
+  for (const appId of appIds) cancelSignalLiveTranslationsForApp(appId);
+}
+
+function isSignalLiveTranslationEligible(task: SignalLiveTranslationTask) {
+  const context = getSignalCacheControlContext(task.appId, task.client);
+  const activeConversation = activeSignalCacheConversations.get(task.appId);
+  const refreshState = task.mode === 'manual-refresh' && task.refreshIdentityKey
+    ? signalTranslationRefreshStates.get(task.refreshIdentityKey)
+    : undefined;
+  return Boolean(
+    !task.cancelled &&
+      context?.profileId === task.profileId &&
+      activeConversation?.client === task.client &&
+      activeConversation.conversationId === task.conversationId &&
+      (
+        task.mode !== 'manual-refresh' ||
+        (
+          refreshState?.revision === task.refreshRevision &&
+          refreshState?.projectionKey === task.refreshProjectionKey
+        )
+      )
+  );
+}
+
+function signalLiveTranslationRefreshKey(task: SignalLiveTranslationTask) {
+  return task.mode === 'manual-refresh' ? task.key : task.appId;
+}
+
+function scheduleSignalLiveTranslationRefresh(task: SignalLiveTranslationTask) {
+  if (!isSignalLiveTranslationEligible(task)) return;
+  const refreshKey = signalLiveTranslationRefreshKey(task);
+  const existing = signalLiveTranslationRefreshTimers.get(refreshKey);
+  if (
+    existing?.task.client === task.client &&
+    existing.task.conversationId === task.conversationId &&
+    isSignalLiveTranslationEligible(existing.task)
+  ) {
+    return;
+  }
+  if (existing) clearTimeout(existing.timer);
+  const timer = setTimeout(() => {
+    const scheduled = signalLiveTranslationRefreshTimers.get(refreshKey);
+    if (
+      scheduled?.timer !== timer ||
+      scheduled.task !== task
+    ) {
+      return;
+    }
+    signalLiveTranslationRefreshTimers.delete(refreshKey);
+    if (!isSignalLiveTranslationEligible(task)) return;
+    const snapshotRequest = validateSignalMessageSnapshotRequest({
+      type: 'message.snapshot.request',
+      requestId: randomUUID()
+    });
+    const pendingStored = setPendingSignalCacheRequest(task.appId, {
+      requestId: snapshotRequest.requestId,
+      conversationId: task.conversationId,
+      client: task.client,
+      state: 'pending',
+      acceptanceTrigger: task.mode === 'manual-refresh' || signalSourceOnlyAcceptanceActive
+        ? {
+            messageId: task.messageId,
+            sourceHash: task.sourceHash,
+            resultSent: false,
+            forceCacheResult: task.mode === 'manual-refresh',
+            refreshTaskKey: task.mode === 'manual-refresh' ? task.key : undefined
+          }
+        : undefined
+    });
+    if (!pendingStored) return;
+    if (!sendSignalControlMessage(task.appId, snapshotRequest)) {
+      deletePendingSignalCacheRequest(task.appId, snapshotRequest.requestId);
+      return;
+    }
+    appendSignalSourceOnlyAcceptanceStage('snapshot-request-sent');
+  }, signalLiveTranslationRefreshCoalesceMs);
+  signalLiveTranslationRefreshTimers.set(refreshKey, {
+    appId: task.appId,
+    task,
+    timer
+  });
+}
+
+async function runSignalLiveTranslationTask(task: SignalLiveTranslationTask) {
+  const forceRefresh = task.mode === 'manual-refresh';
+  const cacheRequest: TranslationCacheLookupRequest = {
+    profileId: task.profileId,
+    platform: 'signal',
+    contactId: task.conversationId,
+    contactIdType: 'platform',
+    sourceHashes: [task.sourceHash]
+  };
+  if (!isSignalLiveTranslationEligible(task)) return;
+  if (!forceRefresh) {
+    if (await isMarkedNonEnglishContact(cacheRequest)) return;
+    if (!isSignalLiveTranslationEligible(task)) return;
+
+    appendSignalSourceOnlyAcceptanceStage('cache-lookup');
+    const cachedEntries = await lookupTranslationCache(cacheRequest);
+    if (!isSignalLiveTranslationEligible(task)) return;
+    const cached = cachedEntries.find(entry => entry.sourceHash === task.sourceHash);
+    if (
+      cached &&
+      typeof cached.sourceText === 'string' &&
+      normalizeSignalCacheSourceText(cached.sourceText) ===
+        normalizeSignalCacheSourceText(task.sourceText) &&
+      isUsefulSignalCacheTranslation(task.sourceText, cached.translatedText)
+    ) {
+      appendSignalSourceOnlyAcceptanceStage('cache-hit');
+      scheduleSignalLiveTranslationRefresh(task);
+      return;
+    }
+  }
+
+  if (!task.translatedText) {
+    appendSignalSourceOnlyAcceptanceStage('api-start');
+    const translatedText = await translateWithDeepSeek(
+      {
+        requestId: randomUUID(),
+        text: task.sourceText,
+        from: 'English',
+        to: 'Chinese',
+        reason: 'visible-message',
+        profileId: task.profileId,
+        platform: 'signal',
+        sourceHash: task.sourceHash,
+        messageKey: task.messageId,
+        contactId: task.conversationId,
+        contactIdType: 'platform',
+        direction: task.direction,
+        messagePart: 'body'
+      },
+      task.abortController.signal,
+      'content-free'
+    );
+    if (!isSignalLiveTranslationEligible(task)) return;
+    if (
+      !isUsefulSignalCacheTranslation(task.sourceText, translatedText) ||
+      Buffer.byteLength(translatedText, 'utf8') > signalCacheProtocolMaxTextBytes
+    ) {
+      throw new Error('Signal live translation result is invalid.');
+    }
+    task.translatedText = translatedText;
+    appendSignalSourceOnlyAcceptanceStage('api-success');
+  }
+
+  if (!forceRefresh && await isMarkedNonEnglishContact(cacheRequest)) return;
+  if (!isSignalLiveTranslationEligible(task)) return;
+  const saved = await saveTranslationCacheEntry(
+    {
+      profileId: task.profileId,
+      sourceHash: task.sourceHash,
+      sourceText: task.sourceText,
+      translatedText: task.translatedText,
+      platform: 'signal',
+      contactId: task.conversationId,
+      contactIdType: 'platform',
+      direction: task.direction,
+      messagePart: 'body'
+    },
+    () => isSignalLiveTranslationEligible(task),
+    { bypassNonEnglishContactGuard: forceRefresh }
+  );
+  if (!saved || !isSignalLiveTranslationEligible(task)) return;
+  appendSignalSourceOnlyAcceptanceStage('cache-saved');
+  scheduleSignalLiveTranslationRefresh(task);
+}
+
+function finishSignalLiveTranslationTask(task: SignalLiveTranslationTask) {
+  signalLiveTranslationPendingKeys.delete(task.key);
+  signalLiveTranslationRetryTimers.delete(task.key);
+  trimSignalTranslationRefreshStates();
+}
+
+function releaseSignalLiveTranslationSlot(task: SignalLiveTranslationTask) {
+  signalLiveTranslationRunningTasks.delete(task.key);
+  signalLiveTranslationRunningCount = Math.max(0, signalLiveTranslationRunningCount - 1);
+  const profileCount = signalLiveTranslationRunningProfiles.get(task.profileId) ?? 0;
+  if (profileCount <= 1) {
+    signalLiveTranslationRunningProfiles.delete(task.profileId);
+  } else {
+    signalLiveTranslationRunningProfiles.set(task.profileId, profileCount - 1);
+  }
+}
+
+function scheduleSignalLiveTranslationPump() {
+  if (signalLiveTranslationPumpTimer) return;
+  signalLiveTranslationPumpTimer = setTimeout(() => {
+    signalLiveTranslationPumpTimer = null;
+    pumpSignalLiveTranslationQueue();
+  }, 0);
+}
+
+function scheduleSignalLiveTranslationRetry(task: SignalLiveTranslationTask) {
+  const retryDelay = signalLiveTranslationRetryDelaysMs[task.attempts];
+  if (retryDelay === undefined || !isSignalLiveTranslationEligible(task)) {
+    appendSignalSourceOnlyAcceptanceStage('failed');
+    finishSignalLiveTranslationTask(task);
+    return;
+  }
+  const retryTask = {
+    ...task,
+    attempts: task.attempts + 1,
+    createdAt: Date.now() + retryDelay
+  };
+  appendSignalSourceOnlyAcceptanceStage('retry-scheduled');
+  const timer = setTimeout(() => {
+    const retry = signalLiveTranslationRetryTimers.get(task.key);
+    if (retry?.timer !== timer) return;
+    signalLiveTranslationRetryTimers.delete(task.key);
+    if (!isSignalLiveTranslationEligible(retryTask)) {
+      finishSignalLiveTranslationTask(retryTask);
+      return;
+    }
+    signalLiveTranslationQueue.push(retryTask);
+    scheduleSignalLiveTranslationPump();
+  }, retryDelay);
+  signalLiveTranslationRetryTimers.set(task.key, { task: retryTask, timer });
+}
+
+function pumpSignalLiveTranslationQueue() {
+  signalLiveTranslationQueue.sort((left, right) => {
+    if (left.mode !== right.mode) return left.mode === 'manual-refresh' ? -1 : 1;
+    return left.createdAt - right.createdAt;
+  });
+  while (
+    signalLiveTranslationQueue.length > 0 &&
+    signalLiveTranslationRunningCount < signalLiveTranslationGlobalConcurrency
+  ) {
+    const nextIndex = signalLiveTranslationQueue.findIndex(
+      task =>
+        (signalLiveTranslationRunningProfiles.get(task.profileId) ?? 0) <
+        signalLiveTranslationProfileConcurrency
+    );
+    if (nextIndex < 0) return;
+    const [task] = signalLiveTranslationQueue.splice(nextIndex, 1);
+    if (!isSignalLiveTranslationEligible(task)) {
+      finishSignalLiveTranslationTask(task);
+      continue;
+    }
+    signalLiveTranslationRunningCount += 1;
+    signalLiveTranslationRunningProfiles.set(
+      task.profileId,
+      (signalLiveTranslationRunningProfiles.get(task.profileId) ?? 0) + 1
+    );
+    signalLiveTranslationRunningTasks.set(task.key, task);
+    void runSignalLiveTranslationTask(task)
+      .then(() => {
+        releaseSignalLiveTranslationSlot(task);
+        finishSignalLiveTranslationTask(task);
+        scheduleSignalLiveTranslationPump();
+      })
+      .catch(() => {
+        releaseSignalLiveTranslationSlot(task);
+        scheduleSignalLiveTranslationRetry(task);
+        scheduleSignalLiveTranslationPump();
+      });
+  }
+}
+
+function enqueueSignalLiveTranslation(
+  appId: string,
+  profileId: string,
+  client: SignalControlClient,
+  message: SignalVisibleMessage
+) {
+  if (
+    message.sourceText.length > signalLiveTranslationSourceTextLimit ||
+    !isValidSignalTranslationProjection(message) ||
+    signalLiveTranslationPendingKeys.size >= signalLiveTranslationPendingLimit
+  ) {
+    return false;
+  }
+  const key = signalLiveTranslationTaskKey(
+    profileId,
+    message.conversationId,
+    message.messageId,
+    message.sourceHash,
+    message.sourceText
+  );
+  if (signalLiveTranslationPendingKeys.has(key)) return false;
+  const task: SignalLiveTranslationTask = {
+    key,
+    mode: 'live',
+    appId,
+    profileId,
+    conversationId: message.conversationId,
+    client,
+    messageId: message.messageId,
+    sourceHash: message.sourceHash,
+    sourceText: message.sourceText,
+    direction: message.direction,
+    attempts: 0,
+    createdAt: Date.now(),
+    cancelled: false,
+    abortController: new AbortController()
+  };
+  if (!isSignalLiveTranslationEligible(task)) return false;
+  signalLiveTranslationPendingKeys.add(key);
+  signalLiveTranslationQueue.push(task);
+  scheduleSignalLiveTranslationPump();
+  return true;
+}
+
+function enqueueSignalTranslationRefresh(
+  appId: string,
+  profileId: string,
+  client: SignalControlClient,
+  message: SignalVisibleMessage
+) {
+  if (
+    message.sourceText.length > signalLiveTranslationSourceTextLimit ||
+    !isValidSignalTranslationProjection(message)
+  ) {
+    return false;
+  }
+
+  const identityKey = signalTranslationRefreshIdentityKey(
+    profileId,
+    message.conversationId,
+    message.messageId
+  );
+  const projectionKey = signalTranslationRefreshProjectionKey(message);
+  const previousState = signalTranslationRefreshStates.get(identityKey);
+  const now = Date.now();
+  if (
+    previousState?.projectionKey === projectionKey &&
+    now - previousState.acceptedAt < signalTranslationRefreshCooldownMs
+  ) {
+    return false;
+  }
+
+  const hasSupersededTask = hasSignalLiveTranslationForMessage(
+    appId,
+    message.conversationId,
+    message.messageId
+  );
+  if (
+    signalLiveTranslationPendingKeys.size >= signalLiveTranslationPendingLimit &&
+    !hasSupersededTask
+  ) {
+    return false;
+  }
+  cancelSignalLiveTranslationsForMessage(
+    appId,
+    message.conversationId,
+    message.messageId
+  );
+  if (signalLiveTranslationPendingKeys.size >= signalLiveTranslationPendingLimit) return false;
+
+  const revision = previousState && previousState.revision < Number.MAX_SAFE_INTEGER
+    ? previousState.revision + 1
+    : 1;
+  const baseKey = signalLiveTranslationTaskKey(
+    profileId,
+    message.conversationId,
+    message.messageId,
+    message.sourceHash,
+    message.sourceText
+  );
+  const key = JSON.stringify(['manual-refresh', baseKey, revision, randomUUID()]);
+  const task: SignalLiveTranslationTask = {
+    key,
+    mode: 'manual-refresh',
+    appId,
+    profileId,
+    conversationId: message.conversationId,
+    client,
+    messageId: message.messageId,
+    sourceHash: message.sourceHash,
+    sourceText: message.sourceText,
+    direction: message.direction,
+    attempts: 0,
+    createdAt: now,
+    cancelled: false,
+    abortController: new AbortController(),
+    refreshIdentityKey: identityKey,
+    refreshProjectionKey: projectionKey,
+    refreshRevision: revision
+  };
+  signalTranslationRefreshStates.delete(identityKey);
+  signalTranslationRefreshStates.set(identityKey, {
+    appId,
+    revision,
+    projectionKey,
+    acceptedAt: now,
+    taskKey: key
+  });
+  trimSignalTranslationRefreshStates();
+  if (!isSignalLiveTranslationEligible(task)) {
+    signalTranslationRefreshStates.delete(identityKey);
+    return false;
+  }
+  signalLiveTranslationPendingKeys.add(key);
+  signalLiveTranslationQueue.push(task);
+  scheduleSignalLiveTranslationPump();
+  return true;
+}
+// SIGNAL_LIVE_TRANSLATION_QUEUE_END
+
+function clearSignalCacheRequestState(appId: string) {
+  pendingSignalCacheSnapshotRequests.delete(appId);
+  activeSignalCacheConversations.delete(appId);
+  cancelSignalLiveTranslationsForApp(appId);
+}
+
+function clearAllSignalCacheRequestState() {
+  pendingSignalCacheSnapshotRequests.clear();
+  activeSignalCacheConversations.clear();
+  cancelAllSignalLiveTranslations();
+}
+
+function getPendingSignalCacheRequest(appId: string, requestId: string) {
+  return pendingSignalCacheSnapshotRequests.get(appId)?.get(requestId);
+}
+
+function setPendingSignalCacheRequest(
+  appId: string,
+  pending: PendingSignalCacheSnapshotRequest
+) {
+  let requests = pendingSignalCacheSnapshotRequests.get(appId);
+  if (!requests) {
+    requests = new Map();
+    pendingSignalCacheSnapshotRequests.set(appId, requests);
+  }
+  if (requests.has(pending.requestId)) return false;
+  if (requests.size >= signalCachePendingRequestLimit) {
+    let oldestPendingRequestId: string | undefined;
+    let evictableRequestId: string | undefined;
+    for (const [requestId, request] of requests) {
+      if (request.state === 'completed') {
+        evictableRequestId = requestId;
+        break;
+      }
+      if (request.state === 'pending' && !oldestPendingRequestId) {
+        oldestPendingRequestId = requestId;
+      }
+    }
+    evictableRequestId ??= oldestPendingRequestId;
+    if (!evictableRequestId) return false;
+    requests.delete(evictableRequestId);
+  }
+  requests.set(pending.requestId, pending);
+  return true;
+}
+
+function deletePendingSignalCacheRequest(appId: string, requestId: string) {
+  const requests = pendingSignalCacheSnapshotRequests.get(appId);
+  if (!requests) return;
+  requests.delete(requestId);
+  if (requests.size === 0) pendingSignalCacheSnapshotRequests.delete(appId);
+}
+
+function tryAcquireSignalCacheLookupSlot(appId: string) {
+  const count = signalCacheInFlightRequestCounts.get(appId) ?? 0;
+  if (count >= signalCacheInFlightRequestLimit) return false;
+  signalCacheInFlightRequestCounts.set(appId, count + 1);
+  return true;
+}
+
+function releaseSignalCacheLookupSlot(appId: string) {
+  const count = signalCacheInFlightRequestCounts.get(appId) ?? 0;
+  if (count <= 1) {
+    signalCacheInFlightRequestCounts.delete(appId);
+    return;
+  }
+  signalCacheInFlightRequestCounts.set(appId, count - 1);
+}
+type SignalVisibilityAckWaiter = {
+  revision: number;
+  resolve: (applied: boolean) => void;
+  timer: NodeJS.Timeout;
+};
+const signalVisibilityAckWaiters = new Map<string, SignalVisibilityAckWaiter>();
 const signalScriptRequests = new Map<
   string,
   { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
@@ -202,14 +1108,14 @@ const lastSignalScreenBounds = new Map<string, { x: number; y: number; width: nu
 let visibleSignalProfileId: string | null = null;
 let signalMoveSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let signalMoveFinalTimer: ReturnType<typeof setTimeout> | null = null;
-let focusedSignalProfileId: string | null = null;
-let appGroupBlurTimer: ReturnType<typeof setTimeout> | null = null;
+let workspaceVisibilityGate = { locked: true, revision: 0 };
 const signalMoveSyncIntervalMs = 16;
 const signalMoveFinalDelayMs = 48;
-const appGroupBlurDelayMs = 120;
 const signalControlHandshakeTimeoutMs = 5_000;
 const signalControlMaxFrameBytes = 1024 * 1024;
 const signalControlMaxSockets = 64;
+const signalVisibilityAckTimeoutMs = 1_000;
+const signalVisibilityShutdownGraceMs = 250;
 let signalShutdownBeforeQuitDone = false;
 let signalShutdownBeforeQuitPromise: Promise<void> | null = null;
 let signalShutdownBeforeQuitTimer: NodeJS.Timeout | null = null;
@@ -221,6 +1127,402 @@ const rendererReadyTimeoutMs = 5000;
 let fatalStartupDialogShown = false;
 const profileIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const supportedPlatforms = new Set<Platform>(['whatsapp', 'telegram-a', 'telegram-k', 'signal']);
+
+// SIGNAL_CACHE_PROTOCOL_PURE_START
+const signalCacheProtocolMaxBatchSize = 100;
+const signalCacheProtocolMaxBusinessJsonBytes = 768 * 1024;
+const signalCacheProtocolMaxTextBytes = 64 * 1024;
+const signalCacheProtocolUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const signalCacheProtocolSourceHashPattern = /^(?:0|[1-9a-z][0-9a-z]{0,6})$/;
+const signalCacheProtocolDirections = new Set(['incoming', 'outgoing'] as const);
+
+type SignalConversationChangedMessage = {
+  type: 'conversation.changed';
+  conversationId: string;
+};
+
+type SignalVisibleMessage = {
+  conversationId: string;
+  messageId: string;
+  sourceHash: string;
+  sourceText: string;
+  direction: 'incoming' | 'outgoing';
+  timestamp: number;
+};
+
+type SignalVisibleMessageBatch = {
+  type: 'message.visibleBatch';
+  requestId: string;
+  conversationId: string;
+  messages: SignalVisibleMessage[];
+};
+
+type SignalMessageAdded = SignalVisibleMessage & {
+  type: 'message.added';
+};
+
+type SignalTranslationRefreshRequest = SignalVisibleMessage & {
+  type: 'translation.refresh.request';
+  requestId: string;
+};
+
+type SignalCacheResult = {
+  conversationId: string;
+  messageId: string;
+  sourceHash: string;
+  sourceText: string;
+  translatedText: string;
+};
+
+type SignalCacheResultBatch = {
+  type: 'translation.cacheResultBatch';
+  requestId: string;
+  conversationId: string;
+  results: SignalCacheResult[];
+};
+
+type SignalCacheResultAppliedMessage = {
+  type: 'translation.cacheResultApplied';
+  requestId: string;
+  appliedCount: number;
+};
+
+type SignalMessageSnapshotRequest = {
+  type: 'message.snapshot.request';
+  requestId: string;
+};
+
+function signalProtocolRecord(
+  value: unknown,
+  expectedKeys: readonly string[]
+): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Signal cache protocol object is invalid.');
+  }
+  const record = value as Record<string, unknown>;
+  const actualKeys = Object.keys(record).sort();
+  const sortedExpectedKeys = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== sortedExpectedKeys.length ||
+    actualKeys.some((key, index) => key !== sortedExpectedKeys[index])
+  ) {
+    throw new Error('Signal cache protocol fields are invalid.');
+  }
+  return record;
+}
+
+function stripSignalControlTransportMetadata(
+  value: unknown,
+  expectedAppId: string
+): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const { appId, at, ...businessPayload } = value as Record<string, unknown>;
+  if (
+    appId !== expectedAppId ||
+    !Number.isSafeInteger(at) ||
+    Number(at) < 0 ||
+    typeof businessPayload.type !== 'string'
+  ) {
+    return null;
+  }
+  return businessPayload;
+}
+
+function assertSignalProtocolBusinessJson(value: unknown) {
+  let serialized = '';
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error('Signal cache protocol object is not serializable.');
+  }
+  if (
+    typeof serialized !== 'string' ||
+    Buffer.byteLength(serialized, 'utf8') > signalCacheProtocolMaxBusinessJsonBytes
+  ) {
+    throw new Error('Signal cache protocol object is too large.');
+  }
+}
+
+function assertSignalProtocolUuid(value: unknown) {
+  if (typeof value !== 'string' || !signalCacheProtocolUuidPattern.test(value)) {
+    throw new Error('Signal cache protocol UUID is invalid.');
+  }
+  return value;
+}
+
+function assertSignalProtocolText(value: unknown) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    Buffer.byteLength(value, 'utf8') > signalCacheProtocolMaxTextBytes
+  ) {
+    throw new Error('Signal cache protocol text is invalid.');
+  }
+  return value;
+}
+
+function assertSignalProtocolSourceHash(value: unknown) {
+  if (typeof value !== 'string' || !signalCacheProtocolSourceHashPattern.test(value)) {
+    throw new Error('Signal cache protocol source hash is invalid.');
+  }
+  return value;
+}
+
+function validateSignalConversationChangedMessage(value: unknown): SignalConversationChangedMessage {
+  assertSignalProtocolBusinessJson(value);
+  const record = signalProtocolRecord(value, ['type', 'conversationId']);
+  if (record.type !== 'conversation.changed') {
+    throw new Error('Signal conversation change type is invalid.');
+  }
+  return {
+    type: 'conversation.changed',
+    conversationId: assertSignalProtocolUuid(record.conversationId)
+  };
+}
+
+function validateSignalMessageSnapshotRequest(value: unknown): SignalMessageSnapshotRequest {
+  assertSignalProtocolBusinessJson(value);
+  const record = signalProtocolRecord(value, ['type', 'requestId']);
+  if (record.type !== 'message.snapshot.request') {
+    throw new Error('Signal snapshot request type is invalid.');
+  }
+  return {
+    type: 'message.snapshot.request',
+    requestId: assertSignalProtocolUuid(record.requestId)
+  };
+}
+
+function validateSignalVisibleMessageBatch(value: unknown): SignalVisibleMessageBatch {
+  assertSignalProtocolBusinessJson(value);
+  const record = signalProtocolRecord(value, ['type', 'requestId', 'conversationId', 'messages']);
+  if (record.type !== 'message.visibleBatch' || !Array.isArray(record.messages)) {
+    throw new Error('Signal visible message batch is invalid.');
+  }
+  if (record.messages.length > signalCacheProtocolMaxBatchSize) {
+    throw new Error('Signal visible message batch is too large.');
+  }
+  const requestId = assertSignalProtocolUuid(record.requestId);
+  const conversationId = assertSignalProtocolUuid(record.conversationId);
+  const messageIds = new Set<string>();
+  const messages = record.messages.map((value) => {
+    const message = signalProtocolRecord(value, [
+      'conversationId',
+      'messageId',
+      'sourceHash',
+      'sourceText',
+      'direction',
+      'timestamp'
+    ]);
+    const itemConversationId = assertSignalProtocolUuid(message.conversationId);
+    const messageId = assertSignalProtocolUuid(message.messageId);
+    if (itemConversationId !== conversationId) {
+      throw new Error('Signal visible message conversation is invalid.');
+    }
+    const comparableMessageId = messageId.toLowerCase();
+    if (messageIds.has(comparableMessageId)) {
+      throw new Error('Signal visible message ID is duplicated.');
+    }
+    messageIds.add(comparableMessageId);
+    if (!signalCacheProtocolDirections.has(message.direction as 'incoming' | 'outgoing')) {
+      throw new Error('Signal visible message direction is invalid.');
+    }
+    if (!Number.isSafeInteger(message.timestamp) || Number(message.timestamp) < 0) {
+      throw new Error('Signal visible message timestamp is invalid.');
+    }
+    return {
+      conversationId: itemConversationId,
+      messageId,
+      sourceHash: assertSignalProtocolSourceHash(message.sourceHash),
+      sourceText: assertSignalProtocolText(message.sourceText),
+      direction: message.direction as 'incoming' | 'outgoing',
+      timestamp: Number(message.timestamp)
+    };
+  });
+  return { type: 'message.visibleBatch', requestId, conversationId, messages };
+}
+
+function validateSignalMessageAdded(value: unknown): SignalMessageAdded {
+  assertSignalProtocolBusinessJson(value);
+  const record = signalProtocolRecord(value, [
+    'type',
+    'conversationId',
+    'messageId',
+    'sourceHash',
+    'sourceText',
+    'direction',
+    'timestamp'
+  ]);
+  if (record.type !== 'message.added') {
+    throw new Error('Signal added message type is invalid.');
+  }
+  const conversationId = assertSignalProtocolUuid(record.conversationId);
+  const validated = validateSignalVisibleMessageBatch({
+    type: 'message.visibleBatch',
+    requestId: '00000000-0000-4000-8000-000000000000',
+    conversationId,
+    messages: [{
+      conversationId,
+      messageId: record.messageId,
+      sourceHash: record.sourceHash,
+      sourceText: record.sourceText,
+      direction: record.direction,
+      timestamp: record.timestamp
+    }]
+  });
+  const [message] = validated.messages;
+  if (!message) throw new Error('Signal added message is missing.');
+  if (!isValidSignalTranslationProjection(message)) {
+    throw new Error('Signal added message projection is invalid.');
+  }
+  return {
+    type: 'message.added',
+    ...message
+  };
+}
+
+function validateSignalTranslationRefreshRequest(
+  value: unknown
+): SignalTranslationRefreshRequest {
+  assertSignalProtocolBusinessJson(value);
+  const record = signalProtocolRecord(value, [
+    'type',
+    'requestId',
+    'conversationId',
+    'messageId',
+    'sourceHash',
+    'sourceText',
+    'direction',
+    'timestamp'
+  ]);
+  if (record.type !== 'translation.refresh.request') {
+    throw new Error('Signal translation refresh request type is invalid.');
+  }
+  const requestId = assertSignalProtocolUuid(record.requestId);
+  const conversationId = assertSignalProtocolUuid(record.conversationId);
+  const validated = validateSignalVisibleMessageBatch({
+    type: 'message.visibleBatch',
+    requestId,
+    conversationId,
+    messages: [{
+      conversationId,
+      messageId: record.messageId,
+      sourceHash: record.sourceHash,
+      sourceText: record.sourceText,
+      direction: record.direction,
+      timestamp: record.timestamp
+    }]
+  });
+  const [message] = validated.messages;
+  if (!message || !isValidSignalTranslationProjection(message)) {
+    throw new Error('Signal translation refresh projection is invalid.');
+  }
+  return {
+    type: 'translation.refresh.request',
+    requestId,
+    ...message
+  };
+}
+
+function validateSignalCacheResultBatch(value: unknown): SignalCacheResultBatch {
+  assertSignalProtocolBusinessJson(value);
+  const record = signalProtocolRecord(value, ['type', 'requestId', 'conversationId', 'results']);
+  if (record.type !== 'translation.cacheResultBatch' || !Array.isArray(record.results)) {
+    throw new Error('Signal cache result batch is invalid.');
+  }
+  if (record.results.length > signalCacheProtocolMaxBatchSize) {
+    throw new Error('Signal cache result batch is too large.');
+  }
+  const requestId = assertSignalProtocolUuid(record.requestId);
+  const conversationId = assertSignalProtocolUuid(record.conversationId);
+  const messageIds = new Set<string>();
+  const results = record.results.map((value) => {
+    const result = signalProtocolRecord(value, [
+      'conversationId',
+      'messageId',
+      'sourceHash',
+      'sourceText',
+      'translatedText'
+    ]);
+    const itemConversationId = assertSignalProtocolUuid(result.conversationId);
+    const messageId = assertSignalProtocolUuid(result.messageId);
+    if (itemConversationId !== conversationId) {
+      throw new Error('Signal cache result conversation is invalid.');
+    }
+    const comparableMessageId = messageId.toLowerCase();
+    if (messageIds.has(comparableMessageId)) {
+      throw new Error('Signal cache result message ID is duplicated.');
+    }
+    messageIds.add(comparableMessageId);
+    return {
+      conversationId: itemConversationId,
+      messageId,
+      sourceHash: assertSignalProtocolSourceHash(result.sourceHash),
+      sourceText: assertSignalProtocolText(result.sourceText),
+      translatedText: assertSignalProtocolText(result.translatedText)
+    };
+  });
+  return { type: 'translation.cacheResultBatch', requestId, conversationId, results };
+}
+
+function validateSignalCacheResultAppliedMessage(value: unknown): SignalCacheResultAppliedMessage {
+  assertSignalProtocolBusinessJson(value);
+  const record = signalProtocolRecord(value, ['type', 'requestId', 'appliedCount']);
+  if (
+    record.type !== 'translation.cacheResultApplied' ||
+    !Number.isSafeInteger(record.appliedCount) ||
+    Number(record.appliedCount) < 0 ||
+    Number(record.appliedCount) > signalCacheProtocolMaxBatchSize
+  ) {
+    throw new Error('Signal cache result acknowledgement is invalid.');
+  }
+  return {
+    type: 'translation.cacheResultApplied',
+    requestId: assertSignalProtocolUuid(record.requestId),
+    appliedCount: Number(record.appliedCount)
+  };
+}
+
+function normalizeSignalCacheSourceText(value: string) {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function legacySignalSourceHash(value: string) {
+  let hash = 2166136261;
+  for (const char of normalizeSignalCacheSourceText(value)) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function isValidSignalTranslationProjection(message: SignalVisibleMessage) {
+  const sourceText = normalizeSignalCacheSourceText(message.sourceText);
+  return Boolean(
+    sourceText === message.sourceText &&
+      sourceText.length > 0 &&
+      sourceText.length <= 4_000 &&
+      /[A-Za-z]/.test(sourceText) &&
+      !/[\u3400-\u9fff]/u.test(sourceText) &&
+      legacySignalSourceHash(sourceText) === message.sourceHash
+  );
+}
+
+function hasSignalCacheTranslationPromptLeak(value: string) {
+  return /translate the following chat message|return only the translated message|keep\s+emojis?,?\s*urls|请将以下英文聊天信息翻译成中文|(?:保留|保持)\s*表情符号|你是一名(?:中译英|英译中)聊天翻译助手|只输出(?:英文|中文)译文|普通英文单词和短语必须翻译|保持原有换行和空行结构|敏感信息占位符必须原样保留|仅返回翻译后的信息|无需解释/i.test(value);
+}
+
+function isUsefulSignalCacheTranslation(sourceText: string, translatedText: string) {
+  const source = normalizeSignalCacheSourceText(sourceText);
+  const translated = normalizeSignalCacheSourceText(translatedText);
+  if (!translated) return false;
+  if (hasSignalCacheTranslationPromptLeak(translated)) return false;
+  if (source && translated.toLowerCase() === source.toLowerCase()) return false;
+  if ((!source || /[A-Za-z]{2,}/.test(source)) && !/[\u4e00-\u9fff]/.test(translated)) {
+    return false;
+  }
+  return true;
+}
+// SIGNAL_CACHE_PROTOCOL_PURE_END
 
 function assertProfileId(value: string) {
   if (!profileIdPattern.test(value)) throw new Error('Profile ID is invalid.');
@@ -400,7 +1702,7 @@ function legacyUserDataDirCandidates() {
   if (userDataOverride) return [];
   return [
     join(app.getPath('appData'), appDisplayName),
-    join(app.getPath('appData'), 'maoyi Legacy')
+    join(app.getPath('appData'), 'maoyi maoyi')
   ].filter((path, index, paths) => path !== app.getPath('userData') && paths.indexOf(path) === index);
 }
 
@@ -418,6 +1720,10 @@ function translateRequestLogPath() {
 
 function signalTranslationDebugLogPath() {
   return join(app.getPath('userData'), 'signal-translation-debug.jsonl');
+}
+
+function signalSourceOnlyAcceptanceSummaryPath() {
+  return join(app.getPath('userData'), 'signal-source-only-acceptance-summary.json');
 }
 
 function partitionStoragePath(partition: string) {
@@ -447,10 +1753,110 @@ function signalControlStatusPath() {
   return join(app.getPath('userData'), 'signal-control-status.json');
 }
 
+let signalExecutableCandidatesCache: string[] | null = null;
+
 function signalExecutableCandidates() {
-  const developmentExecutable = join(process.cwd(), '.runtime', 'signal-desktop', 'Signal.exe');
+  if (signalExecutableCandidatesCache) return signalExecutableCandidatesCache;
+  const developmentExecutable = join(developmentProjectRoot, '.runtime', 'signal-desktop', 'Signal.exe');
   const packagedExecutable = join(process.resourcesPath || '', 'signal', 'Signal.exe');
-  return app.isPackaged ? [packagedExecutable] : [developmentExecutable];
+  if (app.isPackaged) {
+    signalExecutableCandidatesCache = [packagedExecutable];
+    return signalExecutableCandidatesCache;
+  }
+  if (!signalSourceExperimentValue) {
+    signalExecutableCandidatesCache = [developmentExecutable];
+    return signalExecutableCandidatesCache;
+  }
+  if (!isAbsolute(signalSourceExperimentValue)) {
+    throw new Error('MAOYI_SIGNAL_SOURCE_EXE must be an absolute path.');
+  }
+
+  const experimentRoot = canonicalRealDirectory(
+    join(developmentProjectRoot, '.tmp', 'signal-source'),
+    'Signal source experiment root'
+  );
+  const isolatedRuntimeRoot = canonicalRealDirectory(
+    join(developmentProjectRoot, '.tmp', 'signal-source-ui'),
+    'Signal source isolated runtime root'
+  );
+  const requestedExecutable = resolve(signalSourceExperimentValue);
+  const experimentExecutable = realpathSync.native(requestedExecutable);
+  if (
+    lstatSync(requestedExecutable).isSymbolicLink() ||
+    !statSync(experimentExecutable).isFile() ||
+    basename(experimentExecutable).toLowerCase() !== 'signal.exe'
+  ) {
+    throw new Error('Signal source experiment executable must be a real Signal.exe file.');
+  }
+  const isPreparedBuild = isCanonicalChildPath(experimentRoot, experimentExecutable);
+  const isIsolatedRuntimeCopy = isCanonicalChildPath(isolatedRuntimeRoot, experimentExecutable);
+  if (!isPreparedBuild && !isIsolatedRuntimeCopy) {
+    throw new Error('Signal source experiment executable escaped its prepared or isolated root.');
+  }
+  const executableRoot = isPreparedBuild ? experimentRoot : isolatedRuntimeRoot;
+
+  const unpackedRoot = dirname(experimentExecutable);
+  const releaseRoot = dirname(unpackedRoot);
+  if (basename(unpackedRoot).toLowerCase() !== 'win-unpacked' || basename(releaseRoot).toLowerCase() !== 'release') {
+    throw new Error('Signal source experiment executable must come from release/win-unpacked.');
+  }
+  const resourcesPath = realpathSync.native(join(unpackedRoot, 'resources'));
+  if (lstatSync(join(unpackedRoot, 'resources')).isSymbolicLink() || !statSync(resourcesPath).isDirectory()) {
+    throw new Error('Signal source experiment resources directory is missing.');
+  }
+  assertCanonicalChildPath(executableRoot, resourcesPath, 'Signal source experiment resources');
+
+  const preparedRoot = isPreparedBuild ? dirname(dirname(releaseRoot)) : dirname(releaseRoot);
+  const markerFileName = isPreparedBuild
+    ? '.df-source-experiment.json'
+    : '.df-signal-source-runtime-copy.json';
+  const marker = JSON.parse(readFileSync(join(preparedRoot, markerFileName), 'utf8')) as {
+    schemaVersion?: unknown;
+    version?: unknown;
+    patchSetSha256?: unknown;
+    executableRelativePath?: unknown;
+    sourceExecutableSha256?: unknown;
+  };
+  const expectedPatchSetSha256 = typeof marker.version === 'string'
+    ? supportedSignalSourcePatchSets[marker.version]
+    : undefined;
+  if (
+    marker.schemaVersion !== 1 ||
+    typeof marker.version !== 'string' ||
+    typeof marker.patchSetSha256 !== 'string' ||
+    !expectedPatchSetSha256 ||
+    marker.patchSetSha256.toUpperCase() !== expectedPatchSetSha256 ||
+    (isPreparedBuild && (
+      basename(preparedRoot) !== `v${marker.version}` ||
+      basename(dirname(releaseRoot)) !== `Signal-Desktop-${marker.version}`
+    )) ||
+    (isIsolatedRuntimeCopy && (
+      marker.executableRelativePath !== 'release/win-unpacked/Signal.exe' ||
+      resolve(preparedRoot, marker.executableRelativePath) !== experimentExecutable
+    ))
+  ) {
+    throw new Error('Signal source experiment marker does not match the release layout.');
+  }
+
+  const expectedSha256 = process.env.MAOYI_SIGNAL_SOURCE_SHA256?.trim();
+  if (!expectedSha256 || !/^[0-9A-F]{64}$/i.test(expectedSha256)) {
+    throw new Error('Signal source experiments require MAOYI_SIGNAL_SOURCE_SHA256.');
+  }
+  if (
+    isIsolatedRuntimeCopy &&
+    (typeof marker.sourceExecutableSha256 !== 'string' ||
+      marker.sourceExecutableSha256.toUpperCase() !== expectedSha256.toUpperCase())
+  ) {
+    throw new Error('Signal source isolated runtime marker does not match the requested SHA-256.');
+  }
+
+  signalSourceExperimentMetadata = {
+    version: marker.version,
+    patchSetSha256: marker.patchSetSha256.toUpperCase(),
+    isolatedRuntimeCopy: isIsolatedRuntimeCopy
+  };
+  signalExecutableCandidatesCache = [experimentExecutable];
+  return signalExecutableCandidatesCache;
 }
 
 function signalRuntimeBindingPath(executablePath: string) {
@@ -554,26 +1960,74 @@ function decryptTranslationCacheEntry(cacheDir: string, chunkFile: string, recor
   );
 }
 
-type LockScreenState = {
-  version: number;
-  enabled: boolean;
+type LockCredentialFormat = 'legacy-6-digit' | 'digits6-letters2';
+
+type ProtectedLockCredential = {
+  schemaVersion: 1;
+  format: LockCredentialFormat;
   salt: string;
   pinHash: string;
+};
+
+type LockScreenStateBase = {
+  version: number;
+  enabled: boolean;
   failedAttempts: number;
   lockedUntil: number;
   createdAt: number;
   updatedAt: number;
 };
 
+type LegacyLockScreenState = LockScreenStateBase & {
+  version: 1;
+  salt: string;
+  pinHash: string;
+};
+
+type ProtectedLockScreenState = LockScreenStateBase & {
+  version: 2;
+  credentialFormat: LockCredentialFormat;
+  protectedCredential: string;
+};
+
+type UnreadableLockScreenState = LockScreenStateBase & {
+  version: 0;
+  credentialError: string;
+};
+
+type LockScreenState = LegacyLockScreenState | ProtectedLockScreenState | UnreadableLockScreenState;
+
+type LockPinChangeAuthorization = {
+  senderId: number;
+  mode: LockScreenPinChangeMode;
+  stateVersion: number;
+  stateUpdatedAt: number;
+  expiresAt: number;
+};
+
 const lockScreenMaxAttempts = 3;
+const networkOfflineSampleDelayMs = 250;
+const localRouteCheckTimeoutMs = 2_000;
+const lockPinChangeAuthorizationTtlMs = 15 * 60 * 1000;
+const legacyUpgradeAuthorizationTtlMs = 15 * 60 * 1000;
+const lockPinChangeAuthorizations = new Map<string, LockPinChangeAuthorization>();
+let legacyUpgradeAuthorizedUntil = 0;
 
 function defaultLockScreenStatus(): LockScreenStatus {
   return {
     enabled: false,
     lockedUntil: 0,
     failedAttempts: 0,
-    maxAttempts: lockScreenMaxAttempts
+    maxAttempts: lockScreenMaxAttempts,
+    requiresUpgrade: false
   };
+}
+
+function lockScreenStateRequiresUpgrade(state: LockScreenState | null) {
+  return Boolean(
+    state?.enabled &&
+    (state.version === 1 || (state.version === 2 && state.credentialFormat === 'legacy-6-digit'))
+  );
 }
 
 function lockScreenStatusFromState(state: LockScreenState | null): LockScreenStatus {
@@ -582,86 +2036,395 @@ function lockScreenStatusFromState(state: LockScreenState | null): LockScreenSta
     enabled: true,
     lockedUntil: state.lockedUntil || 0,
     failedAttempts: state.failedAttempts || 0,
-    maxAttempts: lockScreenMaxAttempts
+    maxAttempts: lockScreenMaxAttempts,
+    requiresUpgrade: lockScreenStateRequiresUpgrade(state)
   };
 }
 
-async function readLockScreenState(): Promise<LockScreenState | null> {
+function unreadableLockScreenState(reason: string): UnreadableLockScreenState {
+  return {
+    version: 0,
+    enabled: true,
+    failedAttempts: lockScreenMaxAttempts,
+    lockedUntil: 0,
+    createdAt: 0,
+    updatedAt: 0,
+    credentialError: reason
+  };
+}
+
+function lockStateNumbers(value: Record<string, unknown>) {
+  return {
+    failedAttempts: Number.isInteger(value.failedAttempts) ? Math.max(0, Number(value.failedAttempts)) : 0,
+    lockedUntil: Number.isFinite(value.lockedUntil) ? Math.max(0, Number(value.lockedUntil)) : 0,
+    createdAt: Number.isFinite(value.createdAt) ? Math.max(0, Number(value.createdAt)) : Date.now(),
+    updatedAt: Number.isFinite(value.updatedAt) ? Math.max(0, Number(value.updatedAt)) : Date.now()
+  };
+}
+
+function assertSafeStorageAvailable(action: string) {
+  if (process.platform !== 'win32' || !safeStorage.isEncryptionAvailable()) {
+    throw new Error(`Windows 安全存储不可用，无法${action}锁屏凭据`);
+  }
+}
+
+function protectLockCredential(credential: ProtectedLockCredential) {
+  assertSafeStorageAvailable('安全保存');
+  return safeStorage.encryptString(JSON.stringify(credential)).toString('base64');
+}
+
+function unprotectLockCredential(state: ProtectedLockScreenState): ProtectedLockCredential {
+  assertSafeStorageAvailable('读取');
   try {
-    return JSON.parse(await readFile(lockScreenPath(), 'utf8')) as LockScreenState;
+    const parsed = JSON.parse(safeStorage.decryptString(Buffer.from(state.protectedCredential, 'base64'))) as ProtectedLockCredential;
+    if (
+      parsed?.schemaVersion !== 1 ||
+      (parsed.format !== 'legacy-6-digit' && parsed.format !== 'digits6-letters2') ||
+      parsed.format !== state.credentialFormat ||
+      typeof parsed.salt !== 'string' ||
+      typeof parsed.pinHash !== 'string'
+    ) {
+      throw new Error('invalid protected credential');
+    }
+    return parsed;
   } catch {
-    return null;
+    throw new Error('锁屏凭据无法由本机 Windows 安全存储解密；锁屏保持启用，请离线重置凭据');
+  }
+}
+
+async function migrateLegacyLockScreenState(state: LegacyLockScreenState): Promise<ProtectedLockScreenState> {
+  const migrated: ProtectedLockScreenState = {
+    version: 2,
+    enabled: true,
+    credentialFormat: 'legacy-6-digit',
+    protectedCredential: protectLockCredential({
+      schemaVersion: 1,
+      format: 'legacy-6-digit',
+      salt: state.salt,
+      pinHash: state.pinHash
+    }),
+    failedAttempts: state.failedAttempts,
+    lockedUntil: state.lockedUntil,
+    createdAt: state.createdAt,
+    updatedAt: Date.now()
+  };
+  await writeLockScreenState(migrated);
+  return migrated;
+}
+
+async function readLockScreenState(): Promise<LockScreenState | null> {
+  let raw = '';
+  try {
+    raw = await readFile(lockScreenPath(), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    return unreadableLockScreenState('锁屏状态文件无法读取');
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || parsed.enabled !== true) return unreadableLockScreenState('锁屏状态文件格式无效');
+    const numbers = lockStateNumbers(parsed);
+    if (parsed.version === 2) {
+      if (
+        (parsed.credentialFormat !== 'legacy-6-digit' && parsed.credentialFormat !== 'digits6-letters2') ||
+        typeof parsed.protectedCredential !== 'string' ||
+        !parsed.protectedCredential
+      ) {
+        return unreadableLockScreenState('锁屏凭据密文格式无效');
+      }
+      const protectedState: ProtectedLockScreenState = {
+        version: 2,
+        enabled: true,
+        credentialFormat: parsed.credentialFormat,
+        protectedCredential: parsed.protectedCredential,
+        ...numbers
+      };
+      try {
+        unprotectLockCredential(protectedState);
+        return protectedState;
+      } catch (error) {
+        return unreadableLockScreenState(error instanceof Error ? error.message : '锁屏凭据密文无法读取');
+      }
+    }
+    if (
+      (parsed.version === 1 || parsed.version === undefined) &&
+      typeof parsed.salt === 'string' &&
+      typeof parsed.pinHash === 'string' &&
+      parsed.salt &&
+      parsed.pinHash
+    ) {
+      const legacy: LegacyLockScreenState = {
+        version: 1,
+        enabled: true,
+        salt: parsed.salt,
+        pinHash: parsed.pinHash,
+        ...numbers
+      };
+      if (process.platform === 'win32' && safeStorage.isEncryptionAvailable()) {
+        try {
+          return await migrateLegacyLockScreenState(legacy);
+        } catch {
+          return legacy;
+        }
+      }
+      return legacy;
+    }
+    return unreadableLockScreenState('锁屏状态文件格式无效');
+  } catch {
+    return unreadableLockScreenState('锁屏状态文件格式无效');
   }
 }
 
 async function writeLockScreenState(state: LockScreenState) {
   await mkdir(app.getPath('userData'), { recursive: true });
-  await writeFile(lockScreenPath(), JSON.stringify(state, null, 2), 'utf8');
+  await writeJsonAtomic(lockScreenPath(), state);
 }
 
-function assertLockPin(pin: string) {
-  if (!/^\d{6}$/.test(pin)) {
-    throw new Error('锁屏 PIN 必须是 6 位数字');
+function normalizeNewLockCredential(value: string) {
+  const credential = value.toUpperCase();
+  if (!/^\d{6}[A-Z]{2}$/.test(credential)) {
+    throw new Error('锁屏凭据必须为前 6 位数字加后 2 位英文字母');
   }
+  return credential;
+}
+
+function normalizeCredentialForFormat(value: string, format: LockCredentialFormat) {
+  if (format === 'legacy-6-digit') {
+    if (!/^\d{6}$/.test(value)) throw new Error('旧版锁屏凭据必须为 6 位数字');
+    return value;
+  }
+  return normalizeNewLockCredential(value);
 }
 
 function hashLockPin(pin: string, salt: string) {
   return scryptSync(pin, Buffer.from(salt, 'base64'), 64).toString('base64');
 }
 
+function readRouteTable(args: string[]) {
+  return new Promise<string>((resolvePromise, reject) => {
+    execFile(
+      'route.exe',
+      args,
+      { windowsHide: true, timeout: localRouteCheckTimeoutMs, encoding: 'utf8' },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolvePromise(stdout);
+      }
+    );
+  });
+}
+
+async function sampleNetworkOffline() {
+  if (process.platform !== 'win32') return { offline: false, uncertain: true };
+  let hasNonLoopbackInterface = false;
+  try {
+    hasNonLoopbackInterface = Object.values(networkInterfaces()).some((addresses) =>
+      (addresses || []).some((address) => !address.internal && Boolean(address.address))
+    );
+  } catch {
+    return { offline: false, uncertain: true };
+  }
+
+  try {
+    const [ipv4Routes, ipv6Routes] = await Promise.all([
+      readRouteTable(['PRINT', '0.0.0.0']),
+      readRouteTable(['PRINT', '-6', '::/0'])
+    ]);
+    const hasIpv4DefaultRoute = /^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+/m.test(ipv4Routes);
+    const hasIpv6DefaultRoute = /^\s*(?:\d+\s+\d+\s+)?::\/0\s+/m.test(ipv6Routes);
+    return {
+      offline: !hasNonLoopbackInterface && !hasIpv4DefaultRoute && !hasIpv6DefaultRoute,
+      uncertain: false
+    };
+  } catch {
+    return { offline: false, uncertain: true };
+  }
+}
+
+async function inspectNetworkOfflineTwice(): Promise<NetworkOfflineCheckResult> {
+  const first = await sampleNetworkOffline();
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, networkOfflineSampleDelayMs));
+  const second = await sampleNetworkOffline();
+  const checkedAt = Date.now();
+  if (first.uncertain || second.uncertain) {
+    return { offline: false, checkedAt, reason: '无法确认本机已断网，已拒绝设置或重置锁屏凭据' };
+  }
+  if (!first.offline || !second.offline) {
+    return { offline: false, checkedAt, reason: '检测到本机仍有活动网络连接，请断开网络后重试' };
+  }
+  return { offline: true, checkedAt };
+}
+
+async function checkNetworkOffline(): Promise<NetworkOfflineCheckResult> {
+  return inspectNetworkOfflineTwice();
+}
+
+function lockPinChangeModeAllowed(
+  state: LockScreenState | null,
+  mode: LockScreenPinChangeMode,
+  now = Date.now()
+) {
+  if (mode === 'setup') return !state?.enabled;
+  if (mode === 'reset') return Boolean(state?.enabled && state.failedAttempts >= lockScreenMaxAttempts);
+  return Boolean(state?.enabled && lockScreenStateRequiresUpgrade(state) && legacyUpgradeAuthorizedUntil >= now);
+}
+
+function lockPinChangeModeError(state: LockScreenState | null, mode: LockScreenPinChangeMode) {
+  if (mode === 'setup') return state?.enabled ? '锁屏凭据已存在，不能重复执行首次设置' : '当前状态不能首次设置锁屏凭据';
+  if (mode === 'reset') return '当前尚未达到锁屏凭据重置条件';
+  if (!lockScreenStateRequiresUpgrade(state)) return '当前锁屏凭据不需要升级';
+  return '请先使用旧 6 位凭据成功解锁，再升级锁屏凭据';
+}
+
+async function authorizeLockScreenPinChange(
+  senderId: number,
+  mode: LockScreenPinChangeMode
+): Promise<LockScreenPinChangeAuthorizationResult> {
+  const state = await readLockScreenState();
+  if (!lockPinChangeModeAllowed(state, mode)) {
+    return { ok: false, reason: lockPinChangeModeError(state, mode), status: lockScreenStatusFromState(state) };
+  }
+  const networkResult = await inspectNetworkOfflineTwice();
+  if (!networkResult.offline) {
+    return { ok: false, reason: networkResult.reason, status: lockScreenStatusFromState(state) };
+  }
+  const now = Date.now();
+  for (const [existingToken, authorization] of lockPinChangeAuthorizations) {
+    if (authorization.expiresAt <= now || authorization.senderId === senderId) {
+      lockPinChangeAuthorizations.delete(existingToken);
+    }
+  }
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = now + lockPinChangeAuthorizationTtlMs;
+  lockPinChangeAuthorizations.set(token, {
+    senderId,
+    mode,
+    stateVersion: state?.version ?? -1,
+    stateUpdatedAt: state?.updatedAt ?? 0,
+    expiresAt
+  });
+  return { ok: true, token, expiresAt, status: lockScreenStatusFromState(state) };
+}
+
+function consumeLockPinChangeAuthorization(senderId: number, token: string) {
+  const authorization = lockPinChangeAuthorizations.get(token);
+  lockPinChangeAuthorizations.delete(token);
+  if (!authorization || authorization.senderId !== senderId || authorization.expiresAt <= Date.now()) {
+    throw new Error('锁屏凭据设置授权无效或已过期，请重新断网检查');
+  }
+  return authorization;
+}
+
 async function getLockScreenStatus(): Promise<LockScreenStatus> {
   return lockScreenStatusFromState(await readLockScreenState());
 }
 
-async function setLockScreenPin(pin: string): Promise<LockScreenSetPinResult> {
+async function setLockScreenPin(senderId: number, pin: string, token: string): Promise<LockScreenSetPinResult> {
   try {
-    assertLockPin(pin);
+    const credential = normalizeNewLockCredential(pin);
+    const authorization = consumeLockPinChangeAuthorization(senderId, token);
+    const currentState = await readLockScreenState();
+    if (
+      authorization.stateVersion !== (currentState?.version ?? -1) ||
+      authorization.stateUpdatedAt !== (currentState?.updatedAt ?? 0) ||
+      !lockPinChangeModeAllowed(currentState, authorization.mode)
+    ) {
+      throw new Error('锁屏状态已变化，请重新断网检查并申请设置授权');
+    }
+    const networkResult = await inspectNetworkOfflineTwice();
+    if (!networkResult.offline) {
+      throw new Error(networkResult.reason || '无法确认本机已断网，已拒绝设置或重置锁屏凭据');
+    }
     const now = Date.now();
     const salt = randomBytes(16).toString('base64');
-    const state: LockScreenState = {
-      version: 1,
+    const state: ProtectedLockScreenState = {
+      version: 2,
       enabled: true,
-      salt,
-      pinHash: hashLockPin(pin, salt),
+      credentialFormat: 'digits6-letters2',
+      protectedCredential: protectLockCredential({
+        schemaVersion: 1,
+        format: 'digits6-letters2',
+        salt,
+        pinHash: hashLockPin(credential, salt)
+      }),
       failedAttempts: 0,
       lockedUntil: 0,
-      createdAt: now,
+      createdAt: currentState?.createdAt || now,
       updatedAt: now
     };
     await writeLockScreenState(state);
+    legacyUpgradeAuthorizedUntil = 0;
+    releaseWorkspaceVisibilityLock();
     return { ok: true, status: lockScreenStatusFromState(state) };
   } catch (error) {
-    return { ok: false, reason: error instanceof Error ? error.message : '设置锁屏 PIN 失败', status: await getLockScreenStatus() };
+    return { ok: false, reason: error instanceof Error ? error.message : '设置或重置锁屏凭据失败', status: await getLockScreenStatus() };
   }
 }
 
 async function unlockLockScreen(pin: string): Promise<LockScreenUnlockResult> {
-  const state = await readLockScreenState();
-  if (!state?.enabled) return { ok: false, reason: '请先设置锁屏 PIN', status: defaultLockScreenStatus() };
-  const now = Date.now();
-  let validPin = true;
-  try {
-    assertLockPin(pin);
-  } catch {
-    validPin = false;
+  let state = await readLockScreenState();
+  if (!state?.enabled) return { ok: false, reason: '请先设置锁屏凭据', status: defaultLockScreenStatus() };
+  if (state.version === 0) {
+    return { ok: false, reason: `${state.credentialError}；请断网重置锁屏凭据`, status: lockScreenStatusFromState(state) };
   }
-  const expected = Buffer.from(state.pinHash || '', 'base64');
-  const actual = validPin ? Buffer.from(hashLockPin(pin, state.salt || ''), 'base64') : Buffer.alloc(0);
+  if (state.version === 1) {
+    try {
+      state = await migrateLegacyLockScreenState(state);
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error instanceof Error ? error.message : '旧版锁屏凭据无法安全迁移；锁屏保持启用',
+        status: lockScreenStatusFromState(state)
+      };
+    }
+  }
+
+  let protectedCredential: ProtectedLockCredential;
+  try {
+    protectedCredential = unprotectLockCredential(state);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : '锁屏凭据无法读取；锁屏保持启用',
+      status: lockScreenStatusFromState(state)
+    };
+  }
+
+  const now = Date.now();
+  let normalized = '';
+  try {
+    normalized = normalizeCredentialForFormat(pin, protectedCredential.format);
+  } catch {
+    normalized = '';
+  }
+  const expected = Buffer.from(protectedCredential.pinHash, 'base64');
+  const actual = normalized
+    ? Buffer.from(hashLockPin(normalized, protectedCredential.salt), 'base64')
+    : Buffer.alloc(0);
   const ok = expected.length === actual.length && timingSafeEqual(expected, actual);
   if (ok) {
     state.failedAttempts = 0;
     state.lockedUntil = 0;
     state.updatedAt = now;
     await writeLockScreenState(state);
+    if (protectedCredential.format === 'legacy-6-digit') {
+      legacyUpgradeAuthorizedUntil = now + legacyUpgradeAuthorizationTtlMs;
+    } else {
+      releaseWorkspaceVisibilityLock();
+    }
     return { ok: true, status: lockScreenStatusFromState(state) };
   }
 
   state.failedAttempts = (state.failedAttempts || 0) + 1;
-  let reason = `PIN 错误，还可尝试 ${Math.max(0, lockScreenMaxAttempts - state.failedAttempts)} 次`;
+  let reason = `锁屏凭据错误，还可尝试 ${Math.max(0, lockScreenMaxAttempts - state.failedAttempts)} 次`;
   if (state.failedAttempts >= lockScreenMaxAttempts) {
     state.failedAttempts = lockScreenMaxAttempts;
     state.lockedUntil = 0;
-    reason = '请重置 PIN';
+    reason = '锁屏凭据错误次数已达上限，请断网后重置';
   }
   state.updatedAt = now;
   await writeLockScreenState(state);
@@ -742,6 +2505,12 @@ function defaultConfig(): AppConfig {
   return {
     profiles: [],
     activeProfileId: null,
+    profileTabOrder: [],
+    lastActiveProfileIds: {
+      whatsapp: null,
+      telegram: null,
+      signal: null
+    },
     deepseekModel: defaultModel
   };
 }
@@ -789,6 +2558,108 @@ async function readDevelopmentServiceSecret() {
   } catch {
     return '';
   }
+}
+
+let translationPromptsCache: TranslationPrompts | null = null;
+
+function packagedTranslationPromptPath() {
+  return join(process.resourcesPath, translationPromptBundleFileName);
+}
+
+function activeTranslationPromptPath() {
+  return join(app.getPath('userData'), 'security', translationPromptBundleFileName);
+}
+
+function pendingTranslationPromptPath() {
+  return `${activeTranslationPromptPath()}.pending`;
+}
+
+function translationPromptStatePath() {
+  return join(app.getPath('userData'), 'security', 'translation-prompts-state.json');
+}
+
+async function readOptionalText(path: string) {
+  try {
+    return await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+async function writeTextAtomic(path: string, value: string) {
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(tempPath, value, 'utf8');
+  try {
+    await rename(tempPath, path);
+  } catch {
+    await rm(path, { force: true });
+    await rename(tempPath, path);
+  }
+}
+
+async function recordPackagedTranslationPromptHash(hash: string) {
+  await mkdir(dirname(translationPromptStatePath()), { recursive: true });
+  await writeJsonAtomic(translationPromptStatePath(), { schemaVersion: 1, packagedHash: hash });
+}
+
+async function readRecordedPackagedTranslationPromptHash() {
+  try {
+    const parsed = JSON.parse(await readFile(translationPromptStatePath(), 'utf8')) as Record<string, unknown>;
+    return parsed.schemaVersion === 1 && typeof parsed.packagedHash === 'string' ? parsed.packagedHash : '';
+  } catch {
+    return '';
+  }
+}
+
+async function loadTranslationPrompts(serviceSecret: string) {
+  if (translationPromptsCache) return translationPromptsCache;
+  if (!app.isPackaged) {
+    const raw = await readOptionalText(join(developmentProjectRoot, '.package-secrets', translationPromptBundleFileName));
+    if (!raw) throw new Error(`缺少加密提示词文件：${translationPromptBundleFileName}`);
+    translationPromptsCache = decryptTranslationPromptBundle(serviceSecret, raw);
+    return translationPromptsCache;
+  }
+
+  const packagedRaw = await readOptionalText(packagedTranslationPromptPath());
+  const packagedHash = packagedRaw ? createHash('sha256').update(packagedRaw).digest('hex') : '';
+  const recordedHash = await readRecordedPackagedTranslationPromptHash();
+  if (packagedRaw && packagedHash !== recordedHash) {
+    try {
+      const imported = decryptTranslationPromptBundle(serviceSecret, packagedRaw);
+      await writeTextAtomic(activeTranslationPromptPath(), packagedRaw);
+      await recordPackagedTranslationPromptHash(packagedHash);
+      translationPromptsCache = imported;
+      return imported;
+    } catch {
+      // A packaged file encrypted with the previous authorization must not block a valid active copy.
+    }
+  }
+
+  const pendingRaw = await readOptionalText(pendingTranslationPromptPath());
+  if (pendingRaw) {
+    try {
+      const recovered = decryptTranslationPromptBundle(serviceSecret, pendingRaw);
+      await writeTextAtomic(activeTranslationPromptPath(), pendingRaw);
+      await rm(pendingTranslationPromptPath(), { force: true });
+      translationPromptsCache = recovered;
+      return recovered;
+    } catch {
+      // A pending file for an uncommitted authorization is ignored.
+    }
+  }
+
+  const activeRaw = await readOptionalText(activeTranslationPromptPath());
+  if (activeRaw) {
+    translationPromptsCache = decryptTranslationPromptBundle(serviceSecret, activeRaw);
+    return translationPromptsCache;
+  }
+  if (!packagedRaw) throw new Error(`缺少加密提示词文件：${translationPromptBundleFileName}`);
+  translationPromptsCache = decryptTranslationPromptBundle(serviceSecret, packagedRaw);
+  await writeTextAtomic(activeTranslationPromptPath(), packagedRaw);
+  await recordPackagedTranslationPromptHash(packagedHash);
+  return translationPromptsCache;
 }
 
 async function migrateLegacyUserDataDir() {
@@ -840,17 +2711,30 @@ function sanitizeConfig(config: AppConfig): AppConfig {
       fingerprint: {
         ...fallbackFingerprint,
         ...profile.fingerprint,
-        userAgent: profile.fingerprint?.userAgent || userAgentForPlatform(profile.platform)
+        userAgent: resolveProfileUserAgent(
+          profile.platform,
+          profile.fingerprint?.userAgent,
+          userAgentForPlatform(profile.platform)
+        )
       }
     };
   });
   const activeProfileId = profiles.some((profile) => profile.id === config.activeProfileId)
     ? config.activeProfileId
     : profiles[0]?.id ?? null;
+  const profileTabOrder = sanitizeProfileTabOrder(profiles, config.profileTabOrder);
+  const lastActiveProfileIds = sanitizeLastActiveProfileIds(
+    profiles,
+    config.lastActiveProfileIds,
+    activeProfileId,
+    profileTabOrder
+  );
 
   return {
     profiles,
     activeProfileId,
+    profileTabOrder,
+    lastActiveProfileIds,
     deepseekModel: typeof config.deepseekModel === 'string' && /^[a-z0-9._-]{1,64}$/i.test(config.deepseekModel)
       ? config.deepseekModel
       : defaultModel
@@ -985,6 +2869,8 @@ async function createProfile(platform: Platform, name: string, group: string): P
   }
   config.profiles.push(profile);
   config.activeProfileId = profile.id;
+  config.profileTabOrder = [...config.profileTabOrder.filter((profileId) => profileId !== profile.id), profile.id];
+  config.lastActiveProfileIds[workspaceAppForPlatform(profile.platform)] = profile.id;
   configureSession(profile);
   await saveConfig(config);
   return profile;
@@ -1004,9 +2890,30 @@ async function pathExists(path: string) {
   }
 }
 
+async function hashFileSha256(path: string) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) {
+    hash.update(chunk);
+  }
+  return hash.digest('hex').toUpperCase();
+}
+
 async function resolveSignalExecutable() {
   for (const candidate of signalExecutableCandidates()) {
-    if (await pathExists(candidate)) return candidate;
+    try {
+      if (!(await stat(candidate)).isFile()) continue;
+      if (signalSourceExperimentValue) {
+        const expectedSha256 = process.env.MAOYI_SIGNAL_SOURCE_SHA256?.trim().toUpperCase();
+        const actualSha256 = await hashFileSha256(candidate);
+        if (!expectedSha256 || actualSha256 !== expectedSha256) {
+          throw new Error('Signal source experiment executable SHA-256 changed before launch.');
+        }
+      }
+      return candidate;
+    } catch (error) {
+      if (signalSourceExperimentValue) throw error;
+      // Keep checking the explicitly allowed candidates.
+    }
   }
   throw new Error(`Signal.exe was not found. Checked: ${signalExecutableCandidates().join('; ')}`);
 }
@@ -1315,6 +3222,7 @@ function handleSignalControlUpgrade(request: IncomingMessage, socket: Socket) {
           clearTimeout(handshakeTimer);
           const existing = signalControlClients.get(appId);
           existing?.socket.destroy();
+          clearSignalCacheRequestState(appId);
           signalControlClients.set(appId, {
             ...controlSession,
             socket,
@@ -1324,6 +3232,8 @@ function handleSignalControlUpgrade(request: IncomingMessage, socket: Socket) {
             receiveSequence: 0
           });
           void persistSignalControlStatus();
+          sendSignalOwner(appId);
+          sendSignalVisibilityState(appId);
           sendSignalControlMessage(appId, { type: 'hello', appId, at: Date.now() });
           continue;
         }
@@ -1344,6 +3254,8 @@ function handleSignalControlUpgrade(request: IncomingMessage, socket: Socket) {
     const current = signalControlClients.get(appId);
     if (current?.socket === socket) {
       signalControlClients.delete(appId);
+      clearSignalCacheRequestState(appId);
+      settleSignalVisibilityApplied(appId, workspaceVisibilityGate.revision, false);
       void persistSignalControlStatus();
     }
   });
@@ -1457,9 +3369,11 @@ function verifySignalControlEnvelope(appId: string, rawMessage: string) {
     envelope.payload
   ]);
   if (!constantTimeBase64UrlEqual(envelope.mac, expectedMac)) return null;
+  const businessPayload = stripSignalControlTransportMetadata(envelope.payload, appId);
+  if (!businessPayload) return null;
   client.receiveSequence = expectedSequence;
   client.lastSeenAt = Date.now();
-  return envelope.payload;
+  return businessPayload;
 }
 
 function sendSignalControlMessage(appId: string, payload: Record<string, unknown>) {
@@ -1484,11 +3398,242 @@ function sendSignalControlMessage(appId: string, payload: Record<string, unknown
   return true;
 }
 
+function getSignalOwnerDescriptor() {
+  if (process.platform !== 'win32' || !mainWindow || mainWindow.isDestroyed()) return null;
+  try {
+    const handle = mainWindow.getNativeWindowHandle();
+    if (handle.length !== 8) return null;
+    return {
+      type: 'window.owner',
+      handle: handle.toString('base64url'),
+      ownerProcessId: process.pid
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sendSignalOwner(appId: string) {
+  const owner = getSignalOwnerDescriptor();
+  return owner ? sendSignalControlMessage(appId, owner) : false;
+}
+
+function sendSignalVisibilityState(appId: string) {
+  return sendSignalControlMessage(appId, {
+    type: 'security.visibility',
+    locked: workspaceVisibilityGate.locked,
+    revision: workspaceVisibilityGate.revision
+  });
+}
+
+function advanceWorkspaceVisibilityGate(locked: boolean) {
+  workspaceVisibilityGate = {
+    locked,
+    revision: workspaceVisibilityGate.revision + 1
+  };
+  if (locked) {
+    visibleSignalProfileId = null;
+    clearAllSignalCacheRequestState();
+    hideAllSignalWindows();
+    for (const [requestId, request] of signalScriptRequests) {
+      clearTimeout(request.timer);
+      request.reject(new Error('Workspace locked before Signal script completion.'));
+      signalScriptRequests.delete(requestId);
+    }
+  }
+  return workspaceVisibilityGate.revision;
+}
+
+function broadcastSignalVisibilityState() {
+  for (const appId of signalControlClients.keys()) {
+    sendSignalVisibilityState(appId);
+  }
+}
+
+function waitForSignalVisibilityApplied(appId: string, revision: number) {
+  const existing = signalVisibilityAckWaiters.get(appId);
+  if (existing) {
+    clearTimeout(existing.timer);
+    existing.resolve(false);
+  }
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      const current = signalVisibilityAckWaiters.get(appId);
+      if (current?.revision === revision) signalVisibilityAckWaiters.delete(appId);
+      resolve(false);
+    }, signalVisibilityAckTimeoutMs);
+    signalVisibilityAckWaiters.set(appId, { revision, resolve, timer });
+  });
+}
+
+function settleSignalVisibilityApplied(appId: string, revision: number, applied: boolean) {
+  const waiter = signalVisibilityAckWaiters.get(appId);
+  if (!waiter || waiter.revision !== revision) return;
+  signalVisibilityAckWaiters.delete(appId);
+  clearTimeout(waiter.timer);
+  waiter.resolve(applied);
+}
+
+function isSignalProcessIdAlive(processId: number) {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function waitForSignalProcessExit(child: ChildProcess | undefined, processId: number, timeoutMs: number) {
+  if (child && child.exitCode !== null) return Promise.resolve(true);
+  if (!isSignalProcessIdAlive(processId)) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (exited: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child?.off('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const deadline = Date.now() + timeoutMs;
+    const checkExit = () => {
+      if ((child && child.exitCode !== null) || !isSignalProcessIdAlive(processId)) {
+        finish(true);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        finish(false);
+        return;
+      }
+      timer = setTimeout(checkExit, 25);
+    };
+    child?.once('exit', onExit);
+    checkExit();
+  });
+}
+
+async function forceTerminateSignalProcess(
+  processId: number,
+  child: ChildProcess | undefined
+) {
+  if (!isSignalProcessIdAlive(processId)) return true;
+  try {
+    process.kill(processId, 'SIGKILL');
+  } catch {
+    if (isSignalProcessIdAlive(processId)) return false;
+  }
+  return waitForSignalProcessExit(child, processId, signalVisibilityShutdownGraceMs);
+}
+
+async function terminateSignalInstanceFailClosed(appId: string) {
+  const profileId = profileIdFromSignalAppId(appId);
+  const child = signalProcesses.get(profileId);
+  const client = signalControlClients.get(appId);
+  const authenticatedProcessId = client?.processId;
+  const trackedProcessId = child?.pid;
+  const failedProcessIds = new Set<number>();
+
+  try {
+    sendSignalControlMessage(appId, { type: 'shutdown' });
+    if (authenticatedProcessId) {
+      const authenticatedChild = child?.pid === authenticatedProcessId ? child : undefined;
+      const exitedGracefully = await waitForSignalProcessExit(
+        authenticatedChild,
+        authenticatedProcessId,
+        signalVisibilityShutdownGraceMs
+      );
+      if (
+        !exitedGracefully &&
+        !(await forceTerminateSignalProcess(authenticatedProcessId, authenticatedChild))
+      ) {
+        failedProcessIds.add(authenticatedProcessId);
+      }
+    }
+
+    if (
+      trackedProcessId &&
+      trackedProcessId !== authenticatedProcessId &&
+      child?.exitCode === null &&
+      !(await forceTerminateSignalProcess(trackedProcessId, child))
+    ) {
+      failedProcessIds.add(trackedProcessId);
+    }
+  } finally {
+    client?.socket.destroy();
+    signalControlClients.delete(appId);
+    signalControlSessions.delete(appId);
+  }
+
+  if (failedProcessIds.size > 0) {
+    throw new Error(
+      `Workspace remains locked because Signal termination could not be confirmed for ${appId} ` +
+        `(PID ${Array.from(failedProcessIds).join(', ')}).`
+    );
+  }
+}
+
+async function engageWorkspaceVisibilityLock() {
+  const revision = advanceWorkspaceVisibilityGate(true);
+  const liveAppIds = new Set<string>();
+  for (const [profileId, child] of signalProcesses) {
+    if (child.exitCode === null) liveAppIds.add(signalAppId(profileId));
+  }
+  for (const appId of signalControlClients.keys()) liveAppIds.add(appId);
+
+  const acknowledgements = new Map<string, Promise<boolean>>();
+  for (const appId of liveAppIds) {
+    if (signalControlClients.has(appId)) {
+      acknowledgements.set(appId, waitForSignalVisibilityApplied(appId, revision));
+    }
+  }
+  broadcastSignalVisibilityState();
+  hideAllSignalWindows();
+
+  const failed = new Set<string>();
+  const captureTerminationFailure = async (appId: string) => {
+    try {
+      await terminateSignalInstanceFailClosed(appId);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+  };
+  const immediateTerminations = Array.from(liveAppIds)
+    .filter((appId) => !acknowledgements.has(appId))
+    .map((appId) => captureTerminationFailure(appId));
+  for (const appId of liveAppIds) {
+    const acknowledgement = acknowledgements.get(appId);
+    if (acknowledgement && !(await acknowledgement)) failed.add(appId);
+  }
+  const terminationFailures = (await Promise.all([
+    ...immediateTerminations,
+    ...Array.from(failed, (appId) => captureTerminationFailure(appId))
+  ])).filter((error): error is Error => Boolean(error));
+  hideAllSignalWindows();
+  if (terminationFailures.length > 0) {
+    throw new Error(terminationFailures.map((error) => error.message).join(' '));
+  }
+}
+
+function releaseWorkspaceVisibilityLock() {
+  advanceWorkspaceVisibilityGate(false);
+  broadcastSignalVisibilityState();
+}
+
 function canShowSignalWindows() {
-  return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !mainWindow.isMinimized());
+  return Boolean(
+    !workspaceVisibilityGate.locked &&
+      mainWindow &&
+      !mainWindow.isDestroyed() &&
+      mainWindow.isVisible() &&
+      !mainWindow.isMinimized()
+  );
 }
 
 async function executeSignalScript(profileId: string, script: string) {
+  if (workspaceVisibilityGate.locked) throw new Error('Workspace is locked.');
   const appId = signalAppId(profileId);
   const config = await readConfig();
   const profile = config.profiles.find((item) => item.id === profileId && item.platform === 'signal');
@@ -1594,8 +3739,13 @@ async function setSignalWorkspaceBounds(profileId: string, bounds: SignalWorkspa
   const profile = config.profiles.find((item) => item.id === profileId && item.platform === 'signal');
   if (!profile) throw new Error(`Signal profile ${profileId} was not found.`);
   pendingSignalWorkspaceBounds.set(profileId, bounds);
-  if (bounds.visible) visibleSignalProfileId = profileId;
-  else if (visibleSignalProfileId === profileId) visibleSignalProfileId = null;
+  if (bounds.visible) {
+    if (visibleSignalProfileId !== profileId) clearAllSignalCacheRequestState();
+    visibleSignalProfileId = profileId;
+  } else {
+    clearSignalCacheRequestState(signalAppId(profileId));
+    if (visibleSignalProfileId === profileId) visibleSignalProfileId = null;
+  }
   if (bounds.visible && !canShowSignalWindows()) {
     sendSignalControlMessage(signalAppId(profileId), { type: 'window.hide' });
     return;
@@ -1610,28 +3760,15 @@ async function hideSignalProfile(profileId: string) {
   pendingSignalWorkspaceBounds.delete(profileId);
   lastSignalScreenBounds.delete(profileId);
   if (visibleSignalProfileId === profileId) visibleSignalProfileId = null;
+  clearSignalCacheRequestState(signalAppId(profileId));
   sendSignalControlMessage(signalAppId(profileId), { type: 'window.hide' });
 }
 
 function hideAllSignalWindows() {
+  clearAllSignalCacheRequestState();
   for (const appId of signalControlClients.keys()) {
     sendSignalControlMessage(appId, { type: 'window.hide' });
   }
-}
-
-function cancelAppGroupBlurCheck() {
-  if (!appGroupBlurTimer) return;
-  clearTimeout(appGroupBlurTimer);
-  appGroupBlurTimer = null;
-}
-
-function scheduleAppGroupBlurCheck() {
-  cancelAppGroupBlurCheck();
-  appGroupBlurTimer = setTimeout(() => {
-    appGroupBlurTimer = null;
-    if (mainWindow?.isFocused() || focusedSignalProfileId) return;
-    hideAllSignalWindows();
-  }, appGroupBlurDelayMs);
 }
 
 async function hideAllConfiguredSignalProfiles() {
@@ -1645,25 +3782,216 @@ async function hideAllConfiguredSignalProfiles() {
   hideAllSignalWindows();
 }
 
-function resyncVisibleSignalWindows() {
-  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized() || !mainWindow.isVisible()) {
-    hideAllSignalWindows();
-    return;
-  }
+function requestSignalWorkspaceSyncBurst() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('signal:sync-workspace');
+}
 
-  for (const [profileId, bounds] of pendingSignalWorkspaceBounds.entries()) {
-    if (bounds.visible) sendSignalWorkspaceBounds(profileId, bounds);
+type SignalCacheControlContext = {
+  profileId: string;
+  client: SignalControlClient;
+};
+
+function getSignalCacheControlContext(
+  appId: string,
+  expectedClient?: SignalControlClient
+): SignalCacheControlContext | null {
+  const profileId = profileIdFromSignalAppId(appId);
+  const client = signalControlClients.get(appId);
+  const bounds = pendingSignalWorkspaceBounds.get(profileId);
+  if (
+    appId !== signalAppId(profileId) ||
+    !client ||
+    client.socket.destroyed ||
+    (expectedClient && client !== expectedClient) ||
+    !profileIdPattern.test(profileId) ||
+    workspaceVisibilityGate.locked ||
+    visibleSignalProfileId !== profileId ||
+    bounds?.visible !== true ||
+    !canShowSignalWindows()
+  ) {
+    return null;
+  }
+  return { profileId, client };
+}
+
+function appendSignalCacheResultWithinProtocolLimit(
+  payload: SignalCacheResultBatch,
+  result: SignalCacheResult
+) {
+  if (payload.results.length >= signalCacheProtocolMaxBatchSize) return;
+  const candidate = { ...payload, results: [...payload.results, result] };
+  try {
+    validateSignalCacheResultBatch(candidate);
+    payload.results.push(result);
+  } catch {
+    // An invalid or oversized legacy cache entry is a miss, never a reason to expose its contents.
   }
 }
 
-function requestSignalWorkspaceSyncBurst() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  for (const delay of [0]) {
-    setTimeout(() => {
-      if (!mainWindow || mainWindow.isDestroyed()) return;
-      mainWindow.webContents.send('signal:sync-workspace');
-      resyncVisibleSignalWindows();
-    }, delay);
+function sendEmptySignalCacheResultBatch(
+  appId: string,
+  requestId: string,
+  conversationId: string
+) {
+  const response = validateSignalCacheResultBatch({
+    type: 'translation.cacheResultBatch',
+    requestId,
+    conversationId,
+    results: []
+  });
+  return sendSignalControlMessage(appId, response);
+}
+
+async function respondToSignalVisibleMessageBatch(
+  appId: string,
+  profileId: string,
+  pending: PendingSignalCacheSnapshotRequest,
+  batch: SignalVisibleMessageBatch
+) {
+  try {
+    const refreshObservations = new Map(
+      batch.messages.map(message => [
+        message.messageId,
+        observeSignalTranslationRefresh(
+          profileId,
+          message.conversationId,
+          message.messageId
+        )
+      ])
+    );
+    if (!isSignalTranslationRefreshTriggerCurrent(profileId, pending)) {
+      sendEmptySignalCacheResultBatch(appId, batch.requestId, batch.conversationId);
+      return;
+    }
+    const cacheRequest: TranslationCacheLookupRequest = {
+      profileId,
+      platform: 'signal',
+      contactId: batch.conversationId,
+      contactIdType: 'platform',
+      sourceHashes: Array.from(new Set(batch.messages.map((message) => message.sourceHash)))
+    };
+    const markedNonEnglish = pending.acceptanceTrigger?.forceCacheResult === true
+      ? false
+      : await isMarkedNonEnglishContact(cacheRequest);
+    const cachedEntries = markedNonEnglish
+      ? []
+      : await lookupTranslationCache(cacheRequest);
+    if (
+      getPendingSignalCacheRequest(appId, batch.requestId) !== pending ||
+      !getSignalCacheControlContext(appId, pending.client)
+    ) {
+      return;
+    }
+    if (!isSignalTranslationRefreshTriggerCurrent(profileId, pending)) {
+      sendEmptySignalCacheResultBatch(appId, batch.requestId, batch.conversationId);
+      return;
+    }
+    const cachedByHash = new Map(cachedEntries.map((entry) => [entry.sourceHash, entry]));
+    const response: SignalCacheResultBatch = {
+      type: 'translation.cacheResultBatch',
+      requestId: batch.requestId,
+      conversationId: batch.conversationId,
+      results: []
+    };
+    const visibleCacheMisses: SignalVisibleMessage[] = [];
+
+    const acceptanceTrigger = pending.acceptanceTrigger;
+    const messagesToProject = batch.messages.filter(message => {
+      if (
+        acceptanceTrigger &&
+        (
+          message.messageId !== acceptanceTrigger.messageId ||
+          message.sourceHash !== acceptanceTrigger.sourceHash
+        )
+      ) {
+        return false;
+      }
+      if (acceptanceTrigger?.refreshTaskKey) return true;
+      const observed = refreshObservations.get(message.messageId);
+      return Boolean(
+        observed &&
+          isSignalTranslationRefreshObservationSettled(
+            profileId,
+            message.conversationId,
+            message.messageId,
+            observed
+          )
+      );
+    });
+    for (const message of messagesToProject) {
+      const cached = cachedByHash.get(message.sourceHash);
+      if (
+        !cached ||
+        typeof cached.sourceText !== 'string' ||
+        typeof cached.translatedText !== 'string' ||
+        normalizeSignalCacheSourceText(message.sourceText) !== normalizeSignalCacheSourceText(cached.sourceText) ||
+        !isUsefulSignalCacheTranslation(message.sourceText, cached.translatedText)
+      ) {
+        if (!acceptanceTrigger && !markedNonEnglish) {
+          visibleCacheMisses.push(message);
+        }
+        continue;
+      }
+      appendSignalCacheResultWithinProtocolLimit(response, {
+        conversationId: message.conversationId,
+        messageId: message.messageId,
+        sourceHash: message.sourceHash,
+        sourceText: message.sourceText,
+        translatedText: cached.translatedText
+      });
+    }
+
+    validateSignalCacheResultBatch(response);
+    if (
+      getPendingSignalCacheRequest(appId, batch.requestId) !== pending ||
+      !getSignalCacheControlContext(appId, pending.client)
+    ) {
+      return;
+    }
+    const sent = sendSignalControlMessage(appId, response);
+    if (sent && !acceptanceTrigger) {
+      for (const message of visibleCacheMisses) {
+        if (
+          enqueueSignalLiveTranslation(
+            appId,
+            profileId,
+            pending.client,
+            message
+          )
+        ) {
+          appendSignalSourceOnlyAcceptanceStage('queue-accepted');
+        }
+      }
+    }
+    const triggerResult = response.results[0];
+    if (
+      sent &&
+      pending.acceptanceTrigger &&
+      response.results.length === 1 &&
+      triggerResult?.messageId === pending.acceptanceTrigger.messageId &&
+      triggerResult.sourceHash === pending.acceptanceTrigger.sourceHash
+    ) {
+      pending.acceptanceTrigger.resultSent = true;
+      appendSignalSourceOnlyAcceptanceStage('trigger-result-sent');
+    }
+  } catch {
+    if (
+      getPendingSignalCacheRequest(appId, batch.requestId) === pending &&
+      getSignalCacheControlContext(appId, pending.client)
+    ) {
+      try {
+        sendEmptySignalCacheResultBatch(appId, batch.requestId, batch.conversationId);
+      } catch {
+        // The authenticated socket closed while the request-scoped cache miss was sent.
+      }
+    }
+  } finally {
+    // Keep the bounded request marker after completion so the same requestId cannot
+    // be replayed. Conversation switch, hide, lock, transport lifecycle, or bounded
+    // eviction clears it without retaining any message body.
+    pending.state = 'completed';
+    releaseSignalCacheLookupSlot(appId);
   }
 }
 
@@ -1672,21 +4000,180 @@ function handleSignalControlMessage(appId: string, message: Record<string, unkno
   if (client) client.lastSeenAt = Date.now();
 
   try {
-    if (message.type === 'window.group-focused') {
-      focusedSignalProfileId = profileIdFromSignalAppId(appId);
-      cancelAppGroupBlurCheck();
+    const cacheContext = getSignalCacheControlContext(appId, client);
+    if (client && message.type === 'conversation.changed') {
+      appendSignalSourceOnlyAcceptanceStage('conversation-envelope-received');
+      let changed: ReturnType<typeof validateSignalConversationChangedMessage> | null = null;
+      try {
+        changed = validateSignalConversationChangedMessage(message);
+      } catch {
+        appendSignalSourceOnlyAcceptanceStage('conversation-invalid');
+      }
+      if (changed && !cacheContext) {
+        appendSignalSourceOnlyAcceptanceStage('conversation-rejected-cache-context');
+      } else if (changed && cacheContext) {
+        const snapshotRequest = validateSignalMessageSnapshotRequest({
+          type: 'message.snapshot.request',
+          requestId: randomUUID()
+        });
+        clearSignalCacheRequestState(appId);
+        activeSignalCacheConversations.set(appId, {
+          conversationId: changed.conversationId,
+          client: cacheContext.client
+        });
+        appendSignalSourceOnlyAcceptanceStage('conversation-active');
+        const pendingStored = setPendingSignalCacheRequest(appId, {
+          requestId: snapshotRequest.requestId,
+          conversationId: changed.conversationId,
+          client: cacheContext.client,
+          state: 'pending'
+        });
+        if (pendingStored && !sendSignalControlMessage(appId, snapshotRequest)) {
+          deletePendingSignalCacheRequest(appId, snapshotRequest.requestId);
+        }
+      }
     }
-    if (message.type === 'window.group-blurred') {
-      const profileId = profileIdFromSignalAppId(appId);
-      if (focusedSignalProfileId === profileId) focusedSignalProfileId = null;
-      scheduleAppGroupBlurCheck();
+    if (client && message.type === 'message.added') {
+      appendSignalSourceOnlyAcceptanceStage('message-envelope-received');
+      let added: ReturnType<typeof validateSignalMessageAdded> | null = null;
+      try {
+        added = validateSignalMessageAdded(message);
+        appendSignalSourceOnlyAcceptanceStage('message-received');
+      } catch {
+        appendSignalSourceOnlyAcceptanceStage('message-invalid');
+      }
+      const activeConversation = activeSignalCacheConversations.get(appId);
+      if (added && !cacheContext) {
+        appendSignalSourceOnlyAcceptanceStage('message-rejected-cache-context');
+      } else if (
+        added &&
+        cacheContext &&
+        (
+          activeConversation?.client !== cacheContext.client ||
+          activeConversation.conversationId !== added.conversationId
+        )
+      ) {
+        appendSignalSourceOnlyAcceptanceStage('message-rejected-active-conversation');
+      } else if (added && cacheContext) {
+        appendSignalSourceOnlyAcceptanceStage('message-accepted');
+        const queued = enqueueSignalLiveTranslation(
+          appId,
+          cacheContext.profileId,
+          cacheContext.client,
+          added
+        );
+        appendSignalSourceOnlyAcceptanceStage(queued ? 'queue-accepted' : 'queue-rejected');
+      }
+    }
+    if (
+      client &&
+      message.type === 'translation.refresh.request'
+    ) {
+      let refresh: ReturnType<typeof validateSignalTranslationRefreshRequest> | null = null;
+      try {
+        refresh = validateSignalTranslationRefreshRequest(message);
+      } catch {
+        // Strictly reject malformed or non-canonical refresh requests without logging payload data.
+      }
+      const activeConversation = activeSignalCacheConversations.get(appId);
+      if (
+        refresh &&
+        cacheContext &&
+        activeConversation?.client === cacheContext.client &&
+        activeConversation.conversationId === refresh.conversationId
+      ) {
+        enqueueSignalTranslationRefresh(
+          appId,
+          cacheContext.profileId,
+          cacheContext.client,
+          refresh
+        );
+      }
+    }
+    if (cacheContext && message.type === 'message.visibleBatch') {
+      const batch = validateSignalVisibleMessageBatch(message);
+      const activeConversation = activeSignalCacheConversations.get(appId);
+      let pending = getPendingSignalCacheRequest(appId, batch.requestId);
+      if (
+        activeConversation?.client === cacheContext.client &&
+        activeConversation.conversationId === batch.conversationId &&
+        (!pending || (
+          pending.client === cacheContext.client &&
+          pending.conversationId === batch.conversationId
+        ))
+      ) {
+        if (!pending) {
+          const candidate: PendingSignalCacheSnapshotRequest = {
+            requestId: batch.requestId,
+            conversationId: batch.conversationId,
+            client: cacheContext.client,
+            state: 'pending'
+          };
+          if (setPendingSignalCacheRequest(appId, candidate)) pending = candidate;
+        }
+        if (pending?.state === 'pending') {
+          const acceptanceTrigger = pending.acceptanceTrigger;
+          if (
+            acceptanceTrigger &&
+            batch.messages.some(message =>
+              message.messageId === acceptanceTrigger.messageId &&
+              message.sourceHash === acceptanceTrigger.sourceHash
+            )
+          ) {
+            appendSignalSourceOnlyAcceptanceStage('visible-batch-accepted');
+          }
+          if (!tryAcquireSignalCacheLookupSlot(appId)) {
+            pending.state = 'completed';
+            try {
+              sendEmptySignalCacheResultBatch(appId, batch.requestId, batch.conversationId);
+            } catch {
+              // The authenticated socket closed while the request-scoped cache miss was sent.
+            }
+          } else {
+            pending.state = 'responding';
+            void respondToSignalVisibleMessageBatch(
+              appId,
+              cacheContext.profileId,
+              pending,
+              batch
+            );
+          }
+        }
+      }
+    }
+    if (cacheContext && message.type === 'translation.cacheResultApplied') {
+      const applied = validateSignalCacheResultAppliedMessage(message);
+      const pending = getPendingSignalCacheRequest(appId, applied.requestId);
+      if (
+        pending?.client === cacheContext.client &&
+        pending.acceptanceTrigger?.resultSent === true &&
+        applied.appliedCount === 1
+      ) {
+        appendSignalSourceOnlyAcceptanceStage('result-applied');
+        appendSignalSourceOnlyAcceptanceStage('completed');
+        pending.acceptanceTrigger = undefined;
+      }
     }
     if (message.type === 'heartbeat') {
       sendSignalControlMessage(appId, { type: 'heartbeat.ack', at: Date.now() });
     }
+    if (
+      message.type === 'security.visibility-applied' &&
+      typeof message.locked === 'boolean' &&
+      Number.isSafeInteger(message.revision) &&
+      Number.isSafeInteger(message.visibleWindowCount)
+    ) {
+      const applied =
+        message.locked === workspaceVisibilityGate.locked &&
+        message.revision === workspaceVisibilityGate.revision &&
+        (!message.locked || message.visibleWindowCount === 0);
+      settleSignalVisibilityApplied(appId, Number(message.revision), applied);
+    }
     if (message.type === 'ready') {
       const profileId = profileIdFromSignalAppId(appId);
       const bounds = pendingSignalWorkspaceBounds.get(profileId);
+      sendSignalOwner(appId);
+      sendSignalVisibilityState(appId);
       if (bounds) sendSignalWorkspaceBounds(profileId, bounds);
     }
     if (message.type === 'script.result' && typeof message.requestId === 'string') {
@@ -1735,6 +4222,7 @@ async function cleanupPackagedRuntimeLogs() {
   const directLogFiles = [
     translateRequestLogPath(),
     signalTranslationDebugLogPath(),
+    signalSourceOnlyAcceptanceSummaryPath(),
     signalControlStatusPath(),
     join(userDataPath, 'protocol-handlers.log')
   ];
@@ -1879,7 +4367,6 @@ async function launchSignalProfileNow(id: string) {
   await ensureSignalRuntimePreferences(dataDir);
   await cleanupSignalUpdateArtifacts(dataDir);
 
-  const executable = await resolveSignalExecutable();
   const wsPort = await ensureSignalControlServer();
   const credentialPipe = await createSignalCredentialPipe();
   const args = [
@@ -1891,15 +4378,44 @@ async function launchSignalProfileNow(id: string) {
     '--windowMode=embed',
     `--title=${profile.name}`
   ];
-  const child = spawn(executable, args, {
-    stdio: 'ignore',
-    windowsHide: false,
-    env: runtimeLoggingEnabled
-      ? {
-          ...process.env,
-          MAOYI_SIGNAL_GUARD_DIAGNOSTIC: join(dataDir, 'df-guard-debug.json')
-        }
-      : undefined
+  let executable: string;
+  let child: ChildProcess;
+  try {
+    executable = await resolveSignalExecutable();
+    child = spawn(executable, args, {
+      stdio: 'ignore',
+      windowsHide: false,
+      env: runtimeLoggingEnabled
+        ? {
+            ...process.env,
+            MAOYI_SIGNAL_GUARD_DIAGNOSTIC: join(dataDir, 'df-guard-debug.json')
+          }
+        : undefined
+    });
+  } catch (error) {
+    await credentialPipe.close();
+    throw error;
+  }
+  try {
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      const handleSpawn = () => {
+        child.off('error', handleError);
+        resolveSpawn();
+      };
+      const handleError = (error: Error) => {
+        child.off('spawn', handleSpawn);
+        rejectSpawn(error);
+      };
+      child.once('spawn', handleSpawn);
+      child.once('error', handleError);
+    });
+  } catch (error) {
+    await credentialPipe.close();
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Signal process failed to start: ${detail}`);
+  }
+  child.on('error', (error) => {
+    if (runtimeLoggingEnabled) console.error('Signal child process error:', error.message);
   });
   child.once('exit', () => {
     if (signalProcesses.get(id) === child) {
@@ -2377,17 +4893,38 @@ function translationCacheWriteQueueKey(request: TranslationCacheSetRequest) {
   return chunkedTranslationCacheDir(request);
 }
 
-async function saveTranslationCacheEntry(request: TranslationCacheSetRequest): Promise<void> {
-  if (!request.profileId || !request.sourceHash || !request.translatedText || !isEnglishChatSource(request.sourceText)) return;
-  if (await isMarkedNonEnglishContact(request)) return;
+async function saveTranslationCacheEntry(
+  request: TranslationCacheSetRequest,
+  shouldContinue: () => boolean = () => true,
+  options: { bypassNonEnglishContactGuard?: boolean } = {}
+): Promise<boolean> {
+  if (
+    !request.profileId ||
+    !request.sourceHash ||
+    !request.translatedText ||
+    !isEnglishChatSource(request.sourceText) ||
+    !shouldContinue()
+  ) {
+    return false;
+  }
+  if (
+    (!options.bypassNonEnglishContactGuard && await isMarkedNonEnglishContact(request)) ||
+    !shouldContinue()
+  ) {
+    return false;
+  }
   const queueKey = translationCacheWriteQueueKey(request);
-  const previousWrite = translationCacheWriteQueues.get(queueKey) ?? Promise.resolve();
+  const previousWrite = translationCacheWriteQueues.get(queueKey) ?? Promise.resolve(true);
   const nextWrite = previousWrite
-    .catch(() => undefined)
-    .then(() => saveTranslationCacheEntryNow(request));
+    .catch(() => false)
+    .then(async () => {
+      if (!shouldContinue()) return false;
+      await saveTranslationCacheEntryNow(request);
+      return true;
+    });
   translationCacheWriteQueues.set(queueKey, nextWrite);
   try {
-    await nextWrite;
+    return await nextWrite;
   } finally {
     if (translationCacheWriteQueues.get(queueKey) === nextWrite) {
       translationCacheWriteQueues.delete(queueKey);
@@ -2664,9 +5201,15 @@ async function authorizeSensitiveSend(request: SensitiveSendAuthorizeRequest) {
   return sensitiveSendAuthorizations.authorize(request);
 }
 
-async function translateWithDeepSeek(request: TranslateRequest): Promise<string> {
+async function translateWithDeepSeek(
+  request: TranslateRequest,
+  abortSignal?: AbortSignal,
+  logPolicy: 'standard' | 'content-free' = 'standard'
+): Promise<string> {
+  if (abortSignal?.aborted) throw new Error('Translation request was cancelled.');
   const config = await readConfig();
   const deepseekApiKey = clientLicenseManager?.getServiceSecret() || await readDevelopmentServiceSecret();
+  if (abortSignal?.aborted) throw new Error('Translation request was cancelled.');
   if (!deepseekApiKey) {
     throw new Error('DeepSeek API key is not configured.');
   }
@@ -2675,98 +5218,50 @@ async function translateWithDeepSeek(request: TranslateRequest): Promise<string>
   const userId = (request.userId || (request.profileId ? `df-${request.profileId}` : 'df-default'))
     .replace(/[^a-zA-Z0-9\-_]/g, '_')
     .slice(0, 512);
-  const logBase = {
-    requestId,
-    userId,
-    from: request.from || '',
-    to: request.to,
-    textHash: hashForLog(request.text || ''),
-    sourceHash: request.sourceHash || hashForLog(request.text || ''),
-    textLength: request.text?.length ?? 0,
-    reason: request.reason || '',
-    profileId: request.profileId || '',
-    profileName: request.profileName || '',
-    platform: request.platform || '',
-    messageKey: request.messageKey || '',
-    contactId: request.contactId || '',
-    contactIdType: request.contactIdType || '',
-    contactTitle: request.contactTitle || '',
-    direction: request.direction || '',
-    messagePart: request.messagePart || ''
-  };
+  const logBase = logPolicy === 'content-free'
+    ? {
+        from: request.from || '',
+        to: request.to,
+        reason: request.reason || '',
+        platform: request.platform || '',
+        direction: request.direction || '',
+        messagePart: request.messagePart || ''
+      }
+    : {
+        requestId,
+        userId,
+        from: request.from || '',
+        to: request.to,
+        textHash: hashForLog(request.text || ''),
+        sourceHash: request.sourceHash || hashForLog(request.text || ''),
+        textLength: request.text?.length ?? 0,
+        reason: request.reason || '',
+        profileId: request.profileId || '',
+        profileName: request.profileName || '',
+        platform: request.platform || '',
+        messageKey: request.messageKey || '',
+        contactId: request.contactId || '',
+        contactIdType: request.contactIdType || '',
+        contactTitle: request.contactTitle || '',
+        direction: request.direction || '',
+        messagePart: request.messagePart || ''
+      };
   const isComposerEnglishRequest = ['composer-enter', 'composer-pretranslate'].includes(request.reason || '') && /English/i.test(request.to || '');
-  const composerEnglishPrompt = `请将中文翻译成自然的美式英文 WhatsApp 聊天语气。
+  const sensitiveTokenProtection = protectTranslationSensitiveTokens(
+    request.text || '',
+    randomBytes(12).toString('hex')
+  );
+  const translationPrompts = await loadTranslationPrompts(deepseekApiKey);
 
-说话人设：
-- 35岁女性
-- 自然、成熟、亲切，但不随便
-- 像真实美国人手机打字，不像书面翻译
-- 带一点优雅自嘲和轻松幽默
-- 可以有一点常见网络梗，但不要尬，不要过度年轻化
-- 语气有温度，有真人打字节奏
-
-聊天风格：
-- 用自然的美式手机聊天表达，但必须忠实原意
-- 口语化只允许调整表达方式，不允许新增原文没有的对象、事实、情绪、评价或暗示
-- 短句优先保持短句，不主动扩写或补充对象
-- 句子可以自然简短，有手机聊天节奏
-- 优先使用自然的日常词汇和英文缩合形式，例如 I'm, you're, don't, can't
-- 默认不使用 rn, ngl, tbh, idk, lmao 等网络缩写
-- 可以偶尔用大写强调情绪，比如 SO good, I KNOW, SOAKED，但不要整句大写
-- 可以少量使用语气词，比如 haha, lol, honestly, kinda, like, you know, I mean
-- 可以少量 emoji，最多 1 个，不是每句都加
-- 允许轻微随性，比如 lmaoo, sooo, omg，但只能在语境合适时使用
-
-硬性限制：
-- 不要呆板
-- 不要像客服
-- 不要像机器翻译
-- 不要过度俚语化
-- 不要装嫩
-- 不要显得油腻或刻意
-- 不要扩写，不要新增事实
-- 不要把问题改写成带新对象或新评价的问题
-- 保持原意和情绪
-
-符号限制：
-- 不使用句号 .
-- 不使用破折号 -
-- 不使用分号 ;
-- 不使用中文标点
-- 如需停顿，用逗号或自然分句
-
-输出规则：
-- 只输出英文译文
-- 不解释
-- 不加引号`;
-  const strictComposerEnglishPrompt = `将下面的中文忠实翻译成简短、自然的美式英文私聊表达。
-只翻译原文，不要回应原文，不要解释翻译行为，不要新增任何事实、动作、态度或上下文。
-短句必须保持简短，例如“你好”只能翻译为 Hi、Hello 或 Hey there 这类短表达。
-只输出英文译文，不加引号。`;
-  const composerLayoutPrompt = `Preserve the source line structure exactly. Keep every line break and blank line in the same position. Do not merge separate lines or paragraphs. If a source line is a question, retain an English question mark (?) in the translated line. The punctuation ban does not apply to question marks.`;
-
-  const translateOnce = async (strictChinese: boolean, strictComposer = false) => {
-    const prompt = strictComposer ? [
-      strictComposerEnglishPrompt,
-      composerLayoutPrompt,
-      '待翻译中文：',
-      request.text
-    ].join('\n\n') : isComposerEnglishRequest ? [
-      composerEnglishPrompt,
-      composerLayoutPrompt,
-      '待翻译中文：',
-      request.text
-    ].join('\n\n') : [
-      strictChinese
-        ? `Translate the following chat message${request.from ? ` from ${request.from}` : ''} into Simplified Chinese. The sentence itself must be Chinese and must contain Chinese characters; keep only names, brands, URLs, phone numbers, and product names unchanged. If the text is a normal phrase such as "See you soon", translate its meaning. Do not return English-only output.`
-        : `Translate the following chat message${request.from ? ` from ${request.from}` : ''} to ${request.to}.`,
-      'Keep emoji, URLs, phone numbers, product names, and line breaks unchanged.',
-      'Return only the translated message, with no explanation.',
-      request.text
-    ].join('\n\n');
+  const translateOnce = async (retry: boolean) => {
+    if (abortSignal?.aborted) throw new Error('Translation request was cancelled.');
+    const systemPrompt = isComposerEnglishRequest
+      ? translationPrompts.chineseToEnglish
+      : translationPrompts.englishToChinese;
 
     const response = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
+      signal: abortSignal,
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${deepseekApiKey}`
@@ -2774,22 +5269,35 @@ async function translateWithDeepSeek(request: TranslateRequest): Promise<string>
       body: JSON.stringify({
         model: config.deepseekModel || defaultModel,
         user_id: userId,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: sensitiveTokenProtection.text }
+        ],
         thinking: { type: 'disabled' },
-          temperature: strictChinese ? 0.1 : strictComposer ? 0.05 : isComposerEnglishRequest ? 0.2 : 0.2
+        temperature: retry ? (isComposerEnglishRequest ? 0.05 : 0.1) : 0.2
       })
     });
 
     if (!response.ok) {
-      await appendTranslateRequestLog({ ...logBase, status: 'failed', httpStatus: response.status, strictChinese });
+      await appendTranslateRequestLog({ ...logBase, status: 'failed', httpStatus: response.status, retry });
       throw new Error(`DeepSeek request failed: ${response.status}`);
     }
 
     const data = await response.json();
-    return data.choices?.[0]?.message?.content?.trim() || '';
+    const rawTranslation = data.choices?.[0]?.message?.content?.trim() || '';
+    const styledTranslation = isComposerEnglishRequest
+      ? normalizeComposerEnglishStyle(rawTranslation)
+      : rawTranslation;
+    const restored = restoreTranslationSensitiveTokens(styledTranslation, sensitiveTokenProtection);
+    if (!restored.ok) {
+      const error = new Error(restored.reason);
+      error.name = 'SensitiveTranslationTokenIntegrityError';
+      throw error;
+    }
+    return restored.text;
   };
 
-  const translationPromptLeakPattern = /(?:translate the following chat message|return only the translated message|keep emoji,\s*urls|请将以下英文聊天信息翻译成中文|保留表情符号|仅返回翻译后的信息|无需解释)/i;
+  const translationPromptLeakPattern = /(?:translate the following chat message|return only the translated message|keep\s+emojis?,?\s*urls|请将以下英文聊天信息翻译成中文|(?:保留|保持)\s*表情符号|你是一名(?:中译英|英译中)聊天翻译助手|只输出(?:英文|中文)译文|普通英文单词和短语必须翻译|保持原有换行和空行结构|敏感信息占位符必须原样保留|仅返回翻译后的信息|无需解释)/i;
   const stripTranslationPromptLeak = (value: string) => {
     const text = (value || '').trim();
     if (!text || !translationPromptLeakPattern.test(text)) return text;
@@ -2809,30 +5317,6 @@ async function translateWithDeepSeek(request: TranslateRequest): Promise<string>
     }
     return stripped;
   };
-  const sanitizeComposerEnglish = (value: string) => value
-    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, '')
-    .replace(/[，、；：]/g, ',')
-    .replace(/？/g, '?')
-    .replace(/！/g, '!')
-    .replace(/[。．；—…“”‘’《》【】（）]/g, '')
-    .replace(/[.;-]/g, '')
-    .split(/\r?\n/)
-    .map((line) => line.replace(/\s*,\s*/g, ', ').replace(/,{2,}/g, ',').replace(/[\t ]{2,}/g, ' ').trim())
-    .join('\n')
-    .trim();
-  const restoreComposerLayout = (source: string, translated: string) => {
-    const sourceLines = source.replace(/\r\n?/g, '\n').split('\n');
-    const translatedLines = translated.replace(/\r\n?/g, '\n').split('\n').filter((line) => line.trim());
-    const sourceTextLines = sourceLines.filter((line) => line.trim());
-    if (sourceTextLines.length !== translatedLines.length) return translated;
-    let translatedIndex = 0;
-    return sourceLines.map((sourceLine) => {
-      if (!sourceLine.trim()) return '';
-      let line = translatedLines[translatedIndex++]?.trim() || '';
-      if (/[？?]\s*$/.test(sourceLine) && !/\?\s*$/.test(line)) line += '?';
-      return line;
-    }).join('\n').trim();
-  };
   const composerLayoutMatches = (source: string, translated: string) => {
     const sourceLines = source.replace(/\r\n?/g, '\n').split('\n');
     const translatedLines = translated.replace(/\r\n?/g, '\n').split('\n');
@@ -2849,7 +5333,14 @@ async function translateWithDeepSeek(request: TranslateRequest): Promise<string>
 
   const runDeepSeekTranslation = async () => {
     await appendTranslateRequestLog({ ...logBase, status: 'start' });
-    let translated = await translateOnce(false);
+    let translated: string;
+    try {
+      translated = await translateOnce(false);
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'SensitiveTranslationTokenIntegrityError') throw error;
+      await appendTranslateRequestLog({ ...logBase, status: 'retry-sensitive-token-integrity' });
+      translated = await translateOnce(true);
+    }
     const wantsChinese = /Chinese|zh|Simplified/i.test(request.to || '');
     const sourceHasLatin = /[A-Za-z]{2,}/.test(request.text || '');
     if (wantsChinese) translated = sanitizeChineseTranslation(translated);
@@ -2859,13 +5350,13 @@ async function translateWithDeepSeek(request: TranslateRequest): Promise<string>
       translated = sanitizeChineseTranslation(await translateOnce(true));
     }
     if (isComposerEnglishRequest) {
-      translated = sanitizeComposerEnglish(translated);
+      translated = sanitizeComposerEnglishTranslation(translated);
       if (isSuspiciousComposerEnglish(translated) || !composerLayoutMatches(request.text || '', translated)) {
         await appendTranslateRequestLog({ ...logBase, status: 'retry-composer-faithful', translatedLength: translated.length });
-        translated = sanitizeComposerEnglish(await translateOnce(false, true));
+        translated = sanitizeComposerEnglishTranslation(await translateOnce(true));
       }
       if (isSuspiciousComposerEnglish(translated)) throw new Error('Composer translation expanded beyond the source.');
-      translated = restoreComposerLayout(request.text || '', translated);
+      translated = restoreComposerEnglishLayout(request.text || '', translated);
       if (!composerLayoutMatches(request.text || '', translated)) throw new Error('Composer translation did not preserve source line layout.');
     }
     await appendTranslateRequestLog({ ...logBase, status: 'success', translatedLength: translated.length });
@@ -2874,9 +5365,14 @@ async function translateWithDeepSeek(request: TranslateRequest): Promise<string>
   };
 
   const dedupeKey = request.reason === 'visible-message' && request.profileId && request.sourceHash
-    ? `${request.profileId}:${request.sourceHash}`
+    ? JSON.stringify([
+        request.profileId,
+        request.to,
+        request.sourceHash,
+        createHash('sha256').update(request.text || '', 'utf8').digest('base64url')
+      ])
     : '';
-  if (!dedupeKey) return runDeepSeekTranslation();
+  if (!dedupeKey || abortSignal) return runDeepSeekTranslation();
 
   const existing = visibleMessageDeepSeekDedupe.get(dedupeKey);
   if (existing) {
@@ -2914,10 +5410,10 @@ function toggleMainWindowSize(targetWindow: BrowserWindow) {
     width,
     height
   };
-  targetWindow.unmaximize();
-  setTimeout(() => {
+  targetWindow.once('unmaximize', () => {
     if (!targetWindow.isDestroyed() && !targetWindow.isMaximized()) targetWindow.setBounds(compactBounds);
-  }, 50);
+  });
+  targetWindow.unmaximize();
 }
 
 function assertTrustedIpcSender(event: IpcMainInvokeEvent | IpcMainEvent) {
@@ -3016,6 +5512,58 @@ function registerIpc() {
     if (result.ok) await prepareAuthorizedRuntime();
     return result;
   });
+  trustedHandle('client-license:replace', true, async (_event, licenseCode: string) => {
+    if (!clientLicenseManager) throw new Error('客户端授权模块尚未初始化');
+    const oldServiceSecret = clientLicenseManager.getServiceSecret();
+    if (!oldServiceSecret) {
+      return { ok: false, reason: '当前授权密钥不可用，不能重新授权', status: clientLicenseManager.getStatus() };
+    }
+    const preparation = await clientLicenseManager.prepareReplacement(assertText(licenseCode, 'License code', 32 * 1024));
+    if (!preparation.result.ok || !preparation.prepared) {
+      if (preparation.result.selfDestructRequired) await beginAuthorizationSelfDestruct();
+      return preparation.result;
+    }
+
+    let prompts: TranslationPrompts;
+    let pendingRaw = '';
+    try {
+      prompts = await loadTranslationPrompts(oldServiceSecret);
+      pendingRaw = encryptTranslationPromptBundle(preparation.prepared.payload.serviceSecret, prompts);
+      await writeTextAtomic(pendingTranslationPromptPath(), pendingRaw);
+    } catch (error) {
+      await rm(pendingTranslationPromptPath(), { force: true });
+      return {
+        ok: false,
+        reason: error instanceof Error ? `提示词密钥迁移失败：${error.message}` : '提示词密钥迁移失败',
+        status: clientLicenseManager.getStatus()
+      };
+    }
+
+    let snapshot: ClientLicenseSnapshot | undefined;
+    try {
+      snapshot = await clientLicenseManager.commitReplacement(preparation.prepared);
+      await writeTextAtomic(activeTranslationPromptPath(), pendingRaw);
+      await rm(pendingTranslationPromptPath(), { force: true });
+      translationPromptsCache = prompts;
+      return { ok: true, status: clientLicenseManager.getStatus() };
+    } catch (error) {
+      let rollbackCompleted = false;
+      if (snapshot) {
+        try {
+          await clientLicenseManager.rollbackReplacement(snapshot);
+          rollbackCompleted = true;
+        } catch {
+          // The pending prompt remains available for startup recovery if authorization rollback cannot complete.
+        }
+      }
+      if (!snapshot || rollbackCompleted) await rm(pendingTranslationPromptPath(), { force: true });
+      return {
+        ok: false,
+        reason: error instanceof Error ? `重新授权未完成：${error.message}` : '重新授权未完成',
+        status: clientLicenseManager.getStatus()
+      };
+    }
+  });
   trustedHandle('client-license:copy-machine-info', false, async () => {
     if (!clientLicenseManager) throw new Error('客户端授权模块尚未初始化');
     try {
@@ -3048,6 +5596,7 @@ function registerIpc() {
   trustedHandle('signal:launch', true, (_event, id: string) => {
     return launchSignalProfile(assertProfileId(id));
   });
+  trustedHandle('signal:source-only-acceptance', true, () => signalSourceOnlyAcceptanceActive);
   trustedHandle('signal:set-workspace-bounds', true, (_event, id: string, bounds: SignalWorkspaceBounds) =>
     setSignalWorkspaceBounds(assertProfileId(id), validateWorkspaceBounds(bounds))
   );
@@ -3118,13 +5667,24 @@ function registerIpc() {
   });
   trustedHandle('system:get-memory-status', false, () => getMemoryStatus());
   trustedHandle('lock-screen:status', true, () => getLockScreenStatus());
-  trustedHandle('lock-screen:set-pin', true, (_event, pin: string) => setLockScreenPin(assertText(pin, 'Lock PIN', 32)));
-  trustedHandle('lock-screen:unlock', true, (_event, pin: string) => unlockLockScreen(assertText(pin, 'Lock PIN', 32)));
-  trustedHandle('window:set-theme', true, (event, theme: 'blackGold' | 'pink') => {
+  trustedHandle('lock-screen:engage', true, () => engageWorkspaceVisibilityLock());
+  trustedHandle('lock-screen:check-network-offline', true, () => checkNetworkOffline());
+  trustedHandle('lock-screen:authorize-pin-change', true, (event, mode: LockScreenPinChangeMode) => {
+    if (mode !== 'setup' && mode !== 'reset' && mode !== 'upgrade') {
+      throw new Error('锁屏凭据设置模式无效');
+    }
+    return authorizeLockScreenPinChange(event.sender.id, mode);
+  });
+  trustedHandle('lock-screen:set-pin', true, (event, pin: string, token: string) =>
+    setLockScreenPin(
+      event.sender.id,
+      assertText(pin, 'Lock credential', 32),
+      assertText(token, 'Lock credential authorization', 256)
+    )
+  );
+  trustedHandle('lock-screen:unlock', true, (_event, pin: string) => unlockLockScreen(assertText(pin, 'Lock credential', 32)));
+  trustedHandle('window:set-theme', true, (_event, theme: 'blackGold' | 'pink') => {
     if (theme !== 'blackGold' && theme !== 'pink') throw new Error('Theme is invalid.');
-    const targetWindow = BrowserWindow.fromWebContents(event.sender);
-    void theme;
-    (targetWindow as BrowserWindow & { setTitleBarOverlay?: (overlay: false) => void } | null)?.setTitleBarOverlay?.(false);
   });
   trustedHandle('clipboard:read-text', true, () => clipboard.readText().slice(0, 1024 * 1024));
   trustedHandle('clipboard:write-text', true, (_event, text: string) => {
@@ -3132,7 +5692,6 @@ function registerIpc() {
   });
   trustedHandle('window:minimize', false, (event) => {
     const targetWindow = BrowserWindow.fromWebContents(event.sender);
-    hideAllSignalWindows();
     targetWindow?.minimize();
   });
   trustedHandle('window:toggle-maximize', false, (event) => {
@@ -3149,7 +5708,6 @@ function registerIpc() {
     if (!targetWindow) return;
 
     if (action === 'minimize') {
-      hideAllSignalWindows();
       targetWindow.minimize();
       return;
     }
@@ -3213,6 +5771,11 @@ async function prepareAuthorizedRuntime() {
   if (authorizedRuntimePrepared) return;
   assertClientRuntimeAllowed();
   if (!clientLicenseManager) throw new Error('客户端授权模块尚未初始化');
+  signalSourceOnlyAcceptanceActive = resolveSignalSourceOnlyAcceptance();
+  if (signalSourceOnlyAcceptanceActive) {
+    await resolveSignalExecutable();
+    initializeSignalSourceOnlyAcceptanceDiagnostics();
+  }
   const material = clientLicenseManager.getRuntimeSecurityMaterial();
   const binding = await ensureRuntimeBinding(
     defaultRuntimeBindingPath(),
@@ -3300,22 +5863,17 @@ async function createWindow() {
     webPreferences.webSecurity = true;
     webPreferences.allowRunningInsecureContent = false;
   });
-  mainWindow.on('minimize', () => {
-    hideAllSignalWindows();
-  });
+  // Windows hides and restores authenticated owned Signal windows with their owner.
+  // Sending an additional window.hide here can restore only the native surface and
+  // leave Chromium white until the profile is switched.
   mainWindow.on('hide', () => {
     hideAllSignalWindows();
   });
   mainWindow.on('restore', requestSignalWorkspaceSyncBurst);
   mainWindow.on('show', requestSignalWorkspaceSyncBurst);
-  mainWindow.on('focus', () => {
-    focusedSignalProfileId = null;
-    cancelAppGroupBlurCheck();
-    requestSignalWorkspaceSyncBurst();
-  });
-  mainWindow.on('blur', scheduleAppGroupBlurCheck);
+  mainWindow.on('focus', requestSignalWorkspaceSyncBurst);
   mainWindow.on('move', scheduleVisibleSignalMoveSync);
-  mainWindow.on('resize', resyncVisibleSignalWindows);
+  mainWindow.on('resized', requestSignalWorkspaceSyncBurst);
 
   const readyToShow = new Promise<void>((resolve) => {
     let resolved = false;
@@ -3339,6 +5897,7 @@ async function createWindow() {
 
   await readyToShow;
   if (!mainWindow.isDestroyed()) {
+    releaseWorkspaceVisibilityLock();
     mainWindow.show();
     requestSignalWorkspaceSyncBurst();
     const smokeCapturePath = !app.isPackaged ? process.env.MAOYI_SMOKE_CAPTURE_PATH?.trim() : '';

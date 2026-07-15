@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "version": "8.18.0",
+  "archive": {
+    "repositoryRelativePath": "reference-sources/Signal-Desktop-v8.18.0.zip",
+    "sha256": "A1FE955608134DAA81FC4EDDBEA35F8BA57E4CA54B43391B845364965D6C1A66",
+    "extractedRoot": "Signal-Desktop-8.18.0"
+  },
+  "referenceSource": {
+    "repositoryRelativePath": "reference-sources/Signal-Desktop-v8.18.0/Signal-Desktop-8.18.0"
+  },
+  "patchSeries": {
+    "projectRelativePath": "signal-source/patches/v8.18.0/series.json"
+  },
+  "package": {
+    "name": "signal-desktop",
+    "version": "8.18.0",
+    "node": "24.15.0",
+    "packageManager": "pnpm@11.5.2",
+    "electron": "42.3.0"
+  },
+  "experiment": {
+    "projectRelativePath": ".tmp/signal-source/v8.18.0",
+    "minimumPrepareFreeBytes": 1073741824,
+    "minimumBuildFreeBytes": 16106127360
+  },
+  "build": {
+    "installArgs": [
+      "pnpm",
+      "install",
+      "--offline",
+      "--frozen-lockfile"
+    ],
+    "cleanPaths": [
+      "release",
+      "bundles"
+    ],
+    "unsignedWindows": true,
+    "electronArchiveSha256": "01889FF05A2852B86F34E274F0FD7DC41F31CCC500A8D4E07D43F4984B8CEC9A",
+    "buildSteps": [
+      [
+        "pnpm",
+        "run",
+        "generate"
+      ],
+      [
+        "pnpm",
+        "run",
+        "build:rolldown:prod"
+      ],
+      [
+        "pnpm",
+        "run",
+        "build:release",
+        "--win",
+        "dir"
+      ]
+    ]
+  }
+}

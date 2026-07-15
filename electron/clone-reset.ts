@@ -35,7 +35,7 @@ export type CloneResetPlan = {
 };
 
 function resetWorkRoot() {
-  return join(tmpdir(), 'maoyi-Reset');
+  return join(tmpdir(), 'MAOYI-TRANSLATOR-Reset');
 }
 
 function samePath(left: string, right: string) {
@@ -250,7 +250,7 @@ export async function runCloneResetWorker(planPath: string) {
   }
   if (
     plan.uninstallerPath &&
-    basename(plan.uninstallerPath).toLowerCase() === 'uninstall maoyi translator.exe' &&
+    basename(plan.uninstallerPath).toLowerCase() === 'uninstall maoyi.exe' &&
     samePath(dirname(plan.uninstallerPath), dirname(process.execPath))
   ) {
     try {

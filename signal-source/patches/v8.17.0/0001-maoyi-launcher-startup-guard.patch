@@ -1,0 +1,1213 @@
+diff --git a/app/maoyi/bootstrap.main.ts b/app/maoyi/bootstrap.main.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e1fc72f68501021a1d0de87897bc1a022c09d84
+--- /dev/null
++++ b/app/maoyi/bootstrap.main.ts
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import { createRequire } from 'node:module';
++import { join } from 'node:path';
++import { app, dialog } from 'electron';
++
++import { runMaoyiStartupGuard } from './launchGuard.main.ts';
++
++try {
++  if (runMaoyiStartupGuard(app, dialog)) {
++    createRequire(__filename)(join(__dirname, 'signal-main.js'));
++  }
++} catch {
++  if (process.env.MAOYI_SIGNAL_GUARD_TEST_AUTOCLOSE !== '1') {
++    dialog.showErrorBox('MAOYI TRANSLATOR', '内置 Signal 启动校验失败');
++  }
++  app.exit(1);
++}
+diff --git a/app/maoyi/launchContext.main.ts b/app/maoyi/launchContext.main.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fef07b97a5549fc3205e2bb610c4d35ac277e0b
+--- /dev/null
++++ b/app/maoyi/launchContext.main.ts
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++const launchContextKey = Symbol.for('maoyi.signal.launch-context.v1');
++
++export type MaoyiLaunchContext = Readonly<{
++  appId: string;
++  profileId: string;
++  wsPort: number;
++  title: string;
++  controlKey: Buffer;
++}>;
++
++export function setMaoyiLaunchContext(context: MaoyiLaunchContext): void {
++  Reflect.set(globalThis, launchContextKey, {
++    ...context,
++    controlKey: Buffer.from(context.controlKey),
++  });
++}
++
++export function getMaoyiLaunchContext(): MaoyiLaunchContext | undefined {
++  return Reflect.get(globalThis, launchContextKey) as
++    | MaoyiLaunchContext
++    | undefined;
++}
++
++export function takeMaoyiLaunchContext(): MaoyiLaunchContext | undefined {
++  const context = getMaoyiLaunchContext();
++  Reflect.deleteProperty(globalThis, launchContextKey);
++  return context;
++}
++
++export function isMaoyiEmbedLaunch(): boolean {
++  return getMaoyiLaunchContext() != null;
++}
+diff --git a/app/maoyi/launchGuard.main.ts b/app/maoyi/launchGuard.main.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..09d1e01661cb4065e8d44589addccfefb9c652fe
+--- /dev/null
++++ b/app/maoyi/launchGuard.main.ts
+@@ -0,0 +1,912 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import { execFileSync, spawn } from 'node:child_process';
++import {
++  createHash,
++  createPublicKey,
++  randomBytes,
++  randomUUID,
++  verify as verifySignature,
++} from 'node:crypto';
++import fs from 'node:fs';
++import {
++  mkdir,
++  readFile,
++  readdir,
++  rename,
++  rm,
++  rmdir,
++  unlink,
++  writeFile,
++} from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import type { App, Dialog } from 'electron';
++
++import { setMaoyiLaunchContext } from './launchContext.main.ts';
++
++const productId = 'maoyi';
++const schemaVersion = 1;
++const credentialTtlMs = 10_000;
++const credentialMaxBytes = 64 * 1024;
++const resetPlanTtlMs = 5 * 60_000;
++const resetParentWaitMs = 15_000;
++const resetArgument = '--df-clone-reset-plan=';
++const resetMarkerName = '.df-clone-reset-marker.json';
++const runtimeBindingName = 'runtime-binding.dat';
++const runtimeSidecarName = 'df-runtime-binding.dat';
++const instanceBindingName = 'df-instance-binding.dat';
++const dataRootNames = new Set([
++  'maoyi data',
++  'maoyi',
++]);
++const profileIdPattern =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++
++type RuntimeBindingPayload = {
++  schemaVersion: 1;
++  productId: string;
++  suiteId: string;
++  keyId: string;
++  installationId: string;
++  dataRootId: string;
++  machineCodeHash: string;
++  hardwareHash: string;
++  devicePublicKeyPem: string;
++  createdAt: string;
++};
++
++type ProtectedRuntimeBindingFile = {
++  schemaVersion?: number;
++  productId?: string;
++  suiteId?: string;
++  keyId?: string;
++  installationId?: string;
++  dataRootId?: string;
++  signedPayload?: string;
++  signature?: string;
++};
++
++export type SignalInstanceBinding = {
++  schemaVersion: 1;
++  productId: string;
++  suiteId: string;
++  installationId: string;
++  dataRootId: string;
++  profileId: string;
++  createdAt: string;
++  signature: string;
++};
++
++export type SignalLaunchCredential = {
++  schemaVersion: 1;
++  productId: string;
++  suiteId: string;
++  installationId: string;
++  dataRootId: string;
++  profileId: string;
++  processId: number;
++  issuedAt: number;
++  expiresAt: number;
++  nonce: string;
++  controlKey: string;
++  signature: string;
++};
++
++export type SignalLaunchExpectation = {
++  suiteId: string;
++  installationId: string;
++  dataRootId: string;
++  profileId: string;
++  processId: number;
++};
++
++type BindingInspection =
++  | { state: 'missing' }
++  | {
++      state: 'local';
++      file: ProtectedRuntimeBindingFile;
++      payload: RuntimeBindingPayload;
++    }
++  | {
++      state: 'foreign';
++      file?: ProtectedRuntimeBindingFile;
++      reason: string;
++    };
++
++type ResetPlan = {
++  schemaVersion: 1;
++  productId: string;
++  resetId: string;
++  targetRoot?: string;
++  bootstrapPath?: string;
++  runtimeBindingPaths: ReadonlyArray<string>;
++  expectedDataRootId?: string;
++  expectedSuiteId?: string;
++  parentProcessId: number;
++  createdAt: number;
++  expiresAt: number;
++};
++
++function diagnostic(
++  stage: string,
++  details: Record<string, unknown> = {}
++): void {
++  const diagnosticPath = process.env.MAOYI_SIGNAL_GUARD_DIAGNOSTIC;
++  if (!diagnosticPath) {
++    return;
++  }
++  try {
++    fs.writeFileSync(
++      diagnosticPath,
++      `${JSON.stringify({ stage, at: Date.now(), ...details })}\n`,
++      'utf8'
++    );
++  } catch {
++    // Development diagnostics must never affect the guard decision.
++  }
++}
++
++function argValue(
++  name: string,
++  args: ReadonlyArray<string> = process.argv
++): string {
++  const item = args.find(
++    value => value === name || value.startsWith(`${name}=`)
++  );
++  if (!item) {
++    return '';
++  }
++  return item === name ? '1' : item.slice(name.length + 1);
++}
++
++function samePath(left: string, right: string): boolean {
++  return (
++    path.normalize(path.resolve(left)).toLowerCase() ===
++    path.normalize(path.resolve(right)).toLowerCase()
++  );
++}
++
++export function isOwnedDataRoot(value: string): boolean {
++  if (!value || !path.isAbsolute(value) || value.startsWith('\\\\')) {
++    return false;
++  }
++  const resolved = path.resolve(value);
++  return (
++    !samePath(resolved, path.parse(resolved).root) &&
++    dataRootNames.has(path.basename(resolved).toLowerCase())
++  );
++}
++
++export function deriveDataRoot(dataDir: string): string {
++  if (!dataDir || !path.isAbsolute(dataDir)) {
++    return '';
++  }
++  const instanceDir = path.resolve(dataDir);
++  const instancesRoot = path.dirname(instanceDir);
++  if (path.basename(instancesRoot).toLowerCase() !== 'signalinstances') {
++    return '';
++  }
++  const dataRoot = path.dirname(instancesRoot);
++  return isOwnedDataRoot(dataRoot) ? dataRoot : '';
++}
++
++function verifyValues(
++  publicKeyPem: string,
++  signature: string,
++  values: ReadonlyArray<unknown>
++): boolean {
++  try {
++    return verifySignature(
++      null,
++      Buffer.from(JSON.stringify(values)),
++      createPublicKey(publicKeyPem),
++      Buffer.from(signature, 'base64url')
++    );
++  } catch {
++    return false;
++  }
++}
++
++function currentHardwareHash(): string {
++  let stableGuid = '';
++  try {
++    const output = execFileSync(
++      'reg.exe',
++      ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'],
++      { windowsHide: true, encoding: 'utf8' }
++    );
++    stableGuid =
++      output.match(/MachineGuid\s+REG_\w+\s+([^\r\n]+)/i)?.[1]?.trim() || '';
++  } catch {
++    stableGuid = '';
++  }
++  const fallback = [
++    os.hostname(),
++    os.platform(),
++    os.arch(),
++    os.cpus()[0]?.model || 'unknown-cpu',
++  ].join('\0');
++  return createHash('sha256')
++    .update(stableGuid || fallback)
++    .digest('hex');
++}
++
++function validateRuntimePayload(value: unknown): RuntimeBindingPayload {
++  const payload = value as Partial<RuntimeBindingPayload> | null;
++  if (
++    !payload ||
++    payload.schemaVersion !== schemaVersion ||
++    payload.productId !== productId ||
++    !payload.suiteId ||
++    !payload.keyId ||
++    !payload.installationId ||
++    !payload.dataRootId ||
++    !/^[a-f0-9]{64}$/i.test(payload.machineCodeHash || '') ||
++    !/^[a-f0-9]{64}$/i.test(payload.hardwareHash || '') ||
++    !payload.devicePublicKeyPem ||
++    !payload.createdAt
++  ) {
++    throw new Error('Invalid runtime binding payload');
++  }
++  createPublicKey(payload.devicePublicKeyPem);
++  return payload as RuntimeBindingPayload;
++}
++
++function runtimeBindingSignatureValues(
++  payload: RuntimeBindingPayload
++): ReadonlyArray<unknown> {
++  return [
++    'maoyi-runtime-binding-v1',
++    payload.schemaVersion,
++    payload.productId,
++    payload.suiteId,
++    payload.keyId,
++    payload.installationId,
++    payload.dataRootId,
++    payload.machineCodeHash,
++    payload.hardwareHash,
++    payload.devicePublicKeyPem,
++    payload.createdAt,
++  ];
++}
++
++function inspectBindingFile(bindingPath: string): BindingInspection {
++  let file: ProtectedRuntimeBindingFile;
++  try {
++    file = JSON.parse(
++      fs.readFileSync(bindingPath, 'utf8')
++    ) as ProtectedRuntimeBindingFile;
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
++      return { state: 'missing' };
++    }
++    return { state: 'foreign', reason: 'binding-read-failed' };
++  }
++
++  try {
++    if (
++      file.schemaVersion !== schemaVersion ||
++      file.productId !== productId ||
++      !file.signedPayload ||
++      !file.signature
++    ) {
++      return { state: 'foreign', file, reason: 'binding-invalid' };
++    }
++    const payload = validateRuntimePayload(
++      JSON.parse(Buffer.from(file.signedPayload, 'base64url').toString('utf8'))
++    );
++    if (
++      payload.suiteId !== file.suiteId ||
++      payload.keyId !== file.keyId ||
++      payload.installationId !== file.installationId ||
++      payload.dataRootId !== file.dataRootId ||
++      !verifyValues(
++        payload.devicePublicKeyPem,
++        file.signature,
++        runtimeBindingSignatureValues(payload)
++      )
++    ) {
++      return {
++        state: 'foreign',
++        file,
++        reason: 'binding-metadata-mismatch',
++      };
++    }
++    if (payload.hardwareHash !== currentHardwareHash()) {
++      return {
++        state: 'foreign',
++        file,
++        reason: 'binding-hardware-mismatch',
++      };
++    }
++    return { state: 'local', file, payload };
++  } catch {
++    return { state: 'foreign', file, reason: 'binding-signature-failed' };
++  }
++}
++
++function instanceSignatureValues(
++  binding: Omit<SignalInstanceBinding, 'signature'>
++): ReadonlyArray<unknown> {
++  return [
++    'maoyi-signal-instance-v1',
++    binding.schemaVersion,
++    binding.productId,
++    binding.suiteId,
++    binding.installationId,
++    binding.dataRootId,
++    binding.profileId,
++    binding.createdAt,
++  ];
++}
++
++export function verifyInstanceBinding(
++  binding: SignalInstanceBinding,
++  runtimeBinding: RuntimeBindingPayload,
++  profileId: string
++): boolean {
++  if (
++    !binding ||
++    binding.schemaVersion !== schemaVersion ||
++    binding.productId !== productId ||
++    binding.suiteId !== runtimeBinding.suiteId ||
++    binding.installationId !== runtimeBinding.installationId ||
++    binding.dataRootId !== runtimeBinding.dataRootId ||
++    binding.profileId !== profileId ||
++    !Number.isFinite(Date.parse(binding.createdAt))
++  ) {
++    return false;
++  }
++  const { signature, ...unsigned } = binding;
++  return verifyValues(
++    runtimeBinding.devicePublicKeyPem,
++    signature,
++    instanceSignatureValues(unsigned)
++  );
++}
++
++function launchSignatureValues(
++  credential: Omit<SignalLaunchCredential, 'signature'>
++): ReadonlyArray<unknown> {
++  return [
++    'maoyi-signal-launch-v1',
++    credential.schemaVersion,
++    credential.productId,
++    credential.suiteId,
++    credential.installationId,
++    credential.dataRootId,
++    credential.profileId,
++    credential.processId,
++    credential.issuedAt,
++    credential.expiresAt,
++    credential.nonce,
++    credential.controlKey,
++  ];
++}
++
++export function verifyLaunchCredential(
++  credential: SignalLaunchCredential,
++  runtimeBinding: RuntimeBindingPayload,
++  expectation: SignalLaunchExpectation,
++  now = Date.now()
++): boolean {
++  if (
++    !credential ||
++    credential.schemaVersion !== schemaVersion ||
++    credential.productId !== productId ||
++    credential.suiteId !== expectation.suiteId ||
++    credential.installationId !== expectation.installationId ||
++    credential.dataRootId !== expectation.dataRootId ||
++    credential.profileId !== expectation.profileId ||
++    credential.processId !== expectation.processId ||
++    !Number.isInteger(credential.issuedAt) ||
++    !Number.isInteger(credential.expiresAt) ||
++    credential.expiresAt - credential.issuedAt !== credentialTtlMs ||
++    now < credential.issuedAt - 1_000 ||
++    now > credential.expiresAt ||
++    Buffer.from(credential.nonce || '', 'base64url').length !== 32 ||
++    Buffer.from(credential.controlKey || '', 'base64url').length !== 32
++  ) {
++    return false;
++  }
++  const { signature, ...unsigned } = credential;
++  return verifyValues(
++    runtimeBinding.devicePublicKeyPem,
++    signature,
++    launchSignatureValues(unsigned)
++  );
++}
++
++function readCredentialPipe(address: string): SignalLaunchCredential {
++  if (!address || !address.startsWith('\\\\.\\pipe\\maoyi-signal-')) {
++    throw new Error('credential-pipe-address-invalid');
++  }
++  const text = fs.readFileSync(address, 'utf8');
++  if (Buffer.byteLength(text, 'utf8') > credentialMaxBytes) {
++    throw new Error('credential-too-large');
++  }
++  return JSON.parse(text.trim()) as SignalLaunchCredential;
++}
++
++function bootstrapPath(app: App): string {
++  return path.join(
++    app.getPath('appData'),
++    'MAOYI TRANSLATOR Launcher',
++    'storage.json'
++  );
++}
++
++function rootFromBootstrap(app: App): string {
++  try {
++    const parsed = JSON.parse(fs.readFileSync(bootstrapPath(app), 'utf8')) as {
++      dataPath?: unknown;
++    };
++    return typeof parsed.dataPath === 'string' &&
++      isOwnedDataRoot(parsed.dataPath)
++      ? path.resolve(parsed.dataPath)
++      : '';
++  } catch {
++    return '';
++  }
++}
++
++async function writeAtomic(targetPath: string, value: string): Promise<void> {
++  const temporaryPath = `${targetPath}.${process.pid}.${randomBytes(5).toString('hex')}.tmp`;
++  await mkdir(path.dirname(targetPath), { recursive: true });
++  await writeFile(temporaryPath, value, 'utf8');
++  try {
++    await rename(temporaryPath, targetPath);
++  } catch (error) {
++    await rm(targetPath, { force: true });
++    await rename(temporaryPath, targetPath);
++    void error;
++  }
++}
++
++function resetWorkRoot(): string {
++  return path.join(os.tmpdir(), 'MAOYI-TRANSLATOR-Reset');
++}
++
++async function createResetPlan(input: {
++  targetRoot: string;
++  bootstrapFile?: string;
++  runtimeBindingPaths: ReadonlyArray<string>;
++  bindingFile?: ProtectedRuntimeBindingFile;
++}): Promise<string> {
++  const now = Date.now();
++  const resetId = randomUUID();
++  const resolvedRoot =
++    input.targetRoot && isOwnedDataRoot(input.targetRoot)
++      ? path.resolve(input.targetRoot)
++      : undefined;
++  if (resolvedRoot) {
++    await writeAtomic(
++      path.join(resolvedRoot, resetMarkerName),
++      `${JSON.stringify({
++        schemaVersion,
++        productId,
++        resetId,
++        createdAt: now,
++      })}\n`
++    );
++  }
++  const plan: ResetPlan = {
++    schemaVersion,
++    productId,
++    resetId,
++    targetRoot: resolvedRoot,
++    bootstrapPath: input.bootstrapFile,
++    runtimeBindingPaths: [
++      ...new Set(input.runtimeBindingPaths.map(value => path.resolve(value))),
++    ],
++    expectedDataRootId: input.bindingFile?.dataRootId,
++    expectedSuiteId: input.bindingFile?.suiteId,
++    parentProcessId: process.pid,
++    createdAt: now,
++    expiresAt: now + resetPlanTtlMs,
++  };
++  const planPath = path.join(resetWorkRoot(), `reset-${resetId}.json`);
++  await writeAtomic(planPath, `${JSON.stringify(plan)}\n`);
++  return planPath;
++}
++
++async function processExists(processId: number): Promise<boolean> {
++  if (!Number.isInteger(processId) || processId <= 0) {
++    return false;
++  }
++  try {
++    process.kill(processId, 0);
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++async function waitForParentExit(processId: number): Promise<void> {
++  const deadline = Date.now() + resetParentWaitMs;
++  while (Date.now() < deadline && (await processExists(processId))) {
++    await new Promise(resolvePromise => {
++      setTimeout(resolvePromise, 100);
++    });
++  }
++  if (await processExists(processId)) {
++    throw new Error('reset-parent-still-running');
++  }
++}
++
++async function retryDelete(operation: () => Promise<void>): Promise<void> {
++  const delays = [0, 250, 500, 1_000, 2_000, 4_000, 8_000];
++  let lastError: unknown;
++  for (const delay of delays) {
++    if (delay) {
++      await new Promise(resolvePromise => {
++        setTimeout(resolvePromise, delay);
++      });
++    }
++    try {
++      await operation();
++      return;
++    } catch (error) {
++      lastError = error;
++    }
++  }
++  throw lastError;
++}
++
++async function removeTreeWithoutFollowingLinks(
++  targetPath: string
++): Promise<void> {
++  let entries;
++  try {
++    entries = await readdir(targetPath, { withFileTypes: true });
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
++      return;
++    }
++    throw error;
++  }
++  for (const entry of entries) {
++    const entryPath = path.join(targetPath, entry.name);
++    if (entry.isSymbolicLink()) {
++      await retryDelete(() =>
++        unlink(entryPath).catch(async () => {
++          await rm(entryPath, { force: true });
++        })
++      );
++    } else if (entry.isDirectory()) {
++      await removeTreeWithoutFollowingLinks(entryPath);
++    } else {
++      await retryDelete(async () => {
++        await rm(entryPath, { force: true });
++      });
++    }
++  }
++  await retryDelete(async () => {
++    await rmdir(targetPath);
++  });
++}
++
++async function validateResetTarget(plan: ResetPlan): Promise<void> {
++  if (!plan.targetRoot) {
++    return;
++  }
++  if (!isOwnedDataRoot(plan.targetRoot)) {
++    throw new Error('reset-root-invalid');
++  }
++  const rootStat = await fs.promises.lstat(plan.targetRoot);
++  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
++    throw new Error('reset-root-not-directory');
++  }
++  const marker = JSON.parse(
++    await readFile(path.join(plan.targetRoot, resetMarkerName), 'utf8')
++  ) as { schemaVersion?: number; productId?: string; resetId?: string };
++  if (
++    marker.schemaVersion !== schemaVersion ||
++    marker.productId !== productId ||
++    marker.resetId !== plan.resetId
++  ) {
++    throw new Error('reset-marker-invalid');
++  }
++  if (plan.expectedDataRootId || plan.expectedSuiteId) {
++    const binding = JSON.parse(
++      await readFile(path.join(plan.targetRoot, runtimeBindingName), 'utf8')
++    ) as ProtectedRuntimeBindingFile;
++    if (
++      binding.productId !== productId ||
++      (plan.expectedDataRootId &&
++        binding.dataRootId !== plan.expectedDataRootId) ||
++      (plan.expectedSuiteId && binding.suiteId !== plan.expectedSuiteId)
++    ) {
++      throw new Error('reset-binding-invalid');
++    }
++  }
++}
++
++async function removeBootstrapIfOwned(
++  bootstrapFile: string | undefined,
++  targetRoot: string | undefined
++): Promise<void> {
++  if (!bootstrapFile || !targetRoot) {
++    return;
++  }
++  try {
++    const parsed = JSON.parse(await readFile(bootstrapFile, 'utf8')) as {
++      dataPath?: unknown;
++    };
++    if (
++      typeof parsed.dataPath !== 'string' ||
++      !samePath(parsed.dataPath, targetRoot)
++    ) {
++      return;
++    }
++    await rm(bootstrapFile, { force: true });
++    await rmdir(path.dirname(bootstrapFile)).catch(() => undefined);
++  } catch {
++    // Missing and unrelated launch pointers are not reset.
++  }
++}
++
++async function runResetWorker(
++  planPath: string,
++  ownRuntimeBindingPath: string
++): Promise<void> {
++  const resolvedPlanPath = path.resolve(planPath);
++  if (!samePath(path.dirname(resolvedPlanPath), resetWorkRoot())) {
++    throw new Error('reset-plan-path-invalid');
++  }
++  const plan = JSON.parse(
++    await readFile(resolvedPlanPath, 'utf8')
++  ) as ResetPlan;
++  if (
++    plan.schemaVersion !== schemaVersion ||
++    plan.productId !== productId ||
++    !plan.resetId ||
++    Date.now() > plan.expiresAt ||
++    plan.expiresAt - plan.createdAt !== resetPlanTtlMs
++  ) {
++    throw new Error('reset-plan-invalid');
++  }
++  await validateResetTarget(plan);
++  await waitForParentExit(plan.parentProcessId);
++  if (plan.targetRoot) {
++    await removeTreeWithoutFollowingLinks(path.resolve(plan.targetRoot));
++  }
++  await removeBootstrapIfOwned(plan.bootstrapPath, plan.targetRoot);
++  for (const bindingPath of plan.runtimeBindingPaths || []) {
++    if (!samePath(bindingPath, ownRuntimeBindingPath)) {
++      continue;
++    }
++    try {
++      const binding = JSON.parse(
++        await readFile(bindingPath, 'utf8')
++      ) as ProtectedRuntimeBindingFile;
++      if (
++        binding.productId === productId &&
++        (!plan.expectedDataRootId ||
++          binding.dataRootId === plan.expectedDataRootId)
++      ) {
++        await rm(bindingPath, { force: true });
++      }
++    } catch {
++      // Missing or unrelated sidecars are already safe.
++    }
++  }
++  await rm(resolvedPlanPath, { force: true });
++}
++
++function showError(dialog: Dialog, message: string): void {
++  if (process.env.MAOYI_SIGNAL_GUARD_TEST_AUTOCLOSE !== '1') {
++    dialog.showErrorBox('MAOYI TRANSLATOR', message);
++  }
++}
++
++function blockLocalDirectStart(app: App, dialog: Dialog): false {
++  diagnostic('local-direct-blocked');
++  showError(dialog, '缺少启动器，请从maoyi启动');
++  app.exit(0);
++  return false;
++}
++
++async function initializeForeignCopy(input: {
++  app: App;
++  dialog: Dialog;
++  bindingFile?: ProtectedRuntimeBindingFile;
++  dataRoot: string;
++  runtimeSidecarPath: string;
++}): Promise<void> {
++  diagnostic('foreign-initializing', {
++    dataRootPresent: Boolean(input.dataRoot),
++  });
++  showError(input.dialog, '缺少启动器，正在初始化');
++  const planPath = await createResetPlan({
++    targetRoot: input.dataRoot,
++    bootstrapFile: input.dataRoot ? bootstrapPath(input.app) : undefined,
++    runtimeBindingPaths: [input.runtimeSidecarPath],
++    bindingFile: input.bindingFile,
++  });
++  const helperDataPath = path.join(
++    resetWorkRoot(),
++    `signal-worker-${randomBytes(10).toString('hex')}`
++  );
++  const child = spawn(
++    process.execPath,
++    [`${resetArgument}${planPath}`, `--user-data-dir=${helperDataPath}`],
++    {
++      detached: true,
++      stdio: 'ignore',
++      windowsHide: true,
++    }
++  );
++  child.unref();
++  input.app.exit(0);
++}
++
++export function scrubMaoyiArguments(args: Array<string>): void {
++  const sensitiveNames = [
++    '--df',
++    '--appId',
++    '--wsPort',
++    '--dfLaunchPipe',
++    '--windowMode',
++    '--title',
++  ];
++  const filtered = args.filter(
++    value =>
++      !sensitiveNames.some(
++        name => value === name || value.startsWith(`${name}=`)
++      )
++  );
++  args.splice(0, args.length, ...filtered);
++}
++
++function handleBackgroundFailure(app: App, dialog: Dialog): void {
++  showError(dialog, '初始化未完成，请重新启动程序重试');
++  app.exit(1);
++}
++
++export function runMaoyiStartupGuard(app: App, dialog: Dialog): boolean {
++  const runtimeSidecarPath = path.join(
++    process.resourcesPath,
++    runtimeSidecarName
++  );
++  const resetPlanPath = argValue('--df-clone-reset-plan');
++  if (resetPlanPath) {
++    const workerDataPath =
++      argValue('--user-data-dir') ||
++      path.join(resetWorkRoot(), `signal-worker-${process.pid}`);
++    app.setPath('userData', workerDataPath);
++    app.setPath('sessionData', workerDataPath);
++    void runResetWorker(resetPlanPath, runtimeSidecarPath)
++      .then(() => {
++        app.exit(0);
++      })
++      .catch(() => {
++        handleBackgroundFailure(app, dialog);
++      });
++    return false;
++  }
++
++  diagnostic('guard-start', {
++    resetWorker: false,
++    launcherFlag: argValue('--df') === '1',
++    embedMode: argValue('--windowMode') === 'embed',
++    launchPipePresent: Boolean(argValue('--dfLaunchPipe')),
++    dataDirPresent: Boolean(argValue('--user-data-dir')),
++  });
++
++  const dataDir = argValue('--user-data-dir');
++  const dataRoot = deriveDataRoot(dataDir);
++  const bootstrapRoot = rootFromBootstrap(app);
++  const rootBindingPath = dataRoot
++    ? path.join(dataRoot, runtimeBindingName)
++    : bootstrapRoot
++      ? path.join(bootstrapRoot, runtimeBindingName)
++      : '';
++  const bindingPath =
++    rootBindingPath && fs.existsSync(rootBindingPath)
++      ? rootBindingPath
++      : runtimeSidecarPath;
++  const bindingInspection = inspectBindingFile(bindingPath);
++  diagnostic('binding-inspected', {
++    state: bindingInspection.state,
++    source: bindingPath === runtimeSidecarPath ? 'runtime' : 'data-root',
++  });
++
++  if (bindingInspection.state === 'missing' && (dataRoot || bootstrapRoot)) {
++    diagnostic('binding-missing-data-preserved');
++    return blockLocalDirectStart(app, dialog);
++  }
++  if (bindingInspection.state !== 'local') {
++    void initializeForeignCopy({
++      app,
++      dialog,
++      bindingFile:
++        bindingInspection.state === 'foreign'
++          ? bindingInspection.file
++          : undefined,
++      dataRoot: dataRoot || (rootBindingPath ? bootstrapRoot : ''),
++      runtimeSidecarPath,
++    }).catch(() => {
++      handleBackgroundFailure(app, dialog);
++    });
++    return false;
++  }
++
++  const launcherMode =
++    argValue('--df') === '1' && argValue('--windowMode') === 'embed';
++  if (!launcherMode) {
++    return blockLocalDirectStart(app, dialog);
++  }
++
++  const appId = argValue('--appId');
++  const profileId = appId.startsWith('Signal-') ? appId.slice(7) : '';
++  const wsPort = Number.parseInt(argValue('--wsPort'), 10);
++  if (
++    !dataRoot ||
++    !profileIdPattern.test(profileId) ||
++    !Number.isInteger(wsPort) ||
++    wsPort < 1 ||
++    wsPort > 65_535
++  ) {
++    return blockLocalDirectStart(app, dialog);
++  }
++
++  let instanceBinding: SignalInstanceBinding;
++  try {
++    instanceBinding = JSON.parse(
++      fs.readFileSync(path.join(dataDir, instanceBindingName), 'utf8')
++    ) as SignalInstanceBinding;
++  } catch {
++    return blockLocalDirectStart(app, dialog);
++  }
++  if (
++    !verifyInstanceBinding(
++      instanceBinding,
++      bindingInspection.payload,
++      profileId
++    )
++  ) {
++    return blockLocalDirectStart(app, dialog);
++  }
++
++  let credential: SignalLaunchCredential;
++  try {
++    diagnostic('credential-connecting', {
++      launchPipePresent: Boolean(argValue('--dfLaunchPipe')),
++    });
++    credential = readCredentialPipe(argValue('--dfLaunchPipe'));
++    diagnostic('credential-received');
++  } catch (error) {
++    diagnostic('credential-failed', {
++      error: error instanceof Error ? error.message : String(error),
++    });
++    return blockLocalDirectStart(app, dialog);
++  }
++
++  const expectation: SignalLaunchExpectation = {
++    suiteId: bindingInspection.payload.suiteId,
++    installationId: bindingInspection.payload.installationId,
++    dataRootId: bindingInspection.payload.dataRootId,
++    profileId,
++    processId: process.pid,
++  };
++  if (
++    !verifyLaunchCredential(credential, bindingInspection.payload, expectation)
++  ) {
++    diagnostic('credential-rejected');
++    return blockLocalDirectStart(app, dialog);
++  }
++
++  setMaoyiLaunchContext({
++    appId,
++    profileId,
++    wsPort,
++    title: argValue('--title').slice(0, 160),
++    controlKey: Buffer.from(credential.controlKey, 'base64url'),
++  });
++  delete process.env.MAOYI_SIGNAL_CONTROL_KEY;
++  scrubMaoyiArguments(process.argv);
++  diagnostic('credential-accepted');
++  return true;
++}
+diff --git a/app/main.main.ts b/app/main.main.ts
+index e1a3cd83eaa967371cc8f9256e0838a249cc26cc..e1a087f3712b93816c4f2f6bcea50c2c555ef629 100644
+--- a/app/main.main.ts
++++ b/app/main.main.ts
+@@ -50,6 +50,7 @@ import { createLogger } from '../ts/logging/log.std.ts';
+ import * as debugLog from '../ts/logging/debuglogs.node.ts';
+ import * as uploadDebugLog from '../ts/logging/uploadDebugLog.node.ts';
+ import { explodePromise } from '../ts/util/explodePromise.std.ts';
++import { isMaoyiEmbedLaunch } from './maoyi/launchContext.main.ts';
+ 
+ import './startup_config.main.ts';
+ 
+@@ -254,7 +255,7 @@ function showWindow() {
+ }
+ 
+ log.info('making app single instance');
+-const gotLock = app.requestSingleInstanceLock();
++const gotLock = isMaoyiEmbedLaunch() || app.requestSingleInstanceLock();
+ if (!gotLock) {
+   log.info('quitting; we are the second instance');
+   app.exit();
+diff --git a/rolldown.config.ts b/rolldown.config.ts
+index 2f1caeb9c6108d5436276e71a633e04010d65206..c635c2d43bb4933e50b7e79d95ac144f534f57f9 100644
+--- a/rolldown.config.ts
++++ b/rolldown.config.ts
+@@ -175,7 +175,8 @@ export default defineConfig([
+ 
+     input: {
+       // Main
+-      main: 'app/main.main.ts',
++      main: 'app/maoyi/bootstrap.main.ts',
++      'signal-main': 'app/main.main.ts',
+       config: 'app/config.main.js',
+ 
+       // Preloads
+diff --git a/scripts/get-expire-time.mjs b/scripts/get-expire-time.mjs
+index ead86ba455ad1d1fa573188eee8fd69da503a45d..7c38359b4484c1219fd50a9f0d672755e83a90ea 100644
+--- a/scripts/get-expire-time.mjs
++++ b/scripts/get-expire-time.mjs
+@@ -25,7 +25,7 @@ const localProductionPath = join(
+ const localProductionConfig = {
+   buildCreation,
+   buildExpiration,
+-  ...(isNotUpdatable ? { updatesEnabled: false } : {}),
++  updatesEnabled: false,
+ };
+ 
+ writeFileSync(
+diff --git a/ts/test-node/maoyi/launchGuard_test.node.ts b/ts/test-node/maoyi/launchGuard_test.node.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e716caaafcaf8af1a4d9202ff67a96061d822e3
+--- /dev/null
++++ b/ts/test-node/maoyi/launchGuard_test.node.ts
+@@ -0,0 +1,177 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++import { createHash, generateKeyPairSync, sign } from 'node:crypto';
++import path from 'node:path';
++
++import {
++  deriveDataRoot,
++  isOwnedDataRoot,
++  scrubMaoyiArguments,
++  verifyInstanceBinding,
++  verifyLaunchCredential,
++  type SignalInstanceBinding,
++  type SignalLaunchCredential,
++} from '../../../app/maoyi/launchGuard.main.ts';
++
++describe('Maoyi launcher startup guard', () => {
++  const dataRoot = path.resolve('D:\\Fixture', 'MAOYI TRANSLATOR Data');
++  const profileId = '00000000-0000-4000-8000-000000000001';
++
++  it('only derives an application-owned root from a Signal instance path', () => {
++    assert.equal(isOwnedDataRoot(dataRoot), true);
++    assert.equal(
++      deriveDataRoot(
++        path.join(dataRoot, 'SignalInstances', `Signal-${profileId}`)
++      ),
++      dataRoot
++    );
++    assert.equal(deriveDataRoot(path.resolve('D:\\Fixture', 'Signal')), '');
++    assert.equal(isOwnedDataRoot(path.parse(dataRoot).root), false);
++  });
++
++  it('removes launcher-only arguments before Signal renderer configuration', () => {
++    const args = [
++      'Signal.exe',
++      '--df',
++      `--appId=Signal-${profileId}`,
++      '--wsPort=12345',
++      '--dfLaunchPipe=\\\\.\\pipe\\maoyi-signal-test',
++      '--windowMode=embed',
++      '--title=Profile One',
++      `--user-data-dir=${path.join(dataRoot, 'SignalInstances')}`,
++    ];
++    scrubMaoyiArguments(args);
++    assert.deepEqual(args, [
++      'Signal.exe',
++      `--user-data-dir=${path.join(dataRoot, 'SignalInstances')}`,
++    ]);
++  });
++
++  it('verifies profile and process-bound signed credentials', () => {
++    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
++    const publicKeyPem = publicKey
++      .export({ type: 'spki', format: 'pem' })
++      .toString();
++    const runtimeBinding = {
++      schemaVersion: 1 as const,
++      productId: 'maoyi',
++      suiteId: '006-test-suite',
++      keyId: '006-test-key',
++      installationId: 'installation-test',
++      dataRootId: 'data-root-test',
++      machineCodeHash: createHash('sha256').update('machine').digest('hex'),
++      hardwareHash: createHash('sha256').update('hardware').digest('hex'),
++      devicePublicKeyPem: publicKeyPem,
++      createdAt: new Date().toISOString(),
++    };
++    const instanceUnsigned = {
++      schemaVersion: 1 as const,
++      productId: 'maoyi',
++      suiteId: runtimeBinding.suiteId,
++      installationId: runtimeBinding.installationId,
++      dataRootId: runtimeBinding.dataRootId,
++      profileId,
++      createdAt: new Date().toISOString(),
++    };
++    const instanceBinding: SignalInstanceBinding = {
++      ...instanceUnsigned,
++      signature: sign(
++        null,
++        Buffer.from(
++          JSON.stringify([
++            'maoyi-signal-instance-v1',
++            instanceUnsigned.schemaVersion,
++            instanceUnsigned.productId,
++            instanceUnsigned.suiteId,
++            instanceUnsigned.installationId,
++            instanceUnsigned.dataRootId,
++            instanceUnsigned.profileId,
++            instanceUnsigned.createdAt,
++          ])
++        ),
++        privateKey
++      ).toString('base64url'),
++    };
++    assert.equal(
++      verifyInstanceBinding(instanceBinding, runtimeBinding, profileId),
++      true
++    );
++    assert.equal(
++      verifyInstanceBinding(instanceBinding, runtimeBinding, `${profileId}0`),
++      false
++    );
++
++    const issuedAt = 1_800_000_000_000;
++    const launchUnsigned = {
++      schemaVersion: 1 as const,
++      productId: 'maoyi',
++      suiteId: runtimeBinding.suiteId,
++      installationId: runtimeBinding.installationId,
++      dataRootId: runtimeBinding.dataRootId,
++      profileId,
++      processId: 4242,
++      issuedAt,
++      expiresAt: issuedAt + 10_000,
++      nonce: Buffer.alloc(32, 1).toString('base64url'),
++      controlKey: Buffer.alloc(32, 2).toString('base64url'),
++    };
++    const credential: SignalLaunchCredential = {
++      ...launchUnsigned,
++      signature: sign(
++        null,
++        Buffer.from(
++          JSON.stringify([
++            'maoyi-signal-launch-v1',
++            launchUnsigned.schemaVersion,
++            launchUnsigned.productId,
++            launchUnsigned.suiteId,
++            launchUnsigned.installationId,
++            launchUnsigned.dataRootId,
++            launchUnsigned.profileId,
++            launchUnsigned.processId,
++            launchUnsigned.issuedAt,
++            launchUnsigned.expiresAt,
++            launchUnsigned.nonce,
++            launchUnsigned.controlKey,
++          ])
++        ),
++        privateKey
++      ).toString('base64url'),
++    };
++    const expectation = {
++      suiteId: runtimeBinding.suiteId,
++      installationId: runtimeBinding.installationId,
++      dataRootId: runtimeBinding.dataRootId,
++      profileId,
++      processId: launchUnsigned.processId,
++    };
++    assert.equal(
++      verifyLaunchCredential(
++        credential,
++        runtimeBinding,
++        expectation,
++        issuedAt + 5_000
++      ),
++      true
++    );
++    assert.equal(
++      verifyLaunchCredential(
++        credential,
++        runtimeBinding,
++        { ...expectation, processId: 4243 },
++        issuedAt + 5_000
++      ),
++      false
++    );
++    assert.equal(
++      verifyLaunchCredential(
++        credential,
++        runtimeBinding,
++        expectation,
++        issuedAt + 10_001
++      ),
++      false
++    );
++  });
++});

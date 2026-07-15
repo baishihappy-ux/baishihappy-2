@@ -28,7 +28,7 @@ async function main() {
       [FuseV1Options.EnableNodeCliInspectArguments, FuseState.DISABLE],
       [FuseV1Options.EnableEmbeddedAsarIntegrityValidation, FuseState.ENABLE],
       [FuseV1Options.OnlyLoadAppFromAsar, FuseState.ENABLE],
-      [FuseV1Options.LoadBrowserProcessSpecificV8Snapshot, FuseState.ENABLE],
+      [FuseV1Options.LoadBrowserProcessSpecificV8Snapshot, FuseState.DISABLE],
       [FuseV1Options.GrantFileProtocolExtraPrivileges, FuseState.DISABLE],
       [FuseV1Options.WasmTrapHandlers, FuseState.ENABLE]
     ]);

@@ -19,7 +19,7 @@ const machineCode = createMachineCode({
   encryptionPublicKeyPem: deviceKeys.publicKey.export({ type: 'spki', format: 'pem' }).toString()
 });
 const username = 'acceptance-user';
-const serviceSecret = 'unit-test-secret';
+const serviceSecret = 'test-service-secret-not-for-production';
 const code = issueLicenseCode({
   suite,
   machineCode,

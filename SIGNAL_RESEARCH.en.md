@@ -11,13 +11,13 @@ It embeds a Signal Desktop runtime and launches a separate `Signal.exe` with a s
 Reference directory:
 
 ```text
-<external-reference-root>\
+D:\DF fanyiqi\look world\look-world-pro-embed\
 ```
 
 Key structure:
 
 ```text
-external-reference-runtime/
+look-world-pro-embed/
   signal/
     Signal.exe
     resources/app.asar
@@ -39,7 +39,7 @@ Typical competitor launch:
 ```text
 Signal.exe
   --proxy=
-  --user-data-dir=<external-reference-root>\Signal-Zh1T4pyBHEc6NK3wDkpR_
+  --user-data-dir=D:\DF fanyiqi\look world\look-world-pro-embed\Signal-Zh1T4pyBHEc6NK3wDkpR_
   --appId=Signal-Zh1T4pyBHEc6NK3wDkpR_
   --wsPort=23510
   --title=Signal01

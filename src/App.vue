@@ -1,25 +1,47 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
-import type {
-  AppConfig,
-  ChatProfile,
-  ClientAuthorizationStatus,
-  LockScreenStatus,
-  MemoryStatus,
-  Platform,
-  PlatformInfo,
-  SensitiveSendKind,
-  SignalWorkspaceBounds,
-  TranslationCacheEntry,
-  WalletNetwork
+import {
+  isTransientSignalScriptGateError,
+  sanitizeProfileTabOrder,
+  signalTranslationAcceptancePolicy,
+  workspaceAppForPlatform,
+  type AppConfig,
+  type ChatProfile,
+  type ClientAuthorizationStatus,
+  type LockScreenSetPinResult,
+  type LockScreenStatus,
+  type LastActiveProfileIds,
+  type MemoryStatus,
+  type Platform,
+  type PlatformInfo,
+  type SensitiveSendKind,
+  type SignalWorkspaceBounds,
+  type TranslationCacheEntry,
+  type WalletNetwork,
+  type WorkspaceApp
 } from '../electron/shared';
 import multiSignalIcon from './assets/multi-signal.png';
 import multiTelegramIcon from './assets/multi-telegram.png';
 import multiWhatsappIcon from './assets/multi-whatsapp.png';
+import bitcoinGlyphIcon from './assets/bitcoin-glyph-cutout.png';
 
 type Panel = 'apps' | 'home' | 'notice' | 'agency' | 'settings' | 'account' | 'session';
 type ThemeName = 'pink' | 'blackGold';
-type RuntimeApp = 'whatsapp' | 'telegram' | 'signal';
+type RuntimeApp = WorkspaceApp;
+type LockSetupIntent = 'setup' | 'reset' | 'upgrade';
+type LockSetupDialogStage = 'confirm' | 'network' | null;
+type LockNetworkCheckResult = {
+  offline: boolean;
+  checkedAt?: number;
+  reason?: string;
+};
+type LockPinChangeAuthorizationResult = {
+  ok: boolean;
+  token?: string;
+  expiresAt?: number;
+  reason?: string;
+  status: LockScreenStatus;
+};
 
 type AppTile = {
   platform: Platform;
@@ -90,18 +112,33 @@ type QueuedTranslationTask = {
 };
 
 const signedIn = ref(false);
+const signalSourceOnlyAcceptance = ref(false);
 const clientAuthorizationStatus = ref<ClientAuthorizationStatus | null>(null);
 const clientAuthorizationLoading = ref(true);
 const clientAuthorizationBusy = ref(false);
 const clientAuthorizationMessage = ref('');
 const clientUsernameDraft = ref('');
 const clientLicenseCodeDraft = ref('');
+const reauthorizationDialogOpen = ref(false);
+const reauthorizationLicenseCodeDraft = ref('');
+const reauthorizationBusy = ref(false);
+const reauthorizationMessage = ref('');
+const reauthorizationSucceeded = ref(false);
+const accountMessage = ref('');
 const activePanel = ref<Panel>('apps');
 const activeTheme = ref<ThemeName>('blackGold');
 const showDeveloperDiagnostics = ref(import.meta.env.DEV);
 const themeMenuOpen = ref(false);
+const workspaceHeaderCollapsed = ref(false);
+const bitcoinGlyphBursting = ref(false);
 const profiles = ref<ChatProfile[]>([]);
 const activeProfileId = ref<string | null>(null);
+const profileTabOrder = ref<string[]>([]);
+const lastActiveProfileIds = ref<LastActiveProfileIds>({
+  whatsapp: null,
+  telegram: null,
+  signal: null
+});
 const configState = ref<AppConfig | null>(null);
 const currentApp = ref<RuntimeApp>('whatsapp');
 const platformCatalog = ref<PlatformInfo[]>([
@@ -122,6 +159,10 @@ const renameProfileGroup = ref('');
 const renameProfileError = ref('');
 const isRenamingProfile = ref(false);
 const draggingProfileId = ref<string | null>(null);
+const tabDropTargetId = ref<string | null>(null);
+const tabDropAfter = ref(false);
+const suppressTabClickProfileId = ref<string | null>(null);
+let workspaceConfigSaveQueue: Promise<void> = Promise.resolve();
 const translatedDrafts = ref<Record<string, string>>({});
 const composerStatus = ref<Record<string, string>>({});
 const composerFeedbackStates = ref<Record<string, ComposerFeedbackState>>({});
@@ -222,26 +263,36 @@ const lockPinConfirmDraft = ref('');
 const lockPinError = ref('');
 const lockKeypadDigits = ref<number[]>([]);
 const lockScreenClock = ref(Date.now());
+const lockGuideVisible = ref(false);
+const lockSetupIntent = ref<LockSetupIntent>('setup');
+const lockSetupDialogStage = ref<LockSetupDialogStage>(null);
+const lockNetworkGateBusy = ref(false);
+const lockNetworkGateReason = ref('');
+const lockNetworkWarningShaking = ref(false);
+const lockPinChangeToken = ref('');
 const refreshingWindow = ref(false);
-const lockScreenIdleMs = 180000;
-const lockScreenPinLength = 6;
-const lockLogoClickThreshold = 3;
-const lockLogoClickWindowMs = 2000;
+const lockScreenIdleMs = 15 * 60 * 1000;
+const lockScreenDigitLength = 6;
+const lockScreenLetterLength = 2;
+const lockScreenCredentialLength = lockScreenDigitLength + lockScreenLetterLength;
 const lockBlankClickWindowMs = 5000;
 const lockBlankShowKeypadThreshold = 3;
 const lockBlankResetThreshold = 8;
 const refreshWindowCooldownMs = 1500;
 const signalWorkspaceBleedPx = 2;
+const bitcoinGlyphWaitSequenceMs = [3000, 10000, 15000] as const;
 let memoryStatusTimer: ReturnType<typeof setInterval> | null = null;
 let lockScreenIdleTimer: ReturnType<typeof setTimeout> | null = null;
 let lockScreenClockTimer: ReturnType<typeof setInterval> | null = null;
-let lockLogoClickCount = 0;
-let lockLogoClickResetTimer: ReturnType<typeof setTimeout> | null = null;
+let lockScreenLastActivityAt = Date.now();
 let lockBlankClickCount = 0;
 let lockBlankClickResetTimer: ReturnType<typeof setTimeout> | null = null;
+let lockNetworkWarningShakeTimer: ReturnType<typeof setTimeout> | null = null;
 let refreshWindowCooldownTimer: ReturnType<typeof setTimeout> | null = null;
 let signalWorkspaceSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let signalWorkspaceResizeObserver: ResizeObserver | null = null;
+let bitcoinGlyphTimer: ReturnType<typeof setTimeout> | null = null;
+let bitcoinGlyphWaitIndex = 0;
 let removeSignalActivateProfileListener: (() => void) | null = null;
 let removeSignalWorkspaceSyncListener: (() => void) | null = null;
 
@@ -269,15 +320,26 @@ function deepSeekUserId(profileId: string) {
 }
 
 const themeClass = computed(() => (activeTheme.value === 'pink' ? 'theme-pink' : 'theme-black-gold'));
-function formatLockPinLine(value: string, active: boolean) {
-  const cells: string[] = Array.from({ length: lockScreenPinLength }, (_, index) => (index < value.length ? '●' : '○'));
+function lockStatusRequiresUpgrade(status: LockScreenStatus | null | undefined) {
+  return Boolean((status as (LockScreenStatus & { requiresUpgrade?: boolean }) | null | undefined)?.requiresUpgrade);
+}
+
+const lockUnlockCredentialLength = computed(() =>
+  lockStatusRequiresUpgrade(lockScreenStatus.value) ? lockScreenDigitLength : lockScreenCredentialLength
+);
+const lockIsSettingPin = computed(() => lockScreenMode.value === 'setup' || lockScreenMode.value === 'reset');
+const lockActiveCredentialLength = computed(() =>
+  lockIsSettingPin.value ? lockScreenCredentialLength : lockUnlockCredentialLength.value
+);
+
+function formatLockPinLine(value: string, active: boolean, length: number) {
+  const cells: string[] = Array.from({ length }, (_, index) => (index < value.length ? '●' : '○'));
   if (!active) return cells.join(' ');
-  const cursorIndex = Math.min(value.length, lockScreenPinLength - 1);
-  cells[cursorIndex] = value.length >= lockScreenPinLength ? '●|' : '|○';
+  const cursorIndex = Math.min(value.length, length - 1);
+  cells[cursorIndex] = value.length >= length ? '●|' : '|○';
   return cells.join(' ');
 }
 
-const lockIsSettingPin = computed(() => lockScreenMode.value === 'setup' || lockScreenMode.value === 'reset');
 const lockResetAvailable = computed(() =>
   lockScreenMode.value === 'unlock' &&
   Boolean(lockScreenStatus.value?.enabled) &&
@@ -285,11 +347,39 @@ const lockResetAvailable = computed(() =>
 );
 const lockShowPinControls = computed(() => lockIsSettingPin.value || lockKeypadVisible.value);
 const lockPinDots = computed(() =>
-  formatLockPinLine(lockPinDraft.value, !lockIsSettingPin.value || lockPinDraft.value.length < lockScreenPinLength)
+  formatLockPinLine(
+    lockPinDraft.value,
+    !lockIsSettingPin.value || lockPinDraft.value.length < lockScreenCredentialLength,
+    lockActiveCredentialLength.value
+  )
 );
 const lockPinConfirmDots = computed(() =>
-  formatLockPinLine(lockPinConfirmDraft.value, lockIsSettingPin.value && lockPinDraft.value.length >= lockScreenPinLength)
+  formatLockPinLine(
+    lockPinConfirmDraft.value,
+    lockIsSettingPin.value && lockPinDraft.value.length >= lockScreenCredentialLength,
+    lockScreenCredentialLength
+  )
 );
+const lockActiveDraft = computed(() =>
+  lockIsSettingPin.value && lockPinDraft.value.length >= lockScreenCredentialLength
+    ? lockPinConfirmDraft.value
+    : lockPinDraft.value
+);
+const lockInputInstruction = computed(() => {
+  const value = lockActiveDraft.value;
+  const isConfirmation = lockIsSettingPin.value && lockPinDraft.value.length >= lockScreenCredentialLength;
+  if (!lockIsSettingPin.value && lockUnlockCredentialLength.value === lockScreenDigitLength) {
+    return `请用随机软键盘输入旧版 ${lockScreenDigitLength} 位数字密码`;
+  }
+  if (value.length < lockScreenDigitLength) {
+    return `${isConfirmation ? '再次' : '请'}用随机软键盘输入 ${lockScreenDigitLength} 位数字`;
+  }
+  if (value.length < lockScreenCredentialLength) {
+    return `请用实体键盘输入 ${lockScreenLetterLength} 位字母（不区分大小写）`;
+  }
+  if (lockIsSettingPin.value && !isConfirmation) return '第一遍已完成，请再次输入完整密码';
+  return lockIsSettingPin.value ? '两次密码输入已完成，请保存' : '密码输入已完成，请解锁';
+});
 const lockRemainingText = computed(() => {
   const lockedUntil = lockScreenStatus.value?.lockedUntil ?? 0;
   const remaining = Math.max(0, lockedUntil - lockScreenClock.value);
@@ -299,16 +389,19 @@ const lockRemainingText = computed(() => {
   return `${minutes}分${String(seconds % 60).padStart(2, '0')}秒`;
 });
 const lockScreenTitle = computed(() => {
-  if (lockScreenMode.value === 'setup') return '设置客户端锁屏 PIN';
-  if (lockScreenMode.value === 'reset') return '重置客户端锁屏 PIN';
+  if (lockScreenMode.value === 'setup') return '设置客户端锁屏密码';
+  if (lockScreenMode.value === 'reset' && lockSetupIntent.value === 'upgrade') return '升级客户端锁屏密码';
+  if (lockScreenMode.value === 'reset') return '重置客户端锁屏密码';
   return '客户端已锁屏';
 });
 const lockScreenHint = computed(() => {
-  if (lockScreenMode.value === 'setup') return '设置 6 位数字 PIN。两次输入一致后启用自动锁屏。';
-  if (lockScreenMode.value === 'reset') return '请重新设置 6 位数字 PIN。重置成功后才会解锁。';
-  if (lockResetAvailable.value) return '请重置 PIN。';
+  if (lockScreenMode.value === 'setup' || lockScreenMode.value === 'reset') {
+    return '请设置 6 位数字 + 2 位字母的锁屏密码，字母不区分大小写。两次输入必须一致。';
+  }
+  if (lockStatusRequiresUpgrade(lockScreenStatus.value)) return '请输入旧版 6 位数字密码，验证后必须断网升级。';
+  if (lockResetAvailable.value) return '请重置锁屏密码。';
   if (!lockKeypadVisible.value) return '客户端已遮住聊天内容。';
-  return '请输入 PIN 解锁。';
+  return '请输入锁屏密码解锁。';
 });
 
 const appTiles: AppTile[] = [
@@ -319,7 +412,15 @@ const appTiles: AppTile[] = [
 
 const activeProfile = computed(() => profiles.value.find((profile) => profile.id === activeProfileId.value) ?? null);
 const activeSignalProfile = computed(() => (activeProfile.value?.platform === 'signal' ? activeProfile.value : null));
-const hasBlockingModal = computed(() => Boolean(lockScreenVisible.value || createDialogOpen.value || closeTargetProfile.value || renameTargetProfile.value));
+const hasBlockingModal = computed(() => Boolean(
+  lockScreenVisible.value ||
+  lockSetupDialogStage.value ||
+  (signedIn.value && activePanel.value === 'session' && lockGuideVisible.value && !lockScreenStatus.value?.enabled) ||
+  createDialogOpen.value ||
+  closeTargetProfile.value ||
+  renameTargetProfile.value ||
+  reauthorizationDialogOpen.value
+));
 const activePlatformInfo = computed(() => {
   if (!activeProfile.value) return null;
   return platformCatalog.value.find((item) => item.platform === activeProfile.value?.platform) ?? null;
@@ -338,17 +439,11 @@ const renderableProfiles = computed(() =>
     : []
 );
 const workspaceTabs = computed<RuntimeTab[]>(() => {
-  const groupOrder = new Map<string, number>();
-  for (const profile of currentAppProfiles.value) {
-    const group = profile.group.trim() || '本组';
-    if (!groupOrder.has(group)) groupOrder.set(group, groupOrder.size);
-  }
+  const order = new Map(profileTabOrder.value.map((id, index) => [id, index]));
   return [...currentAppProfiles.value]
     .sort((left, right) => {
-      const leftGroup = left.group.trim() || '本组';
-      const rightGroup = right.group.trim() || '本组';
-      const groupDifference = (groupOrder.get(leftGroup) ?? 0) - (groupOrder.get(rightGroup) ?? 0);
-      return groupDifference || left.createdAt - right.createdAt || left.id.localeCompare(right.id);
+      const orderDifference = (order.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (order.get(right.id) ?? Number.MAX_SAFE_INTEGER);
+      return orderDifference || left.createdAt - right.createdAt || left.id.localeCompare(right.id);
     })
     .map((profile) => {
     const tile = appTiles.find((item) => item.app === appForPlatform(profile.platform)) ?? appTiles[0];
@@ -466,6 +561,42 @@ function toggleThemeMenu() {
   preserveActiveSignalAfterChromeChange();
 }
 
+function stopBitcoinGlyphSequence() {
+  if (bitcoinGlyphTimer) clearTimeout(bitcoinGlyphTimer);
+  bitcoinGlyphTimer = null;
+  bitcoinGlyphWaitIndex = 0;
+  bitcoinGlyphBursting.value = false;
+}
+
+function scheduleBitcoinGlyphBurst() {
+  if (!workspaceHeaderCollapsed.value || bitcoinGlyphTimer || bitcoinGlyphBursting.value) return;
+  const waitMs = bitcoinGlyphWaitSequenceMs[bitcoinGlyphWaitIndex];
+  bitcoinGlyphWaitIndex = (bitcoinGlyphWaitIndex + 1) % bitcoinGlyphWaitSequenceMs.length;
+  bitcoinGlyphTimer = setTimeout(() => {
+    bitcoinGlyphTimer = null;
+    if (!workspaceHeaderCollapsed.value) return;
+    bitcoinGlyphBursting.value = true;
+  }, waitMs);
+}
+
+function handleBitcoinGlyphAnimationEnd(event: AnimationEvent) {
+  if (event.animationName !== 'runtime-bitcoin-glyph-burst') return;
+  bitcoinGlyphBursting.value = false;
+  scheduleBitcoinGlyphBurst();
+}
+
+function toggleWorkspaceHeader() {
+  workspaceHeaderCollapsed.value = !workspaceHeaderCollapsed.value;
+  themeMenuOpen.value = false;
+  if (workspaceHeaderCollapsed.value) {
+    stopBitcoinGlyphSequence();
+    scheduleBitcoinGlyphBurst();
+  } else {
+    stopBitcoinGlyphSequence();
+  }
+  preserveActiveSignalAfterChromeChange();
+}
+
 function preserveActiveSignalAfterChromeChange() {
   const activeSignal = activeSignalProfile.value;
   if (!signedIn.value || activePanel.value !== 'session' || !activeSignal) return;
@@ -480,14 +611,29 @@ function preserveActiveSignalAfterChromeChange() {
 async function loadRuntimeState() {
   if (!window.chatTranslator) return;
 
-  const [config, catalog] = await Promise.all([window.chatTranslator.getConfig(), window.chatTranslator.getPlatformCatalog()]);
+  const [config, catalog, sourceOnlyAcceptance] = await Promise.all([
+    window.chatTranslator.getConfig(),
+    window.chatTranslator.getPlatformCatalog(),
+    window.chatTranslator.getSignalSourceOnlyAcceptance()
+  ]);
+  signalSourceOnlyAcceptance.value = sourceOnlyAcceptance;
   applyConfig(config);
   platformCatalog.value = catalog;
+}
+
+function isSignalLegacyBubbleTranslationDisabled(profile?: ChatProfile | null) {
+  return Boolean(
+    profile &&
+      !signalTranslationAcceptancePolicy(profile.platform, signalSourceOnlyAcceptance.value)
+        .legacyBubbleEnabled
+  );
 }
 
 function applyConfig(config: AppConfig) {
   configState.value = config;
   profiles.value = config.profiles;
+  profileTabOrder.value = sanitizeProfileTabOrder(config.profiles, config.profileTabOrder);
+  lastActiveProfileIds.value = { ...config.lastActiveProfileIds };
   const restoredActiveId = config.profiles.some((profile) => profile.id === config.activeProfileId)
     ? config.activeProfileId
     : config.profiles[0]?.id ?? null;
@@ -506,6 +652,7 @@ async function login() {
   }
   await loadRuntimeState();
   await initializeLockScreen();
+  lockScreenLastActivityAt = Date.now();
   signedIn.value = true;
   activePanel.value = 'apps';
 }
@@ -580,10 +727,67 @@ async function activateClientLicense() {
   }
 }
 
+async function openReauthorizationDialog() {
+  reauthorizationLicenseCodeDraft.value = '';
+  reauthorizationMessage.value = '';
+  reauthorizationSucceeded.value = false;
+  accountMessage.value = '';
+  try {
+    const status = await window.chatTranslator?.getClientAuthorizationStatus?.();
+    if (status) applyClientAuthorizationStatus(status);
+  } catch {
+    // The current in-memory authorization identity remains available in the dialog.
+  }
+  reauthorizationDialogOpen.value = true;
+}
+
+function closeReauthorizationDialog() {
+  if (reauthorizationBusy.value) return;
+  reauthorizationDialogOpen.value = false;
+  reauthorizationLicenseCodeDraft.value = '';
+  reauthorizationMessage.value = '';
+  reauthorizationSucceeded.value = false;
+}
+
+async function copyReauthorizationMachineInfo() {
+  reauthorizationMessage.value = '';
+  reauthorizationSucceeded.value = false;
+  try {
+    const result = await window.chatTranslator?.copyClientMachineInfo?.();
+    if (!result) throw new Error('复制本机信息 API 不可用');
+    applyClientAuthorizationStatus(result.status);
+    reauthorizationMessage.value = result.ok ? '本机码和用户名已复制' : result.reason || '复制失败';
+  } catch (error) {
+    reauthorizationMessage.value = error instanceof Error ? error.message : '复制失败';
+  }
+}
+
+async function confirmReauthorization() {
+  if (reauthorizationBusy.value || !reauthorizationLicenseCodeDraft.value.trim()) return;
+  reauthorizationBusy.value = true;
+  reauthorizationMessage.value = '';
+  reauthorizationSucceeded.value = false;
+  try {
+    const result = await window.chatTranslator?.replaceClientLicense?.(reauthorizationLicenseCodeDraft.value);
+    if (!result) throw new Error('重新授权 API 不可用');
+    applyClientAuthorizationStatus(result.status);
+    if (!result.ok) {
+      reauthorizationMessage.value = result.reason || '重新授权失败';
+      return;
+    }
+    reauthorizationSucceeded.value = true;
+    reauthorizationMessage.value = '重新授权成功';
+    accountMessage.value = '重新授权成功';
+    reauthorizationLicenseCodeDraft.value = '';
+  } catch (error) {
+    reauthorizationMessage.value = error instanceof Error ? error.message : '重新授权失败';
+  } finally {
+    reauthorizationBusy.value = false;
+  }
+}
+
 function appForPlatform(platform: Platform): RuntimeApp {
-  if (platform === 'whatsapp') return 'whatsapp';
-  if (platform === 'signal') return 'signal';
-  return 'telegram';
+  return workspaceAppForPlatform(platform);
 }
 
 function platformForApp(app: RuntimeApp): Platform {
@@ -592,15 +796,40 @@ function platformForApp(app: RuntimeApp): Platform {
   return 'telegram-k';
 }
 
+function rememberActiveProfile(profileId: string | null) {
+  if (!profileId) return;
+  const profile = profiles.value.find((item) => item.id === profileId);
+  if (!profile) return;
+  lastActiveProfileIds.value = {
+    ...lastActiveProfileIds.value,
+    [appForPlatform(profile.platform)]: profile.id
+  };
+}
+
+function firstOrderedProfileIdForApp(app: RuntimeApp) {
+  const profilesById = new Map(profiles.value.map((profile) => [profile.id, profile]));
+  return profileTabOrder.value.find((id) => {
+    const profile = profilesById.get(id);
+    return profile && appForPlatform(profile.platform) === app;
+  }) ?? profiles.value.find((profile) => appForPlatform(profile.platform) === app)?.id ?? null;
+}
+
 function selectRuntimeApp(app: RuntimeApp) {
   const previousProfileId = activeProfileId.value;
+  rememberActiveProfile(previousProfileId);
   currentApp.value = app;
   activePanel.value = 'session';
-  const nextActiveId = profiles.value.find((profile) => appForPlatform(profile.platform) === app)?.id ?? null;
+  const rememberedProfileId = lastActiveProfileIds.value[app];
+  const nextActiveId = profiles.value.some((profile) => (
+    profile.id === rememberedProfileId && appForPlatform(profile.platform) === app
+  ))
+    ? rememberedProfileId
+    : firstOrderedProfileIdForApp(app);
   if (previousProfileId && previousProfileId !== nextActiveId && sensitiveSendPending.value?.profileId === previousProfileId) {
     void clearSensitiveSendPending(previousProfileId, '多开已切换，敏感信息确认已作废');
   }
   activeProfileId.value = nextActiveId;
+  rememberActiveProfile(nextActiveId);
   if (nextActiveId) {
     void persistActiveProfile(nextActiveId);
       if (app === 'signal') void launchSignalProfile(nextActiveId);
@@ -615,6 +844,7 @@ function selectRuntimeTab(profileId: string) {
     void clearSensitiveSendPending(previousProfileId, '多开已切换，敏感信息确认已作废');
   }
   activeProfileId.value = profileId;
+  rememberActiveProfile(profileId);
   void persistActiveProfile(profileId);
   void refreshUnreadCount(profileId);
   const profile = profiles.value.find((item) => item.id === profileId);
@@ -640,6 +870,7 @@ async function activateSignalProfileFromMain(profileId: string) {
   currentApp.value = 'signal';
   activePanel.value = 'session';
   activeProfileId.value = profileId;
+  rememberActiveProfile(profileId);
   await persistActiveProfile(profileId);
   await launchSignalProfile(profileId);
   await nextTick();
@@ -777,8 +1008,17 @@ async function hideChatSurfacesForLock() {
 
 async function showLockScreen(mode: 'setup' | 'unlock' | 'reset') {
   if (sensitiveSendPending.value) await clearSensitiveSendPending(sensitiveSendPending.value.profileId);
+  lockSetupDialogStage.value = null;
+  lockNetworkGateBusy.value = false;
+  lockNetworkGateReason.value = '';
+  if (mode === 'unlock') lockPinChangeToken.value = '';
   lockScreenMode.value = mode;
   lockScreenVisible.value = true;
+  try {
+    await window.chatTranslator?.engageLockScreen?.();
+  } catch {
+    // Keep the renderer overlay fail-closed even if a child process had to be terminated.
+  }
   lockKeypadVisible.value = mode !== 'unlock';
   lockPinError.value = '';
   clearLockPinDrafts();
@@ -790,39 +1030,180 @@ async function showLockScreen(mode: 'setup' | 'unlock' | 'reset') {
 function resetLockScreenIdleTimer() {
   if (lockScreenIdleTimer) clearTimeout(lockScreenIdleTimer);
   if (!signedIn.value || !lockScreenStatus.value?.enabled || lockScreenVisible.value) return;
-  lockScreenIdleTimer = setTimeout(() => {
+  const remaining = Math.max(0, lockScreenIdleMs - (Date.now() - lockScreenLastActivityAt));
+  if (!remaining) {
     void showLockScreen('unlock');
-  }, lockScreenIdleMs);
+    return;
+  }
+  lockScreenIdleTimer = setTimeout(() => {
+    checkLockScreenIdleDeadline();
+  }, remaining);
 }
 
 function handleLockActivity() {
+  if (!lockScreenVisible.value) lockScreenLastActivityAt = Date.now();
   resetLockScreenIdleTimer();
+}
+
+function checkLockScreenIdleDeadline() {
+  if (!signedIn.value || !lockScreenStatus.value?.enabled || lockScreenVisible.value) return;
+  if (Date.now() - lockScreenLastActivityAt >= lockScreenIdleMs) {
+    void showLockScreen('unlock');
+    return;
+  }
+  resetLockScreenIdleTimer();
+}
+
+function handleLockVisibilityChange() {
+  if (document.visibilityState === 'visible') checkLockScreenIdleDeadline();
 }
 
 async function initializeLockScreen() {
   const status = await window.chatTranslator?.getLockScreenStatus?.();
   if (!status) return;
   lockScreenStatus.value = status;
+  lockGuideVisible.value = !status.enabled;
   if (status.enabled) {
     resetLockScreenIdleTimer();
   }
 }
 
-function handleRuntimeLogoClick() {
-  if (lockLogoClickResetTimer) clearTimeout(lockLogoClickResetTimer);
-  lockLogoClickCount += 1;
-  lockLogoClickResetTimer = setTimeout(() => {
-    lockLogoClickCount = 0;
-    lockLogoClickResetTimer = null;
-  }, lockLogoClickWindowMs);
-  if (lockLogoClickCount >= lockLogoClickThreshold) {
-    lockLogoClickCount = 0;
-    if (lockLogoClickResetTimer) {
-      clearTimeout(lockLogoClickResetTimer);
-      lockLogoClickResetTimer = null;
-    }
-    void showLockScreen('setup');
+function dismissLockGuide() {
+  lockGuideVisible.value = false;
+  scheduleSignalWorkspaceSyncBurst();
+}
+
+function triggerLockNetworkWarningShake() {
+  lockNetworkWarningShaking.value = false;
+  if (lockNetworkWarningShakeTimer) clearTimeout(lockNetworkWarningShakeTimer);
+  void nextTick(() => {
+    lockNetworkWarningShaking.value = true;
+    lockNetworkWarningShakeTimer = setTimeout(() => {
+      lockNetworkWarningShaking.value = false;
+      lockNetworkWarningShakeTimer = null;
+    }, 560);
+  });
+}
+
+async function checkLockSetupNetwork(): Promise<LockNetworkCheckResult> {
+  const translator = window.chatTranslator as (typeof window.chatTranslator & {
+    checkNetworkOffline?: () => Promise<LockNetworkCheckResult>;
+  }) | undefined;
+  if (!translator?.checkNetworkOffline) {
+    return { offline: false, reason: '当前无法确认网络已断开，请稍后重试。' };
   }
+  try {
+    return await translator.checkNetworkOffline();
+  } catch (error) {
+    return {
+      offline: false,
+      reason: error instanceof Error ? error.message : '网络状态检测失败，请稍后重试。'
+    };
+  }
+}
+
+function closeLockSetupDialog() {
+  if (lockNetworkGateBusy.value) return;
+  lockSetupDialogStage.value = null;
+  lockNetworkGateReason.value = '';
+  lockNetworkWarningShaking.value = false;
+  lockPinChangeToken.value = '';
+  scheduleSignalWorkspaceSyncBurst();
+}
+
+function openLockSetupConfirmation() {
+  dismissLockGuide();
+  lockSetupIntent.value = 'setup';
+  lockSetupDialogStage.value = 'confirm';
+  lockNetworkGateReason.value = '';
+  void hideChatSurfacesForLock();
+}
+
+async function enterLockCredentialSetup(intent: LockSetupIntent) {
+  lockSetupIntent.value = intent;
+  await showLockScreen(intent === 'setup' ? 'setup' : 'reset');
+}
+
+async function authorizeLockPinChange(intent: LockSetupIntent): Promise<LockPinChangeAuthorizationResult> {
+  const translator = window.chatTranslator as unknown as {
+    authorizeLockScreenPinChange?: (mode: LockSetupIntent) => Promise<LockPinChangeAuthorizationResult>;
+  } | undefined;
+  if (!translator?.authorizeLockScreenPinChange) {
+    return {
+      ok: false,
+      reason: '锁屏密码设置授权不可用，请稍后重试。',
+      status: lockScreenStatus.value ?? ({
+        enabled: false,
+        lockedUntil: 0,
+        failedAttempts: 0,
+        maxAttempts: 3,
+        requiresUpgrade: false
+      } as LockScreenStatus)
+    };
+  }
+  try {
+    return await translator.authorizeLockScreenPinChange(intent);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : '锁屏密码设置授权失败，请稍后重试。',
+      status: lockScreenStatus.value ?? ({
+        enabled: false,
+        lockedUntil: 0,
+        failedAttempts: 0,
+        maxAttempts: 3,
+        requiresUpgrade: false
+      } as LockScreenStatus)
+    };
+  }
+}
+
+async function runLockNetworkGate(intent: LockSetupIntent, shakeWhenBlocked = false) {
+  if (lockNetworkGateBusy.value) return;
+  lockSetupIntent.value = intent;
+  lockNetworkGateBusy.value = true;
+  lockNetworkGateReason.value = '';
+  const result = await checkLockSetupNetwork();
+  if (result.offline) {
+    const authorization = await authorizeLockPinChange(intent);
+    lockNetworkGateBusy.value = false;
+    lockScreenStatus.value = authorization.status;
+    if (!authorization.ok || !authorization.token) {
+      lockSetupDialogStage.value = 'network';
+      lockNetworkGateReason.value = authorization.reason || '锁屏密码设置授权失败，请重试。';
+      if (shakeWhenBlocked) triggerLockNetworkWarningShake();
+      return;
+    }
+    lockPinChangeToken.value = authorization.token;
+    await enterLockCredentialSetup(intent);
+    return;
+  }
+  lockNetworkGateBusy.value = false;
+  lockSetupDialogStage.value = 'network';
+  lockNetworkGateReason.value = result.reason || '';
+  if (shakeWhenBlocked) triggerLockNetworkWarningShake();
+}
+
+function handleLockButtonClick() {
+  dismissLockGuide();
+  if (lockScreenStatus.value?.enabled) {
+    void showLockScreen('unlock');
+    return;
+  }
+  openLockSetupConfirmation();
+}
+
+function confirmLockSetupStart() {
+  void runLockNetworkGate('setup');
+}
+
+function continueLockNetworkGate() {
+  void runLockNetworkGate(lockSetupIntent.value, true);
+}
+
+function beginLockResetFlow(intent: 'reset' | 'upgrade' = 'reset') {
+  lockSetupIntent.value = intent;
+  void runLockNetworkGate(intent);
 }
 
 function handleLockBlankPointerDown() {
@@ -835,7 +1216,8 @@ function handleLockBlankPointerDown() {
 
   if (lockResetAvailable.value) {
     if (lockBlankClickCount >= lockBlankResetThreshold) {
-      void showLockScreen('reset');
+      resetLockBlankClickCounter();
+      beginLockResetFlow('reset');
     }
     return;
   }
@@ -850,12 +1232,12 @@ function handleLockBlankPointerDown() {
 }
 
 function lockKeypadPress(digit: number) {
-  if (lockIsSettingPin.value && lockPinDraft.value.length >= lockScreenPinLength) {
-    appendLockPinConfirmDigit(digit);
-    return;
-  }
-  if (lockPinDraft.value.length >= lockScreenPinLength) return;
-  lockPinDraft.value += String(digit);
+  const enteringConfirmation = lockIsSettingPin.value && lockPinDraft.value.length >= lockScreenCredentialLength;
+  const value = enteringConfirmation ? lockPinConfirmDraft.value : lockPinDraft.value;
+  const expectedLength = enteringConfirmation ? lockScreenCredentialLength : lockActiveCredentialLength.value;
+  if (value.length >= expectedLength || value.length >= lockScreenDigitLength) return;
+  if (enteringConfirmation) lockPinConfirmDraft.value += String(digit);
+  else lockPinDraft.value += String(digit);
   lockPinError.value = '';
 }
 
@@ -876,34 +1258,49 @@ function resetLockKeypadInput() {
 }
 
 async function confirmLockPinSetup() {
-  if (lockPinDraft.value.length !== lockScreenPinLength || lockPinConfirmDraft.value.length !== lockScreenPinLength) {
-    lockPinError.value = '请输入并确认 6 位数字 PIN';
+  if (lockPinDraft.value.length !== lockScreenCredentialLength || lockPinConfirmDraft.value.length !== lockScreenCredentialLength) {
+    lockPinError.value = '请分别输入并确认 6 位数字 + 2 位字母的锁屏密码';
     return;
   }
   if (lockPinDraft.value !== lockPinConfirmDraft.value) {
-    lockPinError.value = '两次 PIN 不一致';
+    lockPinError.value = '两次锁屏密码不一致';
     clearLockPinDrafts();
     shuffleLockKeypad();
     return;
   }
-  const result = await window.chatTranslator?.setLockScreenPin?.(lockPinDraft.value);
+  if (!lockPinChangeToken.value) {
+    lockPinError.value = '锁屏密码设置授权已失效，请重新完成断网检测';
+    return;
+  }
+  const translator = window.chatTranslator as unknown as {
+    setLockScreenPin?: (pin: string, token: string) => Promise<LockScreenSetPinResult>;
+  } | undefined;
+  const token = lockPinChangeToken.value;
+  lockPinChangeToken.value = '';
+  const result = await translator?.setLockScreenPin?.(lockPinDraft.value, token);
   if (!result?.ok) {
-    lockPinError.value = result?.reason || '设置锁屏 PIN 失败';
+    lockPinError.value = result?.reason || '设置锁屏密码失败';
     clearLockPinDrafts();
     shuffleLockKeypad();
+    void runLockNetworkGate(lockSetupIntent.value);
     return;
   }
   lockScreenStatus.value = result.status;
+  lockGuideVisible.value = false;
   lockScreenVisible.value = false;
   lockKeypadVisible.value = false;
   clearLockPinDrafts();
+  lockScreenLastActivityAt = Date.now();
   resetLockScreenIdleTimer();
   scheduleSignalWorkspaceSyncBurst();
 }
 
 async function confirmLockPinUnlock() {
-  if (lockPinDraft.value.length !== lockScreenPinLength) {
-    lockPinError.value = '请输入 6 位数字 PIN';
+  const expectedLength = lockUnlockCredentialLength.value;
+  if (lockPinDraft.value.length !== expectedLength) {
+    lockPinError.value = expectedLength === lockScreenDigitLength
+      ? '请输入旧版 6 位数字密码'
+      : '请输入 6 位数字 + 2 位字母的锁屏密码';
     return;
   }
   const result = await window.chatTranslator?.unlockLockScreen?.(lockPinDraft.value);
@@ -911,7 +1308,7 @@ async function confirmLockPinUnlock() {
     lockScreenStatus.value = result?.status ?? lockScreenStatus.value;
     lockPinError.value = result?.reason || '解锁失败';
     if ((result?.status.failedAttempts ?? 0) >= (result?.status.maxAttempts ?? 3)) {
-      lockPinError.value = '请重置 PIN';
+      lockPinError.value = '请重置锁屏密码';
       lockKeypadVisible.value = false;
     }
     clearLockPinDrafts();
@@ -919,17 +1316,49 @@ async function confirmLockPinUnlock() {
     return;
   }
   lockScreenStatus.value = result.status;
+  if (lockStatusRequiresUpgrade(result.status)) {
+    clearLockPinDrafts();
+    lockKeypadVisible.value = false;
+    lockPinError.value = '旧版密码已验证，请断网升级为 6 位数字 + 2 位字母密码';
+    beginLockResetFlow('upgrade');
+    return;
+  }
   lockScreenVisible.value = false;
   lockKeypadVisible.value = false;
   clearLockPinDrafts();
+  lockScreenLastActivityAt = Date.now();
   resetLockScreenIdleTimer();
   scheduleSignalWorkspaceSyncBurst();
 }
 
-function appendLockPinConfirmDigit(digit: number) {
-  if (lockPinConfirmDraft.value.length >= lockScreenPinLength) return;
-  lockPinConfirmDraft.value += String(digit);
+function appendLockLetter(letter: string) {
+  const normalized = letter.toUpperCase();
+  if (!/^[A-Z]$/.test(normalized)) return;
+  const enteringConfirmation = lockIsSettingPin.value && lockPinDraft.value.length >= lockScreenCredentialLength;
+  const value = enteringConfirmation ? lockPinConfirmDraft.value : lockPinDraft.value;
+  const expectedLength = enteringConfirmation ? lockScreenCredentialLength : lockActiveCredentialLength.value;
+  if (expectedLength <= lockScreenDigitLength || value.length < lockScreenDigitLength || value.length >= expectedLength) return;
+  if (enteringConfirmation) lockPinConfirmDraft.value += normalized;
+  else lockPinDraft.value += normalized;
   lockPinError.value = '';
+}
+
+function handleLockScreenKeydown(event: KeyboardEvent) {
+  if (!lockShowPinControls.value) return;
+  if (event.key === 'Backspace') {
+    lockKeypadBackspace();
+    return;
+  }
+  if (event.key === 'Delete') {
+    resetLockKeypadInput();
+    return;
+  }
+  if (event.key === 'Enter') {
+    if (lockIsSettingPin.value) void confirmLockPinSetup();
+    else void confirmLockPinUnlock();
+    return;
+  }
+  if (/^[a-z]$/i.test(event.key)) appendLockLetter(event.key);
 }
 
 function nextProfileName(app: RuntimeApp) {
@@ -1063,52 +1492,105 @@ async function confirmCloseProfile() {
   clearTranslationRuntimeCache(targetId);
   applyConfig(config);
   currentApp.value = selectedApp;
+  const rememberedProfileId = lastActiveProfileIds.value[selectedApp];
   if (!activeProfileId.value || appForPlatform(activeProfile.value?.platform ?? 'whatsapp') !== selectedApp) {
-    activeProfileId.value = currentAppProfiles.value[0]?.id ?? null;
+    activeProfileId.value = profiles.value.some((profile) => (
+      profile.id === rememberedProfileId && appForPlatform(profile.platform) === selectedApp
+    ))
+      ? rememberedProfileId
+      : firstOrderedProfileIdForApp(selectedApp);
   }
+  rememberActiveProfile(activeProfileId.value);
+  if (activeProfileId.value) void persistActiveProfile(activeProfileId.value);
 }
 
-async function persistProfileOrder(nextProfiles: ChatProfile[]) {
-  profiles.value = nextProfiles;
-  if (!window.chatTranslator || !configState.value) return;
-  const saved = await window.chatTranslator.saveConfig({
-    ...configState.value,
-    profiles: nextProfiles,
-    activeProfileId: activeProfileId.value
-  });
-  configState.value = saved;
+async function persistWorkspaceConfig() {
+  workspaceConfigSaveQueue = workspaceConfigSaveQueue
+    .catch(() => undefined)
+    .then(async () => {
+      if (!window.chatTranslator || !configState.value) return;
+      const saved = await window.chatTranslator.saveConfig({
+        ...configState.value,
+        profiles: profiles.value,
+        activeProfileId: activeProfileId.value,
+        profileTabOrder: profileTabOrder.value,
+        lastActiveProfileIds: lastActiveProfileIds.value
+      });
+      configState.value = saved;
+    });
+  await workspaceConfigSaveQueue;
+}
+
+async function persistProfileTabOrder(nextOrder: string[]) {
+  profileTabOrder.value = sanitizeProfileTabOrder(profiles.value, nextOrder);
+  await persistWorkspaceConfig();
 }
 
 async function persistActiveProfile(profileId: string) {
-  if (!window.chatTranslator || !configState.value) return;
-  const saved = await window.chatTranslator.saveConfig({
-    ...configState.value,
-    profiles: profiles.value,
-    activeProfileId: profileId
-  });
-  configState.value = saved;
+  rememberActiveProfile(profileId);
+  await persistWorkspaceConfig();
 }
 
-function handleTabDragStart(profileId: string) {
+function handleRuntimeTabClick(profileId: string) {
+  if (suppressTabClickProfileId.value === profileId) return;
+  selectRuntimeTab(profileId);
+}
+
+function handleTabDragStart(event: DragEvent, profileId: string) {
   draggingProfileId.value = profileId;
+  tabDropTargetId.value = null;
+  event.dataTransfer?.setData('text/plain', profileId);
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
 }
 
-function handleTabDrop(targetId: string) {
-  const sourceId = draggingProfileId.value;
+function handleTabDragOver(event: DragEvent, targetId: string) {
+  if (!draggingProfileId.value || draggingProfileId.value === targetId) {
+    tabDropTargetId.value = null;
+    return;
+  }
+  const target = event.currentTarget as HTMLElement | null;
+  const rect = target?.getBoundingClientRect();
+  tabDropTargetId.value = targetId;
+  tabDropAfter.value = Boolean(rect && event.clientX >= rect.left + rect.width / 2);
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+}
+
+function handleTabDragEnd() {
   draggingProfileId.value = null;
+  tabDropTargetId.value = null;
+  tabDropAfter.value = false;
+}
+
+function handleTabDrop(event: DragEvent, targetId: string) {
+  event.preventDefault();
+  const sourceId = draggingProfileId.value;
+  const insertAfterTarget = tabDropTargetId.value === targetId && tabDropAfter.value;
+  draggingProfileId.value = null;
+  tabDropTargetId.value = null;
+  tabDropAfter.value = false;
   if (!sourceId || sourceId === targetId) return;
 
-  const appProfileIds = currentAppProfiles.value.map((profile) => profile.id);
+  const appProfileIds = workspaceTabs.value.map((profile) => profile.id);
+  if (!appProfileIds.includes(sourceId) || !appProfileIds.includes(targetId)) return;
   const orderedAppIds = appProfileIds.filter((id) => id !== sourceId);
   const targetIndex = orderedAppIds.indexOf(targetId);
-  orderedAppIds.splice(targetIndex < 0 ? orderedAppIds.length : targetIndex, 0, sourceId);
+  const insertionIndex = targetIndex < 0
+    ? orderedAppIds.length
+    : targetIndex + (insertAfterTarget ? 1 : 0);
+  orderedAppIds.splice(insertionIndex, 0, sourceId);
 
-  const appQueue = orderedAppIds.map((id) => profiles.value.find((profile) => profile.id === id)).filter(Boolean) as ChatProfile[];
-  const nextProfiles = profiles.value.map((profile) => {
-    if (appForPlatform(profile.platform) !== currentApp.value) return profile;
-    return appQueue.shift() ?? profile;
+  const profilesById = new Map(profiles.value.map((profile) => [profile.id, profile]));
+  const appQueue = [...orderedAppIds];
+  const nextOrder = profileTabOrder.value.map((id) => {
+    const profile = profilesById.get(id);
+    if (!profile || appForPlatform(profile.platform) !== currentApp.value) return id;
+    return appQueue.shift() ?? id;
   });
-  void persistProfileOrder(nextProfiles);
+  suppressTabClickProfileId.value = sourceId;
+  window.setTimeout(() => {
+    if (suppressTabClickProfileId.value === sourceId) suppressTabClickProfileId.value = null;
+  }, 0);
+  void persistProfileTabOrder(nextOrder);
 }
 
 function reloadActiveWebview() {
@@ -1607,6 +2089,7 @@ function enqueueComposerTranslation(profile: ChatProfile, sourceText: string, co
 }
 
 function enqueueMessageTranslationTask(profile: ChatProfile, candidate: MessageCandidate, reason: TranslationQueueReason) {
+  if (isSignalLegacyBubbleTranslationDisabled(profile)) return false;
   const sourceText = normalizeCacheText(candidate.text || '');
   if (!sourceText || !window.chatTranslator) return false;
 
@@ -2038,6 +2521,32 @@ async function handleInjectedComposerEvent(profileId: string, action: string, te
     return;
   }
 
+  if (action === 'bubble-refresh') {
+    if (profile.platform === 'signal' || !text || text.length > 6000) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const key = typeof payload.key === 'string' ? payload.key.trim() : '';
+    const sourceText = typeof payload.text === 'string' ? normalizeCacheText(payload.text) : '';
+    if (!/^[A-Za-z0-9._:-]{1,256}$/.test(key)) return;
+    if (!sourceText || sourceText.length > 4000 || !/[A-Za-z]{2,}/.test(sourceText) || hasChineseText(sourceText)) return;
+    const direction = payload.direction === 'incoming' || payload.direction === 'outgoing'
+      ? payload.direction
+      : 'unknown';
+    const messagePart = payload.messagePart === 'quote' ? 'quote' : 'body';
+    const enqueued = enqueueMessageTranslationTask(profile, {
+      key,
+      text: sourceText,
+      direction,
+      messagePart
+    }, 'manual-refresh');
+    if (enqueued) setComposerStatus(profileId, '已排队 1 条刷新翻译');
+    return;
+  }
+
   if (action === 'conversation-change') {
     const signature = normalizeCacheText(text || '');
     const previousSignature = composerConversationSignatures.get(profileId) || '';
@@ -2204,8 +2713,13 @@ async function verifySentMessageIntegrity(profile: ChatProfile, expectedText: st
     if (canonicalIntegrityText(newOutgoing.text) === expected) return;
 
     await hideChatSurfacesForLock();
-    await showLockScreen(lockScreenStatus.value?.enabled ? 'unlock' : 'setup');
-    lockPinError.value = '发送内容完整性校验失败，聊天界面已锁定';
+    if (lockScreenStatus.value?.enabled) {
+      await showLockScreen('unlock');
+      lockPinError.value = '发送内容完整性校验失败，聊天界面已锁定';
+    } else {
+      openLockSetupConfirmation();
+      lockNetworkGateReason.value = '发送内容完整性校验失败，请立即设置锁屏密码。';
+    }
     return;
   }
 }
@@ -5126,7 +5640,7 @@ function hasChineseText(text: string) {
 }
 
 function hasTranslationPromptLeak(text: string) {
-  return /translate the following chat message|return only the translated message|keep emoji,\s*urls|请将以下英文聊天信息翻译成中文|保留表情符号|仅返回翻译后的信息|无需解释/i.test(text);
+  return /translate the following chat message|return only the translated message|keep\s+emojis?,?\s*urls|请将以下英文聊天信息翻译成中文|(?:保留|保持)\s*表情符号|你是一名(?:中译英|英译中)聊天翻译助手|只输出(?:英文|中文)译文|普通英文单词和短语必须翻译|保持原有换行和空行结构|敏感信息占位符必须原样保留|仅返回翻译后的信息|无需解释/i.test(text);
 }
 
 function isUsefulMessageTranslation(sourceText: string, translatedText: string) {
@@ -5553,6 +6067,7 @@ function setCachedTranslation(profile: ChatProfile, candidate: MessageCandidate,
 }
 
 async function installCachedTranslationRuntime(profile: ChatProfile, entries: TranslationCacheEntry[]) {
+  if (isSignalLegacyBubbleTranslationDisabled(profile)) return;
   const compactEntries = entries
     .filter((entry) => entry.sourceHash && isUsefulMessageTranslation(entry.sourceText || '', entry.translatedText))
     .map((entry) => ({ sourceHash: entry.sourceHash, sourceText: entry.sourceText, translatedText: entry.translatedText, updatedAt: entry.updatedAt }));
@@ -5627,6 +6142,7 @@ async function warmConversationRenderCache(
 async function refreshProfileCachedTranslations(profileId: string) {
   const profile = profiles.value.find((item) => item.id === profileId);
   if (!profile) return;
+  if (isSignalLegacyBubbleTranslationDisabled(profile)) return;
   await preloadTranslationCache(profileId);
   const loadedEntries = loadedTranslationCacheEntriesForProfile(profileId);
   if (loadedEntries.length) {
@@ -5647,6 +6163,9 @@ async function refreshProfileCachedTranslations(profileId: string) {
 function scheduleProfileTranslationRefresh(profileId: string, delayMs = 80) {
   const existingTimer = profileTranslationRefreshTimers.get(profileId);
   if (existingTimer) clearTimeout(existingTimer);
+  profileTranslationRefreshTimers.delete(profileId);
+  const profile = profiles.value.find((item) => item.id === profileId);
+  if (isSignalLegacyBubbleTranslationDisabled(profile)) return;
   clearTranslatedMessageMarks(profileId);
   const timer = window.setTimeout(() => {
     profileTranslationRefreshTimers.delete(profileId);
@@ -5746,21 +6265,32 @@ function startSignalTranslationRuntime(profileId: string) {
   if (!profile) return;
   if (signalTranslationRuntimeStarted.has(profileId)) return;
   signalTranslationRuntimeStarted.add(profileId);
+  const legacyBubbleDisabled = isSignalLegacyBubbleTranslationDisabled(profile);
   void executeProfileScript(profileId, buildLegacyTranslationCacheCleanupScript('signal')).catch(() => undefined);
-  void preloadTranslationCache(profileId).then(() => {
-    if (activeProfileId.value === profileId && signedIn.value && activePanel.value === 'session') {
-      scheduleProfileTranslationRefresh(profileId, 0);
-    }
-  });
-  setSignalDiagnosticStatus(profileId, 'Signal 翻译探针启动中');
+  if (legacyBubbleDisabled) {
+    void executeProfileScript(profileId, buildSignalLegacyBubbleRuntimeRetirementScript()).catch(() => undefined);
+  }
+  if (!legacyBubbleDisabled) {
+    void preloadTranslationCache(profileId).then(() => {
+      if (activeProfileId.value === profileId && signedIn.value && activePanel.value === 'session') {
+        scheduleProfileTranslationRefresh(profileId, 0);
+      }
+    });
+  }
+  setSignalDiagnosticStatus(
+    profileId,
+    legacyBubbleDisabled ? 'Signal 源码气泡翻译已启用' : 'Signal 翻译探针启动中'
+  );
   startComposerInstallLoop(profileId);
-  startTranslationBridge(profileId);
+  if (!legacyBubbleDisabled) startTranslationBridge(profileId);
   [800, 2000, 4000, 7000].forEach((delay, index) => {
     window.setTimeout(() => {
       const currentProfile = profiles.value.find((item) => item.id === profileId && item.platform === 'signal');
       if (!currentProfile) return;
       void probeSignalRuntime(profileId, index + 1);
-      void scanAndTranslateMessages(profileId);
+      if (!isSignalLegacyBubbleTranslationDisabled(currentProfile)) {
+        void scanAndTranslateMessages(profileId);
+      }
     }, delay);
   });
 }
@@ -5806,7 +6336,12 @@ async function probeSignalRuntime(profileId: string, round = 0) {
       active: activeMeta,
       selection: selectionMeta
     });
+    setSignalDiagnosticStatus(profileId, `Signal 探针第 ${round || '?'} 轮正常`);
   } catch (error) {
+    if (isTransientSignalScriptGateError(error)) {
+      setSignalDiagnosticStatus(profileId, `Signal 探针第 ${round || '?'} 轮：等待运行时就绪`);
+      return;
+    }
     setSignalDiagnosticStatus(profileId, `Signal 探针第 ${round || '?'} 轮失败：${error instanceof Error ? error.message : String(error)}`);
   }
 }
@@ -5822,6 +6357,7 @@ function handleWebviewIpcMessage(event: Event, profile: ChatProfile) {
 function startTranslationBridge(profileId: string) {
   if (translationIntervals.has(profileId)) return;
   const profile = profiles.value.find((item) => item.id === profileId);
+  if (isSignalLegacyBubbleTranslationDisabled(profile)) return;
   const intervalMs = profile?.platform === 'signal' ? 7000 : 3500;
   const interval = setInterval(() => {
     void scanAndTranslateMessages(profileId);
@@ -5833,6 +6369,7 @@ async function scanAndTranslateMessages(profileId: string) {
   if (!window.chatTranslator) return;
   const profile = profiles.value.find((item) => item.id === profileId);
   if (!profile) return;
+  if (isSignalLegacyBubbleTranslationDisabled(profile)) return;
 
   const runtime = getRuntimeScriptExecutor(profile);
   if (!runtime) return;
@@ -5845,8 +6382,12 @@ async function scanAndTranslateMessages(profileId: string) {
       viewportScreensBelow: 1
     }))) ?? [];
   } catch (error) {
+    if (isTransientSignalScriptGateError(error)) return;
     setComposerStatus(profileId, `消息扫描失败：${error instanceof Error ? error.message : String(error)}`);
     return;
+  }
+  if ((composerStatus.value[profileId] || '').startsWith('消息扫描失败：')) {
+    setComposerStatus(profileId, '');
   }
   await registerNonEnglishContactMarkers(profile, candidates);
   candidates = candidates.filter((candidate) => !candidate.nonEnglishContactMarker);
@@ -5917,6 +6458,9 @@ async function scanAndTranslateMessages(profileId: string) {
 function scheduleHistoryRenderPrefetch(profileId: string, delayMs = 120) {
   const existingTimer = historyRenderPrefetchTimers.get(profileId);
   if (existingTimer) clearTimeout(existingTimer);
+  historyRenderPrefetchTimers.delete(profileId);
+  const profile = profiles.value.find((item) => item.id === profileId);
+  if (isSignalLegacyBubbleTranslationDisabled(profile)) return;
   const timer = window.setTimeout(() => {
     historyRenderPrefetchTimers.delete(profileId);
     void preRenderHistoryCachedTranslations(profileId);
@@ -5928,6 +6472,7 @@ async function preRenderHistoryCachedTranslations(profileId: string) {
   if (!window.chatTranslator || historyRenderPrefetchInFlight.has(profileId)) return;
   const profile = profiles.value.find((item) => item.id === profileId);
   if (!profile) return;
+  if (isSignalLegacyBubbleTranslationDisabled(profile)) return;
   const runtime = getRuntimeScriptExecutor(profile);
   if (!runtime) return;
 
@@ -6362,92 +6907,26 @@ function buildMessageScanScript(
     const match = text.match(/(?:[01]?\\d|2[0-3]):[0-5]\\d\\s*(?:AM|PM|am|pm)?/);
     return match ? match[0] : '';
   };
-  const ensureRefreshButton = (bubble, textNode, key, text, messagePart) => {
-    const telegramBubbleContent = platformApp === 'telegram'
-      ? (textNode.closest('.bubble-content') || (bubble.matches?.('.bubble-content') ? bubble : bubble.querySelector('.bubble-content')))
-      : null;
-    const mount = platformApp === 'telegram'
-      ? (telegramBubbleContent || bubble)
-      : bubble;
-    if (platformApp === 'telegram') {
-      const cleanupScope = textNode.closest('[role="row"]') || bubble;
-      for (const oldButton of Array.from(cleanupScope.querySelectorAll('.df-chat-refresh-translation'))) {
-        if (!mount.contains(oldButton)) oldButton.remove();
-      }
-    }
-    if (mount.querySelector('.df-chat-refresh-translation')) return;
-    if (window.getComputedStyle(mount).position === 'static') mount.style.position = 'relative';
+  const ensureRefreshButton = (bubble) => {
     if (platformApp === 'signal') {
-      mount.style.minWidth = '88px';
-      mount.style.boxSizing = 'border-box';
+      for (const injectedButton of Array.from(bubble.querySelectorAll('.df-chat-refresh-translation'))) {
+        injectedButton.remove();
+      }
+      return;
     }
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'df-chat-refresh-translation';
-    button.dataset.dfRefreshKey = key;
-    button.dataset.dfMessagePart = 'bubble';
-    button.title = '重新翻译本条气泡';
-    button.innerHTML = '&#8635;';
-    button.style.cssText = [
-      'position:absolute',
-      'right:' + (platformApp === 'signal' ? '6px' : '3px'),
-      'bottom:3px',
-      'z-index:20',
-      'width:20px',
-      'height:20px',
-      'border-radius:50%',
-      'border:1px solid rgba(214,174,58,0.42)',
-      'background:rgba(255,244,179,0.74)',
-      'color:#8a6500',
-      'font-size:13px',
-      'line-height:18px',
-      'padding:0',
-      'cursor:pointer',
-      'pointer-events:auto',
-      'box-shadow:none',
-      'appearance:none'
-    ].join(';');
-    button.addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      const meta = readContactMeta();
-      window.__dfMessageTranslateQueue = Array.isArray(window.__dfMessageTranslateQueue) ? window.__dfMessageTranslateQueue : [];
-      const queuedKeys = new Set();
-      const keyedTextNodes = Array.from(bubble.querySelectorAll('[data-df-msg-text-key]'));
-      const candidates = keyedTextNodes.length ? keyedTextNodes : [textNode];
-      for (const node of candidates) {
-        const candidateKey = node.dataset.dfMsgTextKey || key;
-        if (!candidateKey || queuedKeys.has(candidateKey)) continue;
-        const candidateText = cleanMessageText(textWithoutTranslatorUi(node));
-        if (!candidateText || !hasLatin(candidateText) || hasChinese(candidateText)) continue;
-        queuedKeys.add(candidateKey);
-        window.__dfMessageTranslateQueue.push({
-          key: candidateKey,
-          text: candidateText,
-          ...meta,
-          direction: readDirection(bubble),
-          timestamp: readTimestamp(bubble),
-          messagePart: findQuoteBlock(node) ? 'quote' : 'body',
-          at: Date.now()
-        });
-      }
-      if (!queuedKeys.size) {
-        window.__dfMessageTranslateQueue.push({
-          key,
-          text,
-          ...meta,
-          direction: readDirection(bubble),
-          timestamp: readTimestamp(bubble),
-          messagePart,
-          at: Date.now()
-        });
-      }
-      button.textContent = '...';
-      window.setTimeout(() => { if (button.isConnected) button.innerHTML = '&#8635;'; }, 1600);
-    }, true);
-    mount.appendChild(button);
+    for (const oldButton of Array.from(bubble.querySelectorAll('.df-chat-refresh-translation'))) {
+      if (!oldButton.closest('.df-chat-translation')) oldButton.remove();
+    }
   };
+  if (platformApp === 'signal') {
+    for (const injectedButton of Array.from(document.querySelectorAll('.df-chat-refresh-translation'))) {
+      injectedButton.remove();
+    }
+  } else {
+    for (const oldButton of Array.from(document.querySelectorAll('.df-chat-refresh-translation'))) {
+      if (!oldButton.closest('.df-chat-translation')) oldButton.remove();
+    }
+  }
   const textSelectors = platformApp === 'signal'
     ? [
       '[data-testid*="message"] [dir="auto"]',
@@ -6775,6 +7254,28 @@ function buildLegacyTranslationCacheCleanupScript(app: RuntimeApp) {
 `;
 }
 
+function buildSignalLegacyBubbleRuntimeRetirementScript() {
+  return `
+(() => {
+  window.__dfCachedTranslationObserver?.disconnect?.();
+  window.__dfCachedTranslationObserver = null;
+  window.clearTimeout(window.__dfPersistentRenderCacheWriteTimer);
+  window.__dfPersistentRenderCacheWriteTimer = 0;
+  for (const node of Array.from(document.querySelectorAll('.df-chat-translation, .df-chat-refresh-translation'))) {
+    node.remove();
+  }
+  delete window.__dfApplyCachedTranslations;
+  delete window.__dfApplyCachedTranslationsBurst;
+  delete window.__dfMergeCachedTranslationRenderCache;
+  delete window.__dfCachedTranslationByHash;
+  delete window.__dfCachedTranslationRenderCache;
+  delete window.__dfCachedTranslationRuntimeInstalled;
+  delete window.__dfCachedTranslationRuntimeVersion;
+  return true;
+})()
+`;
+}
+
 function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ sourceHash: string; sourceText?: string; translatedText: string; updatedAt?: number }>) {
   const payload = JSON.stringify({ app, entries });
   return `
@@ -7000,8 +7501,12 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
     if (rect && rect.width > 0) return rect.left + rect.width / 2 > window.innerWidth / 2 ? 'outgoing' : 'incoming';
     return 'unknown';
   };
-  const translationColorFor = (bubble) =>
-    payload.app === 'signal' && readDirection(bubble) === 'outgoing' ? '#f8fbff' : '#166534';
+  const translationColorFor = (bubble) => {
+    if (payload.app === 'signal') {
+      return readDirection(bubble) === 'outgoing' ? '#f8fbff' : '#0b7654';
+    }
+    return '#166534';
+  };
   const styleTranslationNode = (node, bubble) => {
     node.style.cssText = [
       'display:block',
@@ -7018,6 +7523,64 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
       'max-width:100%',
       'box-sizing:border-box'
     ].join(';');
+  };
+  const renderWebTranslationWithRefresh = (node, translatedText, key, sourceText, bubble) => {
+    if (payload.app === 'signal') {
+      node.textContent = translatedText;
+      return;
+    }
+    for (const oldButton of Array.from(bubble?.querySelectorAll?.('.df-chat-refresh-translation') || [])) {
+      oldButton.remove();
+    }
+    const characters = Array.from(translatedText || '');
+    const lastCharacter = characters.pop() || '';
+    node.replaceChildren();
+    if (characters.length) node.appendChild(document.createTextNode(characters.join('')));
+    const tail = document.createElement('span');
+    tail.className = 'df-chat-translation-tail';
+    tail.style.cssText = 'display:inline-flex;align-items:center;white-space:nowrap';
+    const last = document.createElement('span');
+    last.textContent = lastCharacter;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'df-chat-refresh-translation';
+    button.title = '重新翻译本条气泡';
+    button.innerHTML = '&#8635;';
+    button.style.cssText = [
+      'align-items:center', 'appearance:none', 'background:transparent', 'border:0', 'border-radius:50%',
+      'color:inherit', 'cursor:pointer', 'display:inline-flex', 'flex:0 0 auto', 'font-family:inherit',
+      'font-size:15px', 'font-weight:400', 'height:24px', 'justify-content:center', 'line-height:1',
+      'margin:0 0 0 3px', 'opacity:0.72', 'padding:0', 'pointer-events:auto', 'width:24px'
+    ].join(';');
+    button.onmouseenter = () => {
+      button.style.background = 'color-mix(in srgb, currentColor 12%, transparent)';
+      button.style.opacity = '1';
+    };
+    button.onmouseleave = () => {
+      button.style.background = 'transparent';
+      button.style.opacity = '0.72';
+    };
+    let lastRefreshTriggerAt = 0;
+    const triggerRefresh = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      const now = Date.now();
+      if (now - lastRefreshTriggerAt < 500) return;
+      lastRefreshTriggerAt = now;
+      window.__dfTranslatorQueue = Array.isArray(window.__dfTranslatorQueue) ? window.__dfTranslatorQueue : [];
+      window.__dfTranslatorQueue.push({
+        action: 'bubble-refresh',
+        text: JSON.stringify({ key, text: sourceText, direction: readDirection(bubble), messagePart: 'body' }),
+        at: now
+      });
+      button.textContent = '...';
+      window.setTimeout(() => { if (button.isConnected) button.innerHTML = '&#8635;'; }, 1600);
+    };
+    if (payload.app === 'telegram') button.addEventListener('pointerdown', triggerRefresh, true);
+    button.addEventListener('click', triggerRefresh, true);
+    tail.append(last, button);
+    node.appendChild(tail);
   };
   const mountFor = (textNode, bubble) => {
     if (payload.app === 'signal') {
@@ -7052,7 +7615,7 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
       wrapper.style.boxSizing = 'border-box';
     }
   };
-  const appendTranslation = (mount, sourceHash, translatedText, bubble) => {
+  const appendTranslation = (mount, sourceHash, translatedText, bubble, sourceText, textNode) => {
     if (!mount) return false;
     prepareTelegramMount(mount);
     if (payload.app === 'signal') {
@@ -7066,6 +7629,9 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
       const existingTranslations = Array.from(mount.querySelectorAll('.df-chat-translation'));
       const existingDirect = existingTranslations.find((node) => node.parentElement === mount);
       if (existingDirect) {
+        const key = textNode.dataset.dfMsgTextKey || ('df-cache-' + sourceHash);
+        textNode.dataset.dfMsgTextKey = key;
+        renderWebTranslationWithRefresh(existingDirect, translatedText, key, sourceText, bubble || mount);
         styleTranslationNode(existingDirect, bubble || mount);
         return false;
       }
@@ -7105,7 +7671,9 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
     const node = document.createElement('div');
     node.className = 'df-chat-translation';
     node.dataset.dfCachedHash = sourceHash;
-    node.textContent = translatedText;
+    const key = textNode?.dataset?.dfMsgTextKey || ('df-cache-' + sourceHash);
+    if (textNode) textNode.dataset.dfMsgTextKey = key;
+    renderWebTranslationWithRefresh(node, translatedText, key, sourceText, bubble || mount);
     styleTranslationNode(node, bubble || mount);
     if (payload.app === 'telegram' && mount.matches?.('.message.spoilers-container, .message')) {
       const anchor = Array.from(mount.children).find((child) =>
@@ -7217,7 +7785,7 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
         const bubble = findBubble(textNode);
         if (!isLikelyMessageBubble(bubble, textNode)) continue;
         const mount = mountFor(textNode, bubble);
-        appendTranslation(mount, sourceHash, translatedText, bubble);
+        appendTranslation(mount, sourceHash, translatedText, bubble, text, textNode);
       }
       if (cursor < textNodes.length) {
         runDeferred(runBatch);
@@ -7561,10 +8129,74 @@ function buildMessageTranslationInjectScript(key: string, translation: string, a
       'box-sizing:border-box'
     ].join(';');
   };
+  const renderWebTranslationWithRefresh = (targetNode) => {
+    if (payload.app === 'signal') {
+      targetNode.textContent = payload.translation;
+      return;
+    }
+    for (const oldButton of Array.from(container.querySelectorAll('.df-chat-refresh-translation'))) oldButton.remove();
+    const characters = Array.from(payload.translation || '');
+    const lastCharacter = characters.pop() || '';
+    targetNode.replaceChildren();
+    if (characters.length) targetNode.appendChild(document.createTextNode(characters.join('')));
+    const tail = document.createElement('span');
+    tail.className = 'df-chat-translation-tail';
+    tail.style.cssText = 'display:inline-flex;align-items:center;white-space:nowrap';
+    const last = document.createElement('span');
+    last.textContent = lastCharacter;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'df-chat-refresh-translation';
+    button.title = '重新翻译本条气泡';
+    button.innerHTML = '&#8635;';
+    button.style.cssText = [
+      'align-items:center', 'appearance:none', 'background:transparent', 'border:0', 'border-radius:50%',
+      'color:inherit', 'cursor:pointer', 'display:inline-flex', 'flex:0 0 auto', 'font-family:inherit',
+      'font-size:15px', 'font-weight:400', 'height:24px', 'justify-content:center', 'line-height:1',
+      'margin:0 0 0 3px', 'opacity:0.72', 'padding:0', 'pointer-events:auto', 'width:24px'
+    ].join(';');
+    button.onmouseenter = () => {
+      button.style.background = 'color-mix(in srgb, currentColor 12%, transparent)';
+      button.style.opacity = '1';
+    };
+    button.onmouseleave = () => {
+      button.style.background = 'transparent';
+      button.style.opacity = '0.72';
+    };
+    let lastRefreshTriggerAt = 0;
+    const triggerRefresh = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      const now = Date.now();
+      if (now - lastRefreshTriggerAt < 500) return;
+      lastRefreshTriggerAt = now;
+      window.__dfTranslatorQueue = Array.isArray(window.__dfTranslatorQueue) ? window.__dfTranslatorQueue : [];
+      window.__dfTranslatorQueue.push({
+        action: 'bubble-refresh',
+        text: JSON.stringify({
+          key: payload.key,
+          text: payload.sourceText,
+          direction: readDirection(container),
+          messagePart: 'body'
+        }),
+        at: now
+      });
+      button.textContent = '...';
+      window.setTimeout(() => { if (button.isConnected) button.innerHTML = '&#8635;'; }, 1600);
+    };
+    if (payload.app === 'telegram') button.addEventListener('pointerdown', triggerRefresh, true);
+    button.addEventListener('click', triggerRefresh, true);
+    tail.append(last, button);
+    targetNode.appendChild(tail);
+  };
   const existingTranslations = Array.from(mount.querySelectorAll('.df-chat-translation'));
   if (existingTranslations.length && !payload.replaceExisting) {
     if (payload.app !== 'telegram' || existingTranslations.some((node) => node.parentElement === mount)) {
-      for (const existingTranslation of existingTranslations) styleTranslationNode(existingTranslation);
+      for (const existingTranslation of existingTranslations) {
+        renderWebTranslationWithRefresh(existingTranslation);
+        styleTranslationNode(existingTranslation);
+      }
       return true;
     }
   }
@@ -7573,7 +8205,7 @@ function buildMessageTranslationInjectScript(key: string, translation: string, a
   }
   const node = document.createElement('div');
   node.className = 'df-chat-translation';
-  node.textContent = payload.translation;
+  renderWebTranslationWithRefresh(node);
   styleTranslationNode(node);
   if (payload.app === 'telegram' && mount.matches?.('.message.spoilers-container, .message')) {
     const anchor = Array.from(mount.children).find((child) =>
@@ -7652,6 +8284,16 @@ watch([activeProfileId, activePanel, signedIn], () => {
   resetLockScreenIdleTimer();
 });
 
+watch(activePanel, (panel, previousPanel) => {
+  if (panel !== 'session') {
+    lockGuideVisible.value = false;
+    return;
+  }
+  if (previousPanel !== 'session' && !lockScreenStatus.value?.enabled) {
+    lockGuideVisible.value = true;
+  }
+});
+
 onMounted(() => {
   clearLegacyRendererTranslationCaches();
   void window.chatTranslator?.setWindowTheme?.(activeTheme.value);
@@ -7671,6 +8313,8 @@ onMounted(() => {
   window.addEventListener('pointerdown', handleLockActivity, true);
   window.addEventListener('mousemove', handleLockActivity, true);
   window.addEventListener('keydown', handleLockActivity, true);
+  window.addEventListener('focus', checkLockScreenIdleDeadline, true);
+  document.addEventListener('visibilitychange', handleLockVisibilityChange);
   nextTick(() => {
     const host = document.querySelector<HTMLElement>('.runtime-web-main');
     if (!host || typeof ResizeObserver === 'undefined') return;
@@ -7686,11 +8330,12 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  stopBitcoinGlyphSequence();
   if (memoryStatusTimer) clearInterval(memoryStatusTimer);
   if (lockScreenIdleTimer) clearTimeout(lockScreenIdleTimer);
   if (lockScreenClockTimer) clearInterval(lockScreenClockTimer);
-  if (lockLogoClickResetTimer) clearTimeout(lockLogoClickResetTimer);
   if (lockBlankClickResetTimer) clearTimeout(lockBlankClickResetTimer);
+  if (lockNetworkWarningShakeTimer) clearTimeout(lockNetworkWarningShakeTimer);
   if (refreshWindowCooldownTimer) clearTimeout(refreshWindowCooldownTimer);
   if (sensitiveSendExpiryTimer) clearTimeout(sensitiveSendExpiryTimer);
   if (signalWorkspaceSyncTimer) clearTimeout(signalWorkspaceSyncTimer);
@@ -7730,6 +8375,8 @@ onUnmounted(() => {
   window.removeEventListener('pointerdown', handleLockActivity, true);
   window.removeEventListener('mousemove', handleLockActivity, true);
   window.removeEventListener('keydown', handleLockActivity, true);
+  window.removeEventListener('focus', checkLockScreenIdleDeadline, true);
+  document.removeEventListener('visibilitychange', handleLockVisibilityChange);
   void hideInactiveSignalProfiles(null);
 });
 </script>
@@ -7832,7 +8479,7 @@ onUnmounted(() => {
     <aside class="app-sidebar">
       <div class="brand-mark"></div>
       <h2>maoyi</h2>
-      <span>v0.1.0</span>
+      <span>V0.1.2</span>
 
       <nav class="side-nav">
         <button :class="{ active: activePanel === 'apps' }" type="button" @click="activePanel = 'apps'"><b>01</b>应用中心</button>
@@ -7885,6 +8532,10 @@ onUnmounted(() => {
           <label><span>应用窗口标签排版</span><select><option>顶部横排</option><option>左侧竖排</option></select></label>
           <label><span>窗口模式</span><select><option>嵌入</option><option>独立</option></select></label>
         </div>
+        <div v-else-if="activePanel === 'account'" class="setting-card account-center-card">
+          <button class="account-reauthorize-button" type="button" @click="openReauthorizationDialog">重新授权</button>
+          <p v-if="accountMessage" class="account-action-message">{{ accountMessage }}</p>
+        </div>
       </section>
     </section>
 
@@ -7896,12 +8547,16 @@ onUnmounted(() => {
     </aside>
   </main>
 
-  <main v-show="signedIn && activePanel === 'session'" class="page workspace-page" :class="themeClass">
-    <header class="runtime-header">
+  <main
+    v-show="signedIn && activePanel === 'session'"
+    class="page workspace-page"
+    :class="[themeClass, { 'workspace-header-collapsed': workspaceHeaderCollapsed }]"
+  >
+    <header v-show="!workspaceHeaderCollapsed" class="runtime-header">
       <div class="runtime-brand">
-        <div class="brand-mark small" @pointerdown.capture.stop="handleRuntimeLogoClick"></div>
+        <div class="brand-mark small"></div>
         <strong>maoyi</strong>
-        <span>maoyi v0.1.0</span>
+        <span>maoyi V0.1.2</span>
       </div>
       <nav>
         <div class="memory-status-stack">
@@ -7926,6 +8581,33 @@ onUnmounted(() => {
 
     <aside class="runtime-side">
       <button type="button" class="runtime-home" @click="activePanel = 'apps'"><span class="soft-home-icon"></span>主页</button>
+      <div class="runtime-lock-entry">
+        <button type="button" class="runtime-lock-button" @click="handleLockButtonClick">
+          <span class="runtime-lock-key" aria-hidden="true"></span>
+          锁屏
+        </button>
+        <aside v-if="lockGuideVisible && !lockScreenStatus?.enabled" class="runtime-lock-guide" @click.stop>
+          <button class="runtime-lock-guide-close" type="button" aria-label="关闭锁屏设置引导" @click="dismissLockGuide">×</button>
+          <strong>请先设置锁屏保护</strong>
+          <p>点击“锁屏”设置密码，保护工作区内的聊天内容。</p>
+          <button class="runtime-lock-guide-action" type="button" @click="handleLockButtonClick">立即设置</button>
+        </aside>
+      </div>
+      <button
+        type="button"
+        class="runtime-header-toggle"
+        :aria-label="workspaceHeaderCollapsed ? '展开工作区顶部控制栏' : '折叠工作区顶部控制栏'"
+        :aria-expanded="!workspaceHeaderCollapsed"
+        :title="workspaceHeaderCollapsed ? '展开工作区顶部控制栏' : '折叠工作区顶部控制栏'"
+        @click="toggleWorkspaceHeader"
+      >
+        <span class="runtime-header-toggle-icon" aria-hidden="true">
+          <span class="runtime-header-toggle-glyph" :class="{ spinning: bitcoinGlyphBursting }" @animationend="handleBitcoinGlyphAnimationEnd">
+            <img :src="bitcoinGlyphIcon" alt="" />
+          </span>
+        </span>
+        {{ workspaceHeaderCollapsed ? '折叠' : '展开' }}
+      </button>
       <button type="button" class="app-short wa" :class="{ active: currentApp === 'whatsapp', unread: unreadCountForApp('whatsapp') > 0 }" @click="selectRuntimeApp('whatsapp')">
         <img :src="multiWhatsappIcon" alt="WhatsApp" />
         <span v-if="unreadCountForApp('whatsapp') > 0" class="app-unread-dot" aria-hidden="true"></span>
@@ -7952,14 +8634,20 @@ onUnmounted(() => {
           <span v-if="index > 0" class="multi-open-separator">|</span>
           <button
             class="runtime-tab"
-            :class="{ active: activeProfileId === tab.id }"
+            :class="{
+              active: activeProfileId === tab.id,
+              dragging: draggingProfileId === tab.id,
+              'drop-before': tabDropTargetId === tab.id && !tabDropAfter,
+              'drop-after': tabDropTargetId === tab.id && tabDropAfter
+            }"
             :title="`${tab.name} · ${tab.group}`"
             type="button"
             draggable="true"
-            @click="selectRuntimeTab(tab.id)"
-            @dragstart="handleTabDragStart(tab.id)"
-            @dragover.prevent
-            @drop.prevent="handleTabDrop(tab.id)"
+            @click="handleRuntimeTabClick(tab.id)"
+            @dragstart="handleTabDragStart($event, tab.id)"
+            @dragover.prevent="handleTabDragOver($event, tab.id)"
+            @drop.prevent="handleTabDrop($event, tab.id)"
+            @dragend="handleTabDragEnd"
           >
             <span v-if="unreadCountForProfile(tab.id) > 0" class="tab-unread-badge">{{ formatUnreadCount(unreadCountForProfile(tab.id)) }}</span>
             <span class="tab-icon"><img :src="tab.icon" :alt="tab.short" /></span>
@@ -7995,7 +8683,7 @@ onUnmounted(() => {
         ref="webviewRef"
         :key="item.profile.id"
         class="platform-webview"
-        :class="{ active: activeProfileId === item.profile.id && !createDialogOpen && !closeTargetProfile && !renameTargetProfile }"
+        :class="{ active: activeProfileId === item.profile.id && !hasBlockingModal }"
         :data-profile-id="item.profile.id"
         :src="item.url"
         :partition="item.profile.partition"
@@ -8079,10 +8767,98 @@ onUnmounted(() => {
   </main>
 
   <div
+    v-if="reauthorizationDialogOpen"
+    class="modal-mask reauthorization-mask"
+    :class="themeClass"
+    @click.self="closeReauthorizationDialog"
+  >
+    <section class="modal-card reauthorization-card">
+      <h3>重新授权</h3>
+      <label class="client-license-field">
+        <span>本机码</span>
+        <textarea :value="clientAuthorizationStatus?.machineCode" rows="3" readonly></textarea>
+      </label>
+      <label class="client-license-field">
+        <span>用户名</span>
+        <input :value="clientAuthorizationStatus?.username" readonly />
+      </label>
+      <label class="client-license-field">
+        <span>授权码</span>
+        <textarea
+          v-model="reauthorizationLicenseCodeDraft"
+          rows="5"
+          :disabled="reauthorizationBusy || reauthorizationSucceeded"
+          placeholder="请输入新的授权码"
+        ></textarea>
+      </label>
+      <p
+        v-if="reauthorizationMessage"
+        class="client-license-message"
+        :class="{ error: !reauthorizationSucceeded }"
+      >
+        {{ reauthorizationMessage }}
+      </p>
+      <div class="modal-actions reauthorization-actions">
+        <button type="button" :disabled="reauthorizationBusy" @click="copyReauthorizationMachineInfo">复制</button>
+        <button type="button" :disabled="reauthorizationBusy" @click="closeReauthorizationDialog">
+          {{ reauthorizationSucceeded ? '关闭' : '取消' }}
+        </button>
+        <button
+          type="button"
+          :disabled="reauthorizationBusy || reauthorizationSucceeded || !reauthorizationLicenseCodeDraft.trim()"
+          @click="confirmReauthorization"
+        >
+          {{ reauthorizationBusy ? '更新中' : '确认' }}
+        </button>
+      </div>
+    </section>
+  </div>
+
+  <div
+    v-if="lockSetupDialogStage"
+    class="modal-mask lock-setup-mask"
+    :class="themeClass"
+    @click.self="closeLockSetupDialog"
+  >
+    <section class="modal-card lock-setup-card">
+      <template v-if="lockSetupDialogStage === 'confirm'">
+        <div class="lock-setup-heading">
+          <span class="runtime-lock-key" aria-hidden="true"></span>
+          <h3>即将设置锁屏密码</h3>
+        </div>
+        <p>锁屏密码用于保护工作区内的聊天内容。点击确定后将先检测电脑是否已断开网络。</p>
+        <p v-if="lockNetworkGateReason" class="lock-setup-context">{{ lockNetworkGateReason }}</p>
+        <div class="modal-actions">
+          <button type="button" :disabled="lockNetworkGateBusy" @click="closeLockSetupDialog">取消</button>
+          <button type="button" :disabled="lockNetworkGateBusy" @click="confirmLockSetupStart">
+            {{ lockNetworkGateBusy ? '检测中' : '确定' }}
+          </button>
+        </div>
+      </template>
+      <template v-else>
+        <div class="lock-setup-heading">
+          <span class="runtime-lock-key" aria-hidden="true"></span>
+          <h3>{{ lockSetupIntent === 'setup' ? '设置锁屏密码' : lockSetupIntent === 'upgrade' ? '升级锁屏密码' : '重置锁屏密码' }}</h3>
+        </div>
+        <p class="lock-network-warning" :class="{ shake: lockNetworkWarningShaking }">
+          请拔掉电脑的网线且关闭 WIFI 无线网络连接，完成后点击继续。
+        </p>
+        <small v-if="lockNetworkGateReason" class="lock-network-reason">{{ lockNetworkGateReason }}</small>
+        <div class="modal-actions">
+          <button type="button" :disabled="lockNetworkGateBusy" @click="closeLockSetupDialog">取消</button>
+          <button type="button" :disabled="lockNetworkGateBusy" @click="continueLockNetworkGate">
+            {{ lockNetworkGateBusy ? '检测中' : '继续' }}
+          </button>
+        </div>
+      </template>
+    </section>
+  </div>
+
+  <div
     v-if="lockScreenVisible"
     class="client-lock-screen"
     :class="themeClass"
-    @keydown.capture.prevent.stop
+    @keydown.capture.prevent.stop="handleLockScreenKeydown"
     @keyup.capture.prevent.stop
     @keypress.capture.prevent.stop
     @pointerdown.self.stop="handleLockBlankPointerDown"
@@ -8097,16 +8873,19 @@ onUnmounted(() => {
         </div>
       </div>
       <p>{{ lockScreenHint }}</p>
+      <p v-if="lockIsSettingPin" class="lock-offline-notice">为保障您的安全，在密码设置过程中，请勿连接互联网。</p>
       <p v-if="lockRemainingText" class="lock-warning">已暂时锁定，剩余 {{ lockRemainingText }}</p>
 
       <div v-if="lockShowPinControls" class="pin-display">
         <span>{{ lockPinDots }}</span>
-        <small>{{ lockIsSettingPin ? '输入新 PIN' : '输入 PIN 解锁' }}</small>
+        <small>{{ lockIsSettingPin ? '输入新密码' : '输入密码解锁' }}</small>
       </div>
       <div v-if="lockShowPinControls && lockIsSettingPin" class="pin-display confirm">
         <span>{{ lockPinConfirmDots }}</span>
-        <small>确认新 PIN</small>
+        <small>确认新密码</small>
       </div>
+
+      <p v-if="lockShowPinControls" class="lock-input-instruction">{{ lockInputInstruction }}</p>
 
       <div v-if="lockShowPinControls" class="lock-keypad" aria-label="随机数字键盘">
         <button v-for="digit in lockKeypadDigits" :key="digit" type="button" @click="lockKeypadPress(digit)">{{ digit }}</button>
@@ -8122,7 +8901,7 @@ onUnmounted(() => {
         :disabled="Boolean(lockRemainingText)"
         @click="lockIsSettingPin ? confirmLockPinSetup() : confirmLockPinUnlock()"
       >
-        {{ lockIsSettingPin ? '保存 PIN' : '解锁' }}
+        {{ lockIsSettingPin ? '保存锁屏密码' : '解锁' }}
       </button>
     </section>
   </div>

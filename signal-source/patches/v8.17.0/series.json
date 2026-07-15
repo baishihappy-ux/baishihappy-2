@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "baseline": "8.17.0",
+  "patches": [
+    {
+      "file": "0001-maoyi-launcher-startup-guard.patch",
+      "sha256": "DE7BAEA1511C856AA4681F9F1689701D414FC67371C716656902640685C9136A"
+    },
+    {
+      "file": "0002-maoyi-typed-control-bridge.patch",
+      "sha256": "E4268FA2FAE0FBAEEA6ABF463C5A91CACD0F917E43C82211DA30DF76DB83B632"
+    },
+    {
+      "file": "0003-maoyi-window-security-controller.patch",
+      "sha256": "78CDC75C460C6CC398585FCECF51FD74556F01E32CBC37E3D4D22C337E0685CD"
+    }
+  ]
+}

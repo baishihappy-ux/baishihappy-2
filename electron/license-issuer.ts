@@ -11,7 +11,7 @@ import {
   type IpcMainInvokeEvent
 } from 'electron';
 import { mkdir, readFile, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { dirname, isAbsolute, join, relative, resolve } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -19,8 +19,45 @@ import { issueLicenseCode, parseLicenseCode, type LicenseSuitePrivateConfig } fr
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const preloadPath = join(__dirname, '../electron/license-issuer-preload.cjs');
+type PackagedIssuerIdentity = {
+  suiteId: string;
+  keyId: string;
+  publicKeySha256: string;
+};
+
+type PackagedIssuerKeyFile = PackagedIssuerIdentity & {
+  key: string;
+};
+
+function readPackagedIssuerKeyFile() {
+  return JSON.parse(readFileSync(join(__dirname, 'issuer-suite-key.json'), 'utf8')) as PackagedIssuerKeyFile;
+}
+
+function validatePackagedIssuerIdentity(value: PackagedIssuerKeyFile): PackagedIssuerIdentity {
+  if (
+    !/^\d{9}$/.test(value.suiteId || '') ||
+    !value.keyId ||
+    !/^[a-f0-9]{64}$/i.test(value.publicKeySha256 || '')
+  ) throw new Error('授权套装身份配置无效');
+  return {
+    suiteId: value.suiteId,
+    keyId: value.keyId,
+    publicKeySha256: value.publicKeySha256.toLowerCase()
+  };
+}
+
+const packagedIssuerIdentity = app.isPackaged
+  ? validatePackagedIssuerIdentity(readPackagedIssuerKeyFile())
+  : null;
 const issuerUserDataOverride = process.env.MAOYI_ISSUER_USER_DATA_DIR?.trim();
-if (issuerUserDataOverride) app.setPath('userData', issuerUserDataOverride);
+if (issuerUserDataOverride) {
+  if (!isAbsolute(issuerUserDataOverride)) throw new Error('MAOYI_ISSUER_USER_DATA_DIR 必须是绝对路径');
+  app.setPath('userData', issuerUserDataOverride);
+} else if (packagedIssuerIdentity) {
+  app.setPath('userData', join(app.getPath('appData'), 'MAOYI AUTHORIZER', packagedIssuerIdentity.suiteId));
+} else {
+  app.setPath('userData', join(app.getPath('appData'), 'maoyi-developer-authorizer'));
+}
 const maxAttempts = 3;
 const lockDurationsMs = [10 * 60 * 1000, 60 * 60 * 1000, 6 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 48 * 60 * 60 * 1000];
 let issuerWindow: BrowserWindow | null = null;
@@ -139,6 +176,14 @@ function validatePrivateSuite(suite: LicenseSuitePrivateConfig) {
   if (!suite.suiteId || !suite.privateKeyPem || !suite.publicKeyPem || !suite.keyId) {
     throw new Error('授权套装配置不完整');
   }
+  if (
+    packagedIssuerIdentity &&
+    (
+      suite.suiteId !== packagedIssuerIdentity.suiteId ||
+      suite.keyId !== packagedIssuerIdentity.keyId ||
+      (suite.publicKeySha256 || '').toLowerCase() !== packagedIssuerIdentity.publicKeySha256
+    )
+  ) throw new Error('授权保险库与当前套装身份不匹配');
   return suite;
 }
 
@@ -153,7 +198,8 @@ async function loadBootstrapSuite() {
     tag: string;
     ciphertext: string;
   };
-  const keyFile = JSON.parse(await readFile(join(__dirname, 'issuer-suite-key.json'), 'utf8')) as { key: string };
+  const keyFile = JSON.parse(await readFile(join(__dirname, 'issuer-suite-key.json'), 'utf8')) as PackagedIssuerKeyFile;
+  validatePackagedIssuerIdentity(keyFile);
   if (sealed.version !== 1 || !keyFile.key) throw new Error('授权套装密封配置无效');
   const key = Buffer.from(keyFile.key, 'base64');
   const iv = Buffer.from(sealed.iv, 'base64');

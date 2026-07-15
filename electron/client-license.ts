@@ -55,6 +55,16 @@ type LoadedDeviceIdentity = {
 
 const usernameMaxLength = 64;
 
+export type PreparedClientLicenseReplacement = {
+  code: string;
+  payload: LicensePayload;
+};
+
+export type ClientLicenseSnapshot = {
+  code: string;
+  payload: LicensePayload;
+};
+
 function publicSuiteFromConfig(config: LicenseSuitePublicConfig | LicenseSuitePrivateConfig): LicenseSuitePublicConfig {
   return {
     suiteId: config.suiteId,
@@ -484,6 +494,73 @@ export class ClientLicenseManager {
     this.authorizationGuard = null;
     await rm(this.authorizationGuardPath(), { force: true });
     return { ok: true, status: this.getStatus() };
+  }
+
+  async prepareReplacement(licenseCode: string): Promise<{
+    result: ClientAuthorizationResult;
+    prepared?: PreparedClientLicenseReplacement;
+  }> {
+    await this.initialize();
+    if (this.currentState() !== 'authorized' || !this.verifiedPayload) {
+      return {
+        result: { ok: false, reason: '当前客户端未处于有效授权状态，不能重新授权', status: this.getStatus() }
+      };
+    }
+    if (!this.suite || !this.machineCode || !this.account?.username || !this.identity) {
+      return {
+        result: { ok: false, reason: '客户端设备身份不完整，不能重新授权', status: this.getStatus() }
+      };
+    }
+    const code = licenseCode.trim();
+    if (!code) {
+      return { result: { ok: false, reason: '请输入授权码', status: this.getStatus() } };
+    }
+    const verification = verifyLicenseCode({
+      code,
+      suite: this.suite,
+      machineCode: this.machineCode,
+      username: this.account.username,
+      deviceEncryptionPrivateKeyPem: this.identity.encryptionPrivateKeyPem
+    });
+    if (!verification.ok || !verification.payload) {
+      const guard = await this.recordAuthorizationFailure();
+      const remaining = Math.max(0, 5 - guard.failedAttempts);
+      const baseReason = verification.reason || '授权码校验失败';
+      const reason = guard.lockedAt ? this.deviceError : `${baseReason}，剩余 ${remaining} 次机会`;
+      return {
+        result: {
+          ok: false,
+          reason,
+          status: this.getStatus(),
+          selfDestructRequired: Boolean(guard.lockedAt)
+        }
+      };
+    }
+    return {
+      result: { ok: true, status: this.getStatus() },
+      prepared: { code, payload: verification.payload }
+    };
+  }
+
+  async commitReplacement(prepared: PreparedClientLicenseReplacement): Promise<ClientLicenseSnapshot> {
+    await this.initialize();
+    if (!this.verifiedPayload) throw new Error('当前授权状态不存在，不能提交重新授权');
+    const snapshot: ClientLicenseSnapshot = {
+      code: (await readFile(this.licensePath(), 'utf8')).trim(),
+      payload: this.verifiedPayload
+    };
+    await writeFileAtomic(this.licensePath(), `${prepared.code}\n`);
+    this.verifiedPayload = prepared.payload;
+    this.licenseReason = '';
+    this.authorizationGuard = null;
+    await rm(this.authorizationGuardPath(), { force: true }).catch(() => undefined);
+    return snapshot;
+  }
+
+  async rollbackReplacement(snapshot: ClientLicenseSnapshot) {
+    await writeFileAtomic(this.licensePath(), `${snapshot.code}\n`);
+    this.verifiedPayload = snapshot.payload;
+    this.licenseReason = '';
   }
 
   machineInfoText() {

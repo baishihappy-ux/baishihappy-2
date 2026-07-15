@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "baseline": "8.18.0",
+  "referenceDelivery": "003",
+  "targetDelivery": "006",
+  "rules": {
+    "referenceDeliveryIsUpgradeTarget": false,
+    "preserveReferenceCapabilities": true,
+    "launcherOnly": true,
+    "launcherProductName": "maoyi",
+    "localDirectLaunchAction": "block-without-reset",
+    "foreignWholeFolderLaunchAction": "full-data-root-reset-before-signal-load",
+    "officialSignalFallback": false,
+    "replaceCurrentRuntimeBeforeAcceptance": false
+  },
+  "capabilities": [
+    { "id": "launcher-only-start", "classification": "existing-required" },
+    { "id": "local-direct-block-without-reset", "classification": "existing-required" },
+    { "id": "foreign-whole-folder-full-reset", "classification": "existing-required" },
+    { "id": "guard-before-account-database", "classification": "existing-required" },
+    { "id": "no-official-signal-fallback", "classification": "existing-required" },
+    { "id": "profile-data-isolation", "classification": "existing-required" },
+    { "id": "authenticated-control-channel", "classification": "existing-required" },
+    { "id": "window-show-hide-bounds-shutdown-heartbeat", "classification": "existing-required" },
+    { "id": "english-bubble-to-chinese", "classification": "existing-required" },
+    { "id": "chinese-composer-to-english", "classification": "existing-required" },
+    { "id": "encrypted-cache-restoration", "classification": "existing-required" },
+    { "id": "signal-a-b-a-cache-restoration", "classification": "existing-required" },
+    { "id": "unread-notification-bridge", "classification": "existing-required" },
+    { "id": "event-driven-window-sync-without-800ms-polling", "classification": "existing-required" },
+    { "id": "typed-command-bridge", "classification": "source-upgrade-required" },
+    { "id": "windows-owner-window", "classification": "source-upgrade-required" },
+    { "id": "main-process-lock-visibility-gate", "classification": "source-upgrade-required" },
+    { "id": "source-message-added-live-translation", "classification": "source-upgrade-required" },
+    { "id": "source-bubble-manual-refresh", "classification": "source-upgrade-required" }
+  ]
+}

@@ -13,8 +13,8 @@ import {
 } from 'node:crypto';
 
 export const licenseFormatVersion = 2;
-export const licenseCodePrefix = 'MYLIC2';
-export const machineCodePrefix = 'MYM2';
+export const licenseCodePrefix = 'DFLIC2';
+export const machineCodePrefix = 'DFM2';
 export const licenseSuiteProductId = 'maoyi';
 export const licenseSuiteIssuerId = 'maoyi-offline-issuer';
 

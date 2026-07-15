@@ -1,0 +1,772 @@
+diff --git a/app/maoyi/bootstrap.main.ts b/app/maoyi/bootstrap.main.ts
+index 6e1fc72f68501021a1d0de87897bc1a022c09d84..850facd86a28e8d5610392939def3920f13c502c 100644
+--- a/app/maoyi/bootstrap.main.ts
++++ b/app/maoyi/bootstrap.main.ts
+@@ -4,10 +4,15 @@ import { createRequire } from 'node:module';
+ import { join } from 'node:path';
+ import { app, dialog } from 'electron';
+ 
++import { startMaoyiControlBridge } from './controlBridge.main.ts';
+ import { runMaoyiStartupGuard } from './launchGuard.main.ts';
+ 
+ try {
+   if (runMaoyiStartupGuard(app, dialog)) {
++    const controlBridge = startMaoyiControlBridge();
++    app.once('before-quit', () => {
++      controlBridge.stop();
++    });
+     createRequire(__filename)(join(__dirname, 'signal-main.js'));
+   }
+ } catch {
+diff --git a/app/maoyi/controlBridge.main.ts b/app/maoyi/controlBridge.main.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..432fea7dd7152d9a47e33c49c60496280662f572
+--- /dev/null
++++ b/app/maoyi/controlBridge.main.ts
+@@ -0,0 +1,222 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import {
++  createMaoyiAuthResponse,
++  createMaoyiSignalEnvelope,
++  maoyiControlHeartbeatMs,
++  maoyiControlMaxMessageBytes,
++  maoyiControlReconnectMs,
++  parseMaoyiAuthChallenge,
++  verifyMaoyiLauncherEnvelope,
++  type MaoyiControlCommand,
++  type MaoyiControlEvent,
++} from './controlProtocol.main.ts';
++import { takeMaoyiLaunchContext } from './launchContext.main.ts';
++
++const controlBridgeKey = Symbol.for('maoyi.signal.control-bridge.v1');
++
++export type MaoyiControlBridge = Readonly<{
++  onCommand: (handler: (command: MaoyiControlCommand) => void) => () => void;
++  send: (event: MaoyiControlEvent) => boolean;
++  stop: () => void;
++}>;
++
++function schedule(
++  callback: () => void,
++  delay: number
++): ReturnType<typeof setTimeout> {
++  const timer = setTimeout(callback, delay);
++  timer.unref();
++  return timer;
++}
++
++export function getMaoyiControlBridge(): MaoyiControlBridge | undefined {
++  return Reflect.get(globalThis, controlBridgeKey) as
++    | MaoyiControlBridge
++    | undefined;
++}
++
++export function startMaoyiControlBridge(): MaoyiControlBridge {
++  const existing = getMaoyiControlBridge();
++  if (existing) {
++    return existing;
++  }
++
++  const launchContext = takeMaoyiLaunchContext();
++  if (!launchContext || launchContext.controlKey.length !== 32) {
++    throw new Error('Maoyi launch context is unavailable');
++  }
++  const context = launchContext;
++
++  const controlKey = Buffer.from(context.controlKey);
++  context.controlKey.fill(0);
++  const handlers = new Set<(command: MaoyiControlCommand) => void>();
++  let socket: WebSocket | undefined;
++  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
++  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
++  let authenticated = false;
++  let stopped = false;
++  let sendSequence = 0;
++  let receiveSequence = 0;
++
++  const clearTimers = (): void => {
++    if (reconnectTimer) {
++      clearTimeout(reconnectTimer);
++      reconnectTimer = undefined;
++    }
++    if (heartbeatTimer) {
++      clearInterval(heartbeatTimer);
++      heartbeatTimer = undefined;
++    }
++  };
++
++  const send = (event: MaoyiControlEvent): boolean => {
++    if (!authenticated || !socket || socket.readyState !== WebSocket.OPEN) {
++      return false;
++    }
++    sendSequence += 1;
++    socket.send(
++      createMaoyiSignalEnvelope(
++        controlKey,
++        context.appId,
++        process.pid,
++        sendSequence,
++        event
++      )
++    );
++    return true;
++  };
++
++  const stop = (): void => {
++    if (stopped) {
++      return;
++    }
++    stopped = true;
++    authenticated = false;
++    clearTimers();
++    try {
++      socket?.close();
++    } catch {
++      // A closing transport is already stopped.
++    }
++    socket = undefined;
++    handlers.clear();
++    controlKey.fill(0);
++    Reflect.deleteProperty(globalThis, controlBridgeKey);
++  };
++
++  function scheduleReconnect(): void {
++    if (stopped || reconnectTimer) {
++      return;
++    }
++    reconnectTimer = schedule(() => {
++      reconnectTimer = undefined;
++      connect();
++    }, maoyiControlReconnectMs);
++  }
++
++  function connect(): void {
++    if (stopped) {
++      return;
++    }
++    authenticated = false;
++    sendSequence = 0;
++    receiveSequence = 0;
++    if (heartbeatTimer) {
++      clearInterval(heartbeatTimer);
++      heartbeatTimer = undefined;
++    }
++
++    try {
++      socket = new WebSocket(
++        `ws://127.0.0.1:${context.wsPort}?appId=${encodeURIComponent(context.appId)}`
++      );
++    } catch {
++      scheduleReconnect();
++      return;
++    }
++
++    socket.addEventListener('message', event => {
++      if (
++        stopped ||
++        typeof event.data !== 'string' ||
++        Buffer.byteLength(event.data, 'utf8') > maoyiControlMaxMessageBytes
++      ) {
++        socket?.close();
++        return;
++      }
++
++      if (!authenticated) {
++        const challenge = parseMaoyiAuthChallenge(event.data, context.appId);
++        if (!challenge) {
++          socket?.close();
++          return;
++        }
++        socket?.send(
++          createMaoyiAuthResponse(
++            controlKey,
++            context.appId,
++            process.pid,
++            challenge.challenge
++          )
++        );
++        authenticated = true;
++        send({ type: 'ready', title: context.title || undefined });
++        heartbeatTimer = setInterval(() => {
++          send({ type: 'heartbeat', visible: false });
++        }, maoyiControlHeartbeatMs);
++        heartbeatTimer.unref();
++        return;
++      }
++
++      const expectedSequence = receiveSequence + 1;
++      const command = verifyMaoyiLauncherEnvelope(
++        event.data,
++        controlKey,
++        context.appId,
++        process.pid,
++        expectedSequence
++      );
++      if (
++        !command ||
++        (command.type === 'hello' && command.appId !== context.appId)
++      ) {
++        socket?.close();
++        return;
++      }
++      receiveSequence = expectedSequence;
++      for (const handler of handlers) {
++        try {
++          handler(command);
++        } catch {
++          // One command consumer cannot weaken or stop the authenticated bridge.
++        }
++      }
++    });
++    socket.addEventListener('close', () => {
++      authenticated = false;
++      if (heartbeatTimer) {
++        clearInterval(heartbeatTimer);
++        heartbeatTimer = undefined;
++      }
++      scheduleReconnect();
++    });
++    socket.addEventListener('error', () => {
++      // The close event performs the bounded reconnect.
++    });
++  }
++
++  const bridge: MaoyiControlBridge = Object.freeze({
++    onCommand(handler: (command: MaoyiControlCommand) => void) {
++      handlers.add(handler);
++      return () => {
++        handlers.delete(handler);
++      };
++    },
++    send,
++    stop,
++  });
++  Reflect.set(globalThis, controlBridgeKey, bridge);
++  connect();
++  return bridge;
++}
+diff --git a/app/maoyi/controlProtocol.main.ts b/app/maoyi/controlProtocol.main.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..39f526a497e37cd0ecf96d4e51102ebcd3df828e
+--- /dev/null
++++ b/app/maoyi/controlProtocol.main.ts
+@@ -0,0 +1,332 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import { createHmac, timingSafeEqual } from 'node:crypto';
++
++export const maoyiControlProtocolVersion = 1;
++export const maoyiControlMaxMessageBytes = 1024 * 1024;
++export const maoyiControlHeartbeatMs = 5_000;
++export const maoyiControlReconnectMs = 1_000;
++
++export type MaoyiWindowBounds = Readonly<{
++  x: number;
++  y: number;
++  width: number;
++  height: number;
++}>;
++
++export type MaoyiControlCommand =
++  | Readonly<{ type: 'hello'; appId: string; at: number }>
++  | Readonly<{ type: 'heartbeat.ack'; at: number }>
++  | Readonly<{ type: 'window.show'; bounds?: MaoyiWindowBounds }>
++  | Readonly<{ type: 'window.focus' }>
++  | Readonly<{ type: 'window.hide' }>
++  | Readonly<{
++      type: 'window.bounds-changed';
++      bounds: MaoyiWindowBounds;
++    }>
++  | Readonly<{ type: 'protocol.open'; url: string; requestId?: string }>
++  | Readonly<{ type: 'shutdown' }>
++  | Readonly<{ type: 'script.execute'; requestId: string; script: string }>;
++
++export type MaoyiControlEvent =
++  | Readonly<{ type: 'ready'; title?: string }>
++  | Readonly<{ type: 'heartbeat'; visible: boolean }>
++  | Readonly<{ type: 'transport.error'; code: string }>;
++
++type MaoyiControlPayload<T> = Readonly<{
++  appId: string;
++  at: number;
++}> &
++  T;
++
++type MaoyiControlEnvelope<T> = Readonly<{
++  version: 1;
++  sequence: number;
++  payload: T;
++  mac: string;
++}>;
++
++type MaoyiAuthChallenge = Readonly<{
++  type: 'auth.challenge';
++  appId: string;
++  challenge: string;
++}>;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++function hasOnlyKeys(
++  value: Record<string, unknown>,
++  allowed: ReadonlyArray<string>
++): boolean {
++  const allowedKeys = new Set(allowed);
++  return Object.keys(value).every(key => allowedKeys.has(key));
++}
++
++function isFiniteIntegerInRange(
++  value: unknown,
++  minimum: number,
++  maximum: number
++): value is number {
++  return (
++    typeof value === 'number' &&
++    Number.isFinite(value) &&
++    Number.isInteger(value) &&
++    value >= minimum &&
++    value <= maximum
++  );
++}
++
++function parseBounds(value: unknown): MaoyiWindowBounds | undefined {
++  if (
++    !isRecord(value) ||
++    !hasOnlyKeys(value, ['x', 'y', 'width', 'height']) ||
++    !isFiniteIntegerInRange(value.x, -100_000, 100_000) ||
++    !isFiniteIntegerInRange(value.y, -100_000, 100_000) ||
++    !isFiniteIntegerInRange(value.width, 1, 20_000) ||
++    !isFiniteIntegerInRange(value.height, 1, 20_000)
++  ) {
++    return undefined;
++  }
++  return {
++    x: value.x,
++    y: value.y,
++    width: value.width,
++    height: value.height,
++  };
++}
++
++function isBoundedString(
++  value: unknown,
++  maximumBytes: number
++): value is string {
++  return (
++    typeof value === 'string' &&
++    Buffer.byteLength(value, 'utf8') <= maximumBytes
++  );
++}
++
++export function parseMaoyiControlCommand(
++  value: unknown
++): MaoyiControlCommand | undefined {
++  if (!isRecord(value) || typeof value.type !== 'string') {
++    return undefined;
++  }
++
++  switch (value.type) {
++    case 'hello':
++      if (
++        hasOnlyKeys(value, ['type', 'appId', 'at']) &&
++        isBoundedString(value.appId, 160) &&
++        isFiniteIntegerInRange(value.at, 0, Number.MAX_SAFE_INTEGER)
++      ) {
++        return { type: 'hello', appId: value.appId, at: value.at };
++      }
++      return undefined;
++    case 'heartbeat.ack':
++      if (
++        hasOnlyKeys(value, ['type', 'at']) &&
++        isFiniteIntegerInRange(value.at, 0, Number.MAX_SAFE_INTEGER)
++      ) {
++        return { type: 'heartbeat.ack', at: value.at };
++      }
++      return undefined;
++    case 'window.show': {
++      if (!hasOnlyKeys(value, ['type', 'bounds'])) {
++        return undefined;
++      }
++      if (value.bounds == null) {
++        return { type: 'window.show' };
++      }
++      const bounds = parseBounds(value.bounds);
++      return bounds ? { type: 'window.show', bounds } : undefined;
++    }
++    case 'window.focus':
++    case 'window.hide':
++    case 'shutdown':
++      return hasOnlyKeys(value, ['type'])
++        ? ({ type: value.type } as MaoyiControlCommand)
++        : undefined;
++    case 'window.bounds-changed': {
++      if (!hasOnlyKeys(value, ['type', 'bounds'])) {
++        return undefined;
++      }
++      const bounds = parseBounds(value.bounds);
++      return bounds ? { type: 'window.bounds-changed', bounds } : undefined;
++    }
++    case 'protocol.open': {
++      if (
++        !hasOnlyKeys(value, ['type', 'url', 'requestId']) ||
++        !isBoundedString(value.url, 4_096) ||
++        !/^(?:sgnl|signalcaptcha):/i.test(value.url) ||
++        (value.requestId != null && !isBoundedString(value.requestId, 160))
++      ) {
++        return undefined;
++      }
++      return {
++        type: 'protocol.open',
++        url: value.url,
++        requestId:
++          typeof value.requestId === 'string' ? value.requestId : undefined,
++      };
++    }
++    case 'script.execute':
++      if (
++        hasOnlyKeys(value, ['type', 'requestId', 'script']) &&
++        isBoundedString(value.requestId, 160) &&
++        isBoundedString(value.script, 900 * 1024)
++      ) {
++        return {
++          type: 'script.execute',
++          requestId: value.requestId,
++          script: value.script,
++        };
++      }
++      return undefined;
++    default:
++      return undefined;
++  }
++}
++
++function controlMac(key: Buffer, values: ReadonlyArray<unknown>): string {
++  return createHmac('sha256', key)
++    .update(JSON.stringify(values))
++    .digest('base64url');
++}
++
++function constantTimeBase64UrlEqual(
++  actual: unknown,
++  expected: string
++): boolean {
++  if (typeof actual !== 'string') {
++    return false;
++  }
++  try {
++    const actualBuffer = Buffer.from(actual, 'base64url');
++    const expectedBuffer = Buffer.from(expected, 'base64url');
++    return (
++      actualBuffer.length === expectedBuffer.length &&
++      timingSafeEqual(actualBuffer, expectedBuffer)
++    );
++  } catch {
++    return false;
++  }
++}
++
++export function parseMaoyiAuthChallenge(
++  raw: string,
++  expectedAppId: string
++): MaoyiAuthChallenge | undefined {
++  if (Buffer.byteLength(raw, 'utf8') > maoyiControlMaxMessageBytes) {
++    return undefined;
++  }
++  try {
++    const value = JSON.parse(raw) as unknown;
++    if (
++      !isRecord(value) ||
++      !hasOnlyKeys(value, ['type', 'appId', 'challenge']) ||
++      value.type !== 'auth.challenge' ||
++      value.appId !== expectedAppId ||
++      typeof value.challenge !== 'string' ||
++      !/^[A-Za-z0-9_-]{43}$/.test(value.challenge) ||
++      Buffer.from(value.challenge, 'base64url').length !== 32
++    ) {
++      return undefined;
++    }
++    return {
++      type: 'auth.challenge',
++      appId: value.appId,
++      challenge: value.challenge,
++    };
++  } catch {
++    return undefined;
++  }
++}
++
++export function createMaoyiAuthResponse(
++  key: Buffer,
++  appId: string,
++  processId: number,
++  challenge: string
++): string {
++  return JSON.stringify({
++    type: 'auth.response',
++    processId,
++    mac: controlMac(key, [
++      'maoyi-signal-control-auth-v1',
++      appId,
++      processId,
++      challenge,
++    ]),
++  });
++}
++
++export function createMaoyiSignalEnvelope(
++  key: Buffer,
++  appId: string,
++  processId: number,
++  sequence: number,
++  event: MaoyiControlEvent,
++  now = Date.now()
++): string {
++  const payload: MaoyiControlPayload<MaoyiControlEvent> = {
++    appId,
++    at: now,
++    ...event,
++  };
++  const envelope: MaoyiControlEnvelope<typeof payload> = {
++    version: maoyiControlProtocolVersion,
++    sequence,
++    payload,
++    mac: controlMac(key, [
++      'maoyi-signal-control-message-v1',
++      'signal-to-main',
++      appId,
++      processId,
++      sequence,
++      payload,
++    ]),
++  };
++  return JSON.stringify(envelope);
++}
++
++export function verifyMaoyiLauncherEnvelope(
++  raw: string,
++  key: Buffer,
++  appId: string,
++  processId: number,
++  expectedSequence: number
++): MaoyiControlCommand | undefined {
++  if (Buffer.byteLength(raw, 'utf8') > maoyiControlMaxMessageBytes) {
++    return undefined;
++  }
++  try {
++    const envelope = JSON.parse(raw) as unknown;
++    if (
++      !isRecord(envelope) ||
++      !hasOnlyKeys(envelope, ['version', 'sequence', 'payload', 'mac']) ||
++      envelope.version !== maoyiControlProtocolVersion ||
++      envelope.sequence !== expectedSequence
++    ) {
++      return undefined;
++    }
++    const command = parseMaoyiControlCommand(envelope.payload);
++    if (!command) {
++      return undefined;
++    }
++    const expectedMac = controlMac(key, [
++      'maoyi-signal-control-message-v1',
++      'main-to-signal',
++      appId,
++      processId,
++      expectedSequence,
++      envelope.payload,
++    ]);
++    return constantTimeBase64UrlEqual(envelope.mac, expectedMac)
++      ? command
++      : undefined;
++  } catch {
++    return undefined;
++  }
++}
+diff --git a/app/maoyi/launchContext.main.ts b/app/maoyi/launchContext.main.ts
+index 1fef07b97a5549fc3205e2bb610c4d35ac277e0b..0902f9e3d852c41071afaf88a58ec4eb88227430 100644
+--- a/app/maoyi/launchContext.main.ts
++++ b/app/maoyi/launchContext.main.ts
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ const launchContextKey = Symbol.for('maoyi.signal.launch-context.v1');
++const authorizedLaunchKey = Symbol.for('maoyi.signal.authorized-launch.v1');
+ 
+ export type MaoyiLaunchContext = Readonly<{
+   appId: string;
+@@ -15,6 +16,7 @@ export function setMaoyiLaunchContext(context: MaoyiLaunchContext): void {
+     ...context,
+     controlKey: Buffer.from(context.controlKey),
+   });
++  Reflect.set(globalThis, authorizedLaunchKey, true);
+ }
+ 
+ export function getMaoyiLaunchContext(): MaoyiLaunchContext | undefined {
+@@ -30,5 +32,5 @@ export function takeMaoyiLaunchContext(): MaoyiLaunchContext | undefined {
+ }
+ 
+ export function isMaoyiEmbedLaunch(): boolean {
+-  return getMaoyiLaunchContext() != null;
++  return Reflect.get(globalThis, authorizedLaunchKey) === true;
+ }
+diff --git a/ts/test-node/maoyi/controlProtocol_test.node.ts b/ts/test-node/maoyi/controlProtocol_test.node.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b2c3b7d6d7c299fe61ce1f1a3976db0e5bd156e
+--- /dev/null
++++ b/ts/test-node/maoyi/controlProtocol_test.node.ts
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++import { createHmac, randomBytes } from 'node:crypto';
++
++import {
++  createMaoyiAuthResponse,
++  createMaoyiSignalEnvelope,
++  parseMaoyiAuthChallenge,
++  parseMaoyiControlCommand,
++  verifyMaoyiLauncherEnvelope,
++} from '../../../app/maoyi/controlProtocol.main.ts';
++
++describe('Maoyi typed control protocol', () => {
++  const appId = 'Signal-00000000-0000-4000-8000-000000000001';
++  const processId = 4242;
++  const key = Buffer.alloc(32, 7);
++
++  it('accepts only whitelisted bounded commands', () => {
++    assert.deepEqual(
++      parseMaoyiControlCommand({
++        type: 'window.bounds-changed',
++        bounds: { x: 10, y: 20, width: 800, height: 600 },
++      }),
++      {
++        type: 'window.bounds-changed',
++        bounds: { x: 10, y: 20, width: 800, height: 600 },
++      }
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'window.bounds-changed',
++        bounds: { x: 10.5, y: 20, width: 800, height: 600 },
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({ type: 'window.hide', extra: true }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({ type: 'unknown.command' }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'script.execute',
++        requestId: 'request',
++        script: 'x'.repeat(900 * 1024 + 1),
++      }),
++      undefined
++    );
++  });
++
++  it('binds authentication to app id, process id, and challenge', () => {
++    const challenge = randomBytes(32).toString('base64url');
++    const parsed = parseMaoyiAuthChallenge(
++      JSON.stringify({ type: 'auth.challenge', appId, challenge }),
++      appId
++    );
++    assert.deepEqual(parsed, { type: 'auth.challenge', appId, challenge });
++    assert.equal(
++      parseMaoyiAuthChallenge(
++        JSON.stringify({
++          type: 'auth.challenge',
++          appId: `${appId}-other`,
++          challenge,
++        }),
++        appId
++      ),
++      undefined
++    );
++    const response = JSON.parse(
++      createMaoyiAuthResponse(key, appId, processId, challenge)
++    ) as { mac: string };
++    const expectedMac = createHmac('sha256', key)
++      .update(
++        JSON.stringify([
++          'maoyi-signal-control-auth-v1',
++          appId,
++          processId,
++          challenge,
++        ])
++      )
++      .digest('base64url');
++    assert.equal(response.mac, expectedMac);
++  });
++
++  it('rejects tampering and replayed launcher envelopes', () => {
++    const payload = { type: 'window.hide' };
++    const sequence = 1;
++    const mac = createHmac('sha256', key)
++      .update(
++        JSON.stringify([
++          'maoyi-signal-control-message-v1',
++          'main-to-signal',
++          appId,
++          processId,
++          sequence,
++          payload,
++        ])
++      )
++      .digest('base64url');
++    const raw = JSON.stringify({ version: 1, sequence, payload, mac });
++    assert.deepEqual(
++      verifyMaoyiLauncherEnvelope(raw, key, appId, processId, 1),
++      payload
++    );
++    assert.equal(
++      verifyMaoyiLauncherEnvelope(raw, key, appId, processId, 2),
++      undefined
++    );
++    assert.equal(
++      verifyMaoyiLauncherEnvelope(
++        JSON.stringify({
++          version: 1,
++          sequence,
++          payload: { type: 'window.focus' },
++          mac,
++        }),
++        key,
++        appId,
++        processId,
++        1
++      ),
++      undefined
++    );
++
++    const signalEnvelope = JSON.parse(
++      createMaoyiSignalEnvelope(
++        key,
++        appId,
++        processId,
++        1,
++        { type: 'heartbeat', visible: false },
++        1_800_000_000_000
++      )
++    ) as { sequence: number; payload: unknown; mac: string };
++    const signalExpectedMac = createHmac('sha256', key)
++      .update(
++        JSON.stringify([
++          'maoyi-signal-control-message-v1',
++          'signal-to-main',
++          appId,
++          processId,
++          signalEnvelope.sequence,
++          signalEnvelope.payload,
++        ])
++      )
++      .digest('base64url');
++    assert.equal(signalEnvelope.mac, signalExpectedMac);
++  });
++});

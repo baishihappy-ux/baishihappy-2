@@ -1,4 +1,32 @@
 export type Platform = 'whatsapp' | 'telegram-a' | 'telegram-k' | 'signal';
+export type WorkspaceApp = 'whatsapp' | 'telegram' | 'signal';
+export type LastActiveProfileIds = Record<WorkspaceApp, string | null>;
+
+export const legacyWhatsAppChrome130UserAgent =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
+export function buildWindowsChromiumUserAgent(chromiumVersion: string) {
+  const match = /^([1-9]\d{0,3})\.\d+\.\d+\.\d+$/.exec(chromiumVersion);
+  if (!match) throw new Error('Chromium runtime version is invalid.');
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${match[1]}.0.0.0 Safari/537.36`;
+}
+
+export function resolveProfileUserAgent(
+  platform: Platform,
+  configuredUserAgent: unknown,
+  platformDefault: string
+) {
+  if (typeof configuredUserAgent !== 'string' || !configuredUserAgent.trim()) {
+    return platformDefault;
+  }
+  if (
+    platform === 'whatsapp' &&
+    configuredUserAgent === legacyWhatsAppChrome130UserAgent
+  ) {
+    return platformDefault;
+  }
+  return configuredUserAgent;
+}
 
 export type PlatformInfo = {
   platform: Platform;
@@ -38,8 +66,168 @@ export type ChatProfile = {
 export type AppConfig = {
   profiles: ChatProfile[];
   activeProfileId: string | null;
+  profileTabOrder: string[];
+  lastActiveProfileIds: LastActiveProfileIds;
   deepseekModel: string;
 };
+
+export function workspaceAppForPlatform(platform: Platform): WorkspaceApp {
+  if (platform === 'whatsapp') return 'whatsapp';
+  if (platform === 'signal') return 'signal';
+  return 'telegram';
+}
+
+export function defaultProfileTabOrder(profiles: ChatProfile[]) {
+  const result: string[] = [];
+  for (const app of ['whatsapp', 'telegram', 'signal'] as const) {
+    const appProfiles = profiles.filter((profile) => workspaceAppForPlatform(profile.platform) === app);
+    const groupOrder = new Map<string, number>();
+    for (const profile of appProfiles) {
+      const group = profile.group.trim() || '本组';
+      if (!groupOrder.has(group)) groupOrder.set(group, groupOrder.size);
+    }
+    appProfiles.sort((left, right) => {
+      const leftGroup = left.group.trim() || '本组';
+      const rightGroup = right.group.trim() || '本组';
+      const groupDifference = (groupOrder.get(leftGroup) ?? 0) - (groupOrder.get(rightGroup) ?? 0);
+      return groupDifference || left.createdAt - right.createdAt || left.id.localeCompare(right.id);
+    });
+    result.push(...appProfiles.map((profile) => profile.id));
+  }
+  return result;
+}
+
+export function sanitizeProfileTabOrder(profiles: ChatProfile[], rawOrder: unknown) {
+  const validIds = new Set(profiles.map((profile) => profile.id));
+  const seen = new Set<string>();
+  const result: string[] = [];
+  if (Array.isArray(rawOrder)) {
+    for (const value of rawOrder) {
+      if (typeof value !== 'string' || !validIds.has(value) || seen.has(value)) continue;
+      seen.add(value);
+      result.push(value);
+    }
+  }
+  for (const id of defaultProfileTabOrder(profiles)) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push(id);
+  }
+  return result;
+}
+
+export function sanitizeLastActiveProfileIds(
+  profiles: ChatProfile[],
+  rawState: unknown,
+  activeProfileId: string | null,
+  profileTabOrder: string[]
+): LastActiveProfileIds {
+  const source = rawState && typeof rawState === 'object'
+    ? rawState as Partial<Record<WorkspaceApp, unknown>>
+    : {};
+  const byId = new Map(profiles.map((profile) => [profile.id, profile]));
+  const activeProfile = activeProfileId ? byId.get(activeProfileId) : undefined;
+  const result = {} as LastActiveProfileIds;
+  for (const app of ['whatsapp', 'telegram', 'signal'] as const) {
+    const candidate = typeof source[app] === 'string' ? source[app] : null;
+    const candidateProfile = candidate ? byId.get(candidate) : undefined;
+    if (candidateProfile && workspaceAppForPlatform(candidateProfile.platform) === app) {
+      result[app] = candidate;
+      continue;
+    }
+    if (activeProfile && workspaceAppForPlatform(activeProfile.platform) === app) {
+      result[app] = activeProfile.id;
+      continue;
+    }
+    result[app] = profileTabOrder.find((id) => {
+      const profile = byId.get(id);
+      return profile && workspaceAppForPlatform(profile.platform) === app;
+    }) ?? null;
+  }
+  return result;
+}
+
+export type SignalTranslationAcceptancePolicy = {
+  legacyBubbleEnabled: boolean;
+  composerEnabled: boolean;
+};
+
+export function signalTranslationAcceptancePolicy(
+  platform: Platform,
+  _sourceOnlyAcceptance = false
+): SignalTranslationAcceptancePolicy {
+  return {
+    // Signal v8.18.0 renders translations and its refresh control in the
+    // source-owned message component. Never install the former DOM bubble
+    // scanner/injector alongside it. Composer translation remains bridged
+    // until that workflow is migrated into the Signal source separately.
+    legacyBubbleEnabled: platform !== 'signal',
+    composerEnabled: true
+  };
+}
+
+export const signalSourceOnlyAcceptanceStages = [
+  'mode-active',
+  'conversation-envelope-received',
+  'conversation-invalid',
+  'conversation-rejected-cache-context',
+  'conversation-active',
+  'message-envelope-received',
+  'message-invalid',
+  'message-received',
+  'message-rejected-cache-context',
+  'message-rejected-active-conversation',
+  'message-accepted',
+  'queue-accepted',
+  'queue-rejected',
+  'cache-lookup',
+  'cache-hit',
+  'api-start',
+  'api-success',
+  'cache-saved',
+  'snapshot-request-sent',
+  'visible-batch-accepted',
+  'trigger-result-sent',
+  'result-applied',
+  'completed',
+  'retry-scheduled',
+  'failed'
+] as const;
+
+export type SignalSourceOnlyAcceptanceStage =
+  (typeof signalSourceOnlyAcceptanceStages)[number];
+
+export type SignalSourceOnlyAcceptanceStageCounts = Record<
+  SignalSourceOnlyAcceptanceStage,
+  number
+>;
+
+export function buildSignalSourceOnlyAcceptanceDiagnostic(
+  stage: SignalSourceOnlyAcceptanceStage,
+  stageCounts: SignalSourceOnlyAcceptanceStageCounts,
+  elapsedMs: number
+) {
+  const boundedInteger = (value: number, maximum: number) =>
+    Math.max(0, Math.min(maximum, Number.isSafeInteger(value) ? value : 0));
+  const stages = Object.fromEntries(
+    signalSourceOnlyAcceptanceStages.map((stageName) => [
+      stageName,
+      boundedInteger(stageCounts[stageName], 1_000_000)
+    ])
+  ) as SignalSourceOnlyAcceptanceStageCounts;
+  return {
+    schemaVersion: 1,
+    type: 'source-only-acceptance-summary',
+    baseline: '8.18.0',
+    patchSetSha256: 'E25AA0F8308BF5DB04A41D3ED12E4F717884AFCC118BA639786A3AE523C7D1D6',
+    mode: 'source-only',
+    legacyBubbleEnabled: false,
+    composerEnabled: true,
+    elapsedMs: boundedInteger(elapsedMs, 24 * 60 * 60 * 1000),
+    lastStage: stage,
+    stages
+  } as const;
+}
 
 export type MemoryStatus = {
   totalBytes: number;
@@ -179,6 +367,23 @@ export type LockScreenStatus = {
   lockedUntil: number;
   failedAttempts: number;
   maxAttempts: number;
+  requiresUpgrade: boolean;
+};
+
+export type NetworkOfflineCheckResult = {
+  offline: boolean;
+  checkedAt: number;
+  reason?: string;
+};
+
+export type LockScreenPinChangeMode = 'setup' | 'reset' | 'upgrade';
+
+export type LockScreenPinChangeAuthorizationResult = {
+  ok: boolean;
+  token?: string;
+  expiresAt?: number;
+  reason?: string;
+  status: LockScreenStatus;
 };
 
 export type LockScreenSetPinResult = {
@@ -192,6 +397,66 @@ export type LockScreenUnlockResult = {
   reason?: string;
   status: LockScreenStatus;
 };
+
+export function sanitizeComposerEnglishTranslation(value: string) {
+  return value
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, '')
+    .replace(/[，、；：]/g, ',')
+    .replace(/？/g, '?')
+    .replace(/！/g, '!')
+    .replace(/\?{2,}/g, '?')
+    .replace(/[。．]/g, '.')
+    .replace(/；/g, ';')
+    .replace(/—/g, '-')
+    .replace(/…/g, '...')
+    .replace(/[“”‘’]/g, '')
+    .split(/\r?\n/)
+    .map(line =>
+      line
+        .replace(/\s*,\s*/g, ', ')
+        .replace(/,{2,}/g, ',')
+        .replace(/[\t ]{2,}/g, ' ')
+        .trim()
+    )
+    .join('\n')
+    .trim();
+}
+
+export function restoreComposerEnglishLayout(
+  source: string,
+  translated: string
+) {
+  const sourceLines = source.replace(/\r\n?/g, '\n').split('\n');
+  const translatedLines = translated
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .filter(line => line.trim());
+  const sourceTextLines = sourceLines.filter(line => line.trim());
+  if (sourceTextLines.length !== translatedLines.length) return translated;
+  let translatedIndex = 0;
+  return sourceLines
+    .map(sourceLine => {
+      if (!sourceLine.trim()) return '';
+      let line = translatedLines[translatedIndex++]?.trim() || '';
+      if (/[？?]\s*$/.test(sourceLine)) {
+        line = /\?+\s*$/.test(line)
+          ? line.replace(/\?+\s*$/, '?')
+          : `${line}?`;
+      }
+      return line;
+    })
+    .join('\n')
+    .trim();
+}
+
+export function isTransientSignalScriptGateError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return (
+    message.includes('Workspace is locked.') ||
+    message.includes('Signal script execution is unavailable while locked') ||
+    message.includes('Signal control channel is not connected')
+  );
+}
 
 export type ClientAuthorizationState =
   | 'development'
@@ -227,6 +492,7 @@ export type ElectronApi = {
   getClientAuthorizationStatus: () => Promise<ClientAuthorizationStatus>;
   setClientUsername: (username: string) => Promise<ClientAuthorizationResult>;
   activateClientLicense: (licenseCode: string) => Promise<ClientAuthorizationResult>;
+  replaceClientLicense: (licenseCode: string) => Promise<ClientAuthorizationResult>;
   copyClientMachineInfo: () => Promise<ClientAuthorizationResult>;
   getConfig: () => Promise<AppConfig>;
   isPackaged: () => Promise<boolean>;
@@ -236,6 +502,7 @@ export type ElectronApi = {
   renameProfile: (id: string, name: string, group: string) => Promise<AppConfig>;
   removeProfile: (id: string) => Promise<AppConfig>;
   launchSignalProfile: (id: string) => Promise<{ pid: number | null; dataDir: string; wsPort?: number; recovered?: boolean }>;
+  getSignalSourceOnlyAcceptance: () => Promise<boolean>;
   setSignalWorkspaceBounds: (id: string, bounds: SignalWorkspaceBounds) => Promise<void>;
   hideSignalProfile: (id: string) => Promise<void>;
   stopSignalProfile: (id: string) => Promise<void>;
@@ -251,7 +518,10 @@ export type ElectronApi = {
   markNonEnglishContact: (request: NonEnglishContactRequest) => Promise<void>;
   getMemoryStatus: () => Promise<MemoryStatus>;
   getLockScreenStatus: () => Promise<LockScreenStatus>;
-  setLockScreenPin: (pin: string) => Promise<LockScreenSetPinResult>;
+  engageLockScreen: () => Promise<void>;
+  checkNetworkOffline: () => Promise<NetworkOfflineCheckResult>;
+  authorizeLockScreenPinChange: (mode: LockScreenPinChangeMode) => Promise<LockScreenPinChangeAuthorizationResult>;
+  setLockScreenPin: (pin: string, token: string) => Promise<LockScreenSetPinResult>;
   unlockLockScreen: (pin: string) => Promise<LockScreenUnlockResult>;
   setWindowTheme: (theme: 'blackGold' | 'pink') => Promise<void>;
   readClipboardText: () => Promise<string>;

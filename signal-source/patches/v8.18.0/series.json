@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "baseline": "8.18.0",
+  "patches": [
+    {
+      "file": "0001-maoyi-launcher-startup-guard.patch",
+      "sha256": "DE7BAEA1511C856AA4681F9F1689701D414FC67371C716656902640685C9136A"
+    },
+    {
+      "file": "0002-maoyi-typed-control-bridge.patch",
+      "sha256": "E4268FA2FAE0FBAEEA6ABF463C5A91CACD0F917E43C82211DA30DF76DB83B632"
+    },
+    {
+      "file": "0003-maoyi-window-security-controller.patch",
+      "sha256": "78CDC75C460C6CC398585FCECF51FD74556F01E32CBC37E3D4D22C337E0685CD"
+    },
+    {
+      "file": "0004-maoyi-source-translation-cache-bridge.patch",
+      "sha256": "E1A261466D7D9F6C38896C7236C9E27067871320123F0BE86EE00A09ADF8F7A8"
+    },
+    {
+      "file": "0005-maoyi-realtime-message-translation.patch",
+      "sha256": "43B1CBDDF3E1A9C5CDBD0B03EAA33BC464D63A214880D26F495045635823DFD6"
+    },
+    {
+      "file": "0006-maoyi-source-bubble-refresh.patch",
+      "sha256": "1E124603EC29EFE3F4B4090D70DCC9F891F48D253C5ED174CD6668B0B4A8E7A6"
+    },
+    {
+      "file": "0007-maoyi-incoming-auto-translation-stability.patch",
+      "sha256": "F260FAC184A6080E4055CF2BEA8205987841430B8DCF4E834DD0081594656B02"
+    }
+  ]
+}

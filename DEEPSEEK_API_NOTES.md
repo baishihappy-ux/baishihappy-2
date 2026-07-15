@@ -75,7 +75,7 @@
 
 - API Key 不写入仓库文件。
 - 开发阶段写入本机 `config.json`。
-- 配置文件位置：`%APPDATA%\maoyi\config.json`
+- 配置文件位置：`C:\Users\admin\AppData\Roaming\chat-translator\config.json`
 - 字段名：`deepseekApiKey`
 
 ## 后续聊天翻译接入

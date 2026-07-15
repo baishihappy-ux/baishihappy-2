@@ -2,7 +2,7 @@
 
 ## Product Boundary
 
-- The client has no maoyi server dependency and requires no online licensing server.
+- The client has no Maoyi server dependency and requires no online licensing server.
 - The client calls the configured translation service directly.
 - For client-only sales, the supplier retains the issuer and creates licenses for the customer.
 - A full-suite sale delivers only the client installer, license issuer, and encrypted issuing key. Source code is not included.
@@ -98,13 +98,15 @@ The payload includes at least:
 - Authorized days
 - Enabled features
 
-The current license text uses the `MYLIC2` prefix. For every license, the issuer generates an ephemeral X25519 key, combines it with the device X25519 public key carried by the machine request code, derives an AES-256-GCM key through HKDF-SHA256, and signs the complete encrypted envelope with the suite Ed25519 private key.
+The current license text uses the `DFLIC2` prefix. For every license, the issuer generates an ephemeral X25519 key, combines it with the device X25519 public key carried by the machine request code, derives an AES-256-GCM key through HKDF-SHA256, and signs the complete encrypted envelope with the suite Ed25519 private key.
 
 The license-code text must not be readable JSON plaintext. When a customer opens the license code or `license.dat` with a text editor, they must only see encrypted license text, not the secret, machine code, username, expiration date, or feature list.
 
 ## Issuer Startup Protection
 
 - On first launch, the issuer must require creating the issuer startup password.
+- A packaged issuer must isolate its state, password vault, failure count, and lockout time under `AppData/Roaming/MAOYI AUTHORIZER/<suiteId>/`. It must never reuse the client data directory or share state across suites.
+- The embedded `suiteId`, `keyId`, and public-key SHA-256 must match the unlocked vault before issuance is allowed.
 - During first password setup, show: "This password protects the license issuer. Please remember it. If the password is lost, the issuer cannot be opened."
 - `scrypt` derives the startup-password key without storing plaintext. Fixed parameters are `N=131072`, `r=8`, `p=1`, and a random 32-byte salt.
 - AES-256-GCM encrypts the signing key and suite configuration; Windows DPAPI protects the complete outer envelope.
@@ -138,9 +140,8 @@ Consecutive failure lockout ladder:
 ## Upgrading a Delivered Suite
 
 - An upgrade for an existing customer is not a new-suite generation and does not consume a new suite ID.
-- A `003` customer upgrade must reuse suite `183105912`'s original `suiteId`, `keyId`, and complete key pair.
-- Never regenerate keys from the same numeric ID; a new key pair cannot validate the existing `license.dat`.
-- Replace program files only, preserving the storage pointer, authorization, device identity, profiles, and all three platform login states.
-- The first encrypted-cache release does not migrate plaintext translations. It removes only `TranslationCache` and `df.translation.renderCache.*`, then writes a one-time cleanup marker.
+- Suite `003` is retired. No legacy upgrade package, in-place upgrade, license reissue, or data migration will be provided; installed users must discontinue that version.
+- The next delivery suite is named `006`. `006` is a delivery name, not a nine-digit `suiteId`, and must never be used in place of the suite ID.
+- Treat `006` as a completely new suite. When packaging actually begins, permanently consume a fresh nine-digit suite ID and generate an independent `suiteId`, `keyId`, and complete key pair. Never reuse suite `003` / `183105912` key material.
+- Never deliver `006` as an overwrite upgrade for `003`. The `003` storage pointer, authorization, device identity, profiles, and three-platform login states are outside any upgrade-migration commitment.
 - Deliveries to new customers still consume a new suite ID permanently and generate an independent key pair.
-- When suite `003` moves from legacy `DFLIC1` to `MYLIC2`, its original suite key must issue one replacement license code. The suite ID and keys stay unchanged, but the legacy license text is not accepted by the new format.

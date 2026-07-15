@@ -14,7 +14,9 @@ module.exports = async function hardenElectronPackage(context) {
     [FuseV1Options.EnableNodeCliInspectArguments]: false,
     [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: true,
     [FuseV1Options.OnlyLoadAppFromAsar]: true,
-    [FuseV1Options.LoadBrowserProcessSpecificV8Snapshot]: true,
+    // Keep this disabled unless browser_v8_context_snapshot.bin is generated and packaged.
+    // Enabling the fuse without that file makes Electron exit before app JavaScript runs.
+    [FuseV1Options.LoadBrowserProcessSpecificV8Snapshot]: false,
     [FuseV1Options.GrantFileProtocolExtraPrivileges]: false,
     [FuseV1Options.WasmTrapHandlers]: true
   });

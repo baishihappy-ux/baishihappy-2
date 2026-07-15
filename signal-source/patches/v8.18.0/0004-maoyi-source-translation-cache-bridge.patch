@@ -1,0 +1,3811 @@
+diff --git a/app/maoyi/bootstrap.main.ts b/app/maoyi/bootstrap.main.ts
+index b8eccb4ea36c7a4a575abcc8e7b84569e2354058..7efdfd9deed792f8da06be193fef60a4ad2fe508 100644
+--- a/app/maoyi/bootstrap.main.ts
++++ b/app/maoyi/bootstrap.main.ts
+@@ -7,13 +7,19 @@ import { app, dialog } from 'electron';
+ 
+ import { startMaoyiControlBridge } from './controlBridge.main.ts';
+ import { runMaoyiStartupGuard } from './launchGuard.main.ts';
++import { startMaoyiMessageBridge } from './messageBridge.main.ts';
+ import { startMaoyiWindowController } from './windowController.main.ts';
+ 
+ try {
+   if (runMaoyiStartupGuard(app, dialog)) {
+     const controlBridge = startMaoyiControlBridge();
+     const windowController = startMaoyiWindowController(controlBridge);
++    const messageBridge = startMaoyiMessageBridge(
++      controlBridge,
++      windowController
++    );
+     app.once('before-quit', () => {
++      messageBridge.stop();
+       windowController.stop();
+       controlBridge.stop();
+     });
+diff --git a/app/maoyi/controlProtocol.node.ts b/app/maoyi/controlProtocol.node.ts
+index ebc9dceec94d1bd92a2d15cc12a9cd6857bff657..426f6248c71d742b551d6ecdc19dc164786f2880 100644
+--- a/app/maoyi/controlProtocol.node.ts
++++ b/app/maoyi/controlProtocol.node.ts
+@@ -5,9 +5,16 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
+ 
+ export const maoyiControlProtocolVersion = 1;
+ export const maoyiControlMaxMessageBytes = 1024 * 1024;
++export const maoyiControlMaxBusinessPayloadBytes = 768 * 1024;
++export const maoyiControlMaxBatchItems = 100;
++export const maoyiControlMaxTextBytes = 64 * 1024;
+ export const maoyiControlHeartbeatMs = 5_000;
+ export const maoyiControlReconnectMs = 1_000;
+ 
++const maoyiUuidPattern =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++const maoyiSourceHashPattern = /^(?:0|[1-9a-z][0-9a-z]{0,6})$/;
++
+ export type MaoyiWindowBounds = Readonly<{
+   x: number;
+   y: number;
+@@ -15,6 +22,25 @@ export type MaoyiWindowBounds = Readonly<{
+   height: number;
+ }>;
+ 
++export type MaoyiMessageDirection = 'incoming' | 'outgoing';
++
++export type MaoyiVisibleMessage = Readonly<{
++  conversationId: string;
++  messageId: string;
++  sourceHash: string;
++  sourceText: string;
++  direction: MaoyiMessageDirection;
++  timestamp: number;
++}>;
++
++export type MaoyiTranslationCacheResult = Readonly<{
++  conversationId: string;
++  messageId: string;
++  sourceHash: string;
++  sourceText: string;
++  translatedText: string;
++}>;
++
+ export type MaoyiControlCommand =
+   | Readonly<{ type: 'hello'; appId: string; at: number }>
+   | Readonly<{ type: 'heartbeat.ack'; at: number }>
+@@ -37,6 +63,13 @@ export type MaoyiControlCommand =
+     }>
+   | Readonly<{ type: 'protocol.open'; url: string; requestId?: string }>
+   | Readonly<{ type: 'shutdown' }>
++  | Readonly<{ type: 'message.snapshot.request'; requestId: string }>
++  | Readonly<{
++      type: 'translation.cacheResultBatch';
++      requestId: string;
++      conversationId: string;
++      results: ReadonlyArray<MaoyiTranslationCacheResult>;
++    }>
+   | Readonly<{ type: 'script.execute'; requestId: string; script: string }>;
+ 
+ export type MaoyiControlEvent =
+@@ -66,6 +99,18 @@ export type MaoyiControlEvent =
+     }>
+   | Readonly<{ type: 'shutdown.ack' }>
+   | Readonly<{ type: 'protocol.opened'; requestId?: string }>
++  | Readonly<{ type: 'conversation.changed'; conversationId: string }>
++  | Readonly<{
++      type: 'message.visibleBatch';
++      requestId: string;
++      conversationId: string;
++      messages: ReadonlyArray<MaoyiVisibleMessage>;
++    }>
++  | Readonly<{
++      type: 'translation.cacheResultApplied';
++      requestId: string;
++      appliedCount: number;
++    }>
+   | Readonly<{ type: 'script.result'; requestId: string; result: unknown }>
+   | Readonly<{ type: 'error'; requestId?: string; message: string }>
+   | Readonly<{ type: 'transport.error'; code: string }>;
+@@ -144,6 +189,127 @@ function isBoundedString(
+   );
+ }
+ 
++export function isMaoyiControlUuid(value: unknown): value is string {
++  return typeof value === 'string' && maoyiUuidPattern.test(value);
++}
++
++export function isMaoyiControlSourceHash(value: unknown): value is string {
++  return typeof value === 'string' && maoyiSourceHashPattern.test(value);
++}
++
++export function isMaoyiControlBusinessPayloadWithinLimit(
++  value: unknown
++): boolean {
++  try {
++    const serialized = JSON.stringify(value);
++    return (
++      typeof serialized === 'string' &&
++      Buffer.byteLength(serialized, 'utf8') <=
++        maoyiControlMaxBusinessPayloadBytes
++    );
++  } catch {
++    return false;
++  }
++}
++
++function isMaoyiControlText(value: unknown): value is string {
++  return (
++    typeof value === 'string' &&
++    Buffer.byteLength(value, 'utf8') > 0 &&
++    Buffer.byteLength(value, 'utf8') <= maoyiControlMaxTextBytes
++  );
++}
++
++function parseVisibleMessage(
++  value: unknown,
++  expectedConversationId: string
++): MaoyiVisibleMessage | undefined {
++  if (
++    !isRecord(value) ||
++    !hasOnlyKeys(value, [
++      'conversationId',
++      'messageId',
++      'sourceHash',
++      'sourceText',
++      'direction',
++      'timestamp',
++    ]) ||
++    value.conversationId !== expectedConversationId ||
++    !isMaoyiControlUuid(value.conversationId) ||
++    !isMaoyiControlUuid(value.messageId) ||
++    !isMaoyiControlSourceHash(value.sourceHash) ||
++    !isMaoyiControlText(value.sourceText) ||
++    (value.direction !== 'incoming' && value.direction !== 'outgoing') ||
++    !isFiniteIntegerInRange(value.timestamp, 0, Number.MAX_SAFE_INTEGER)
++  ) {
++    return undefined;
++  }
++  return {
++    conversationId: value.conversationId,
++    messageId: value.messageId,
++    sourceHash: value.sourceHash,
++    sourceText: value.sourceText,
++    direction: value.direction,
++    timestamp: value.timestamp,
++  };
++}
++
++function parseTranslationCacheResult(
++  value: unknown,
++  expectedConversationId: string
++): MaoyiTranslationCacheResult | undefined {
++  if (
++    !isRecord(value) ||
++    !hasOnlyKeys(value, [
++      'conversationId',
++      'messageId',
++      'sourceHash',
++      'sourceText',
++      'translatedText',
++    ]) ||
++    value.conversationId !== expectedConversationId ||
++    !isMaoyiControlUuid(value.conversationId) ||
++    !isMaoyiControlUuid(value.messageId) ||
++    !isMaoyiControlSourceHash(value.sourceHash) ||
++    !isMaoyiControlText(value.sourceText) ||
++    !isMaoyiControlText(value.translatedText)
++  ) {
++    return undefined;
++  }
++  return {
++    conversationId: value.conversationId,
++    messageId: value.messageId,
++    sourceHash: value.sourceHash,
++    sourceText: value.sourceText,
++    translatedText: value.translatedText,
++  };
++}
++
++function parseStrictBatch<T>(
++  value: unknown,
++  parseItem: (item: unknown) => T | undefined,
++  itemIdentity: (item: T) => string
++): ReadonlyArray<T> | undefined {
++  if (!Array.isArray(value) || value.length > maoyiControlMaxBatchItems) {
++    return undefined;
++  }
++  const parsed: Array<T> = [];
++  const identities = new Set<string>();
++  for (const item of value) {
++    const parsedItem = parseItem(item);
++    if (!parsedItem) {
++      return undefined;
++    }
++    const identity = itemIdentity(parsedItem);
++    if (identities.has(identity)) {
++      return undefined;
++    }
++    identities.add(identity);
++    parsed.push(parsedItem);
++  }
++  return parsed;
++}
++
+ export function parseMaoyiControlCommand(
+   value: unknown
+ ): MaoyiControlCommand | undefined {
+@@ -236,6 +402,47 @@ export function parseMaoyiControlCommand(
+           typeof value.requestId === 'string' ? value.requestId : undefined,
+       };
+     }
++    case 'message.snapshot.request':
++      if (
++        isMaoyiControlBusinessPayloadWithinLimit(value) &&
++        hasOnlyKeys(value, ['type', 'requestId']) &&
++        isMaoyiControlUuid(value.requestId)
++      ) {
++        return {
++          type: 'message.snapshot.request',
++          requestId: value.requestId,
++        };
++      }
++      return undefined;
++    case 'translation.cacheResultBatch': {
++      if (
++        !isMaoyiControlBusinessPayloadWithinLimit(value) ||
++        !hasOnlyKeys(value, [
++          'type',
++          'requestId',
++          'conversationId',
++          'results',
++        ]) ||
++        !isMaoyiControlUuid(value.requestId) ||
++        !isMaoyiControlUuid(value.conversationId)
++      ) {
++        return undefined;
++      }
++      const { conversationId } = value;
++      const results = parseStrictBatch(
++        value.results,
++        item => parseTranslationCacheResult(item, conversationId),
++        item => item.messageId.toLowerCase()
++      );
++      return results
++        ? {
++            type: 'translation.cacheResultBatch',
++            requestId: value.requestId,
++            conversationId,
++            results,
++          }
++        : undefined;
++    }
+     case 'script.execute':
+       if (
+         hasOnlyKeys(value, ['type', 'requestId', 'script']) &&
+@@ -254,6 +461,87 @@ export function parseMaoyiControlCommand(
+   }
+ }
+ 
++export function parseMaoyiMessageControlEvent(value: unknown):
++  | Extract<
++      MaoyiControlEvent,
++      {
++        type:
++          | 'conversation.changed'
++          | 'message.visibleBatch'
++          | 'translation.cacheResultApplied';
++      }
++    >
++  | undefined {
++  if (
++    !isRecord(value) ||
++    typeof value.type !== 'string' ||
++    !isMaoyiControlBusinessPayloadWithinLimit(value)
++  ) {
++    return undefined;
++  }
++
++  switch (value.type) {
++    case 'conversation.changed':
++      if (
++        hasOnlyKeys(value, ['type', 'conversationId']) &&
++        isMaoyiControlUuid(value.conversationId)
++      ) {
++        return {
++          type: 'conversation.changed',
++          conversationId: value.conversationId,
++        };
++      }
++      return undefined;
++    case 'message.visibleBatch': {
++      if (
++        !hasOnlyKeys(value, [
++          'type',
++          'requestId',
++          'conversationId',
++          'messages',
++        ]) ||
++        !isMaoyiControlUuid(value.requestId) ||
++        !isMaoyiControlUuid(value.conversationId)
++      ) {
++        return undefined;
++      }
++      const { conversationId } = value;
++      const messages = parseStrictBatch(
++        value.messages,
++        item => parseVisibleMessage(item, conversationId),
++        item => item.messageId.toLowerCase()
++      );
++      return messages
++        ? {
++            type: 'message.visibleBatch',
++            requestId: value.requestId,
++            conversationId,
++            messages,
++          }
++        : undefined;
++    }
++    case 'translation.cacheResultApplied':
++      if (
++        hasOnlyKeys(value, ['type', 'requestId', 'appliedCount']) &&
++        isMaoyiControlUuid(value.requestId) &&
++        isFiniteIntegerInRange(
++          value.appliedCount,
++          0,
++          maoyiControlMaxBatchItems
++        )
++      ) {
++        return {
++          type: 'translation.cacheResultApplied',
++          requestId: value.requestId,
++          appliedCount: value.appliedCount,
++        };
++      }
++      return undefined;
++    default:
++      return undefined;
++  }
++}
++
+ function controlMac(
+   key: Buffer<ArrayBuffer>,
+   values: ReadonlyArray<unknown>
+diff --git a/app/maoyi/messageBridge.main.ts b/app/maoyi/messageBridge.main.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..321a4bdab889d4e48b52e614a686b00b4e7d61a8
+--- /dev/null
++++ b/app/maoyi/messageBridge.main.ts
+@@ -0,0 +1,438 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import { randomUUID } from 'node:crypto';
++import {
++  ipcMain,
++  type BrowserWindow,
++  type IpcMain,
++  type IpcMainInvokeEvent,
++} from 'electron';
++
++import {
++  getMaoyiControlBridge,
++  type MaoyiControlBridge,
++} from './controlBridge.main.ts';
++import {
++  parseMaoyiMessageControlEvent,
++  type MaoyiControlCommand,
++} from './controlProtocol.node.ts';
++import {
++  getMaoyiWindowController,
++  type MaoyiWindowController,
++} from './windowController.main.ts';
++import {
++  maoyiMessageCommandChannel,
++  maoyiMessageEventChannel,
++  type MaoyiRendererCommand,
++} from '../../ts/maoyi/messageBridgeChannels.std.ts';
++
++const messageBridgeKey = Symbol.for('maoyi.signal.message-bridge.v1');
++
++export const maoyiRequestCorrelationLimit = 128;
++export const maoyiRequestCorrelationTtlMs = 30_000;
++
++type RequestState =
++  | 'snapshot-forwarded'
++  | 'awaiting-result'
++  | 'awaiting-ack'
++  | 'consumed';
++
++type RequestEntry = {
++  state: RequestState;
++  conversationId?: string;
++  surviveConversationChange?: boolean;
++  expiresAt: number;
++};
++
++export class MaoyiRequestLedger {
++  readonly #entries = new Map<string, RequestEntry>();
++  readonly #now: () => number;
++  readonly #limit: number;
++  readonly #ttlMs: number;
++
++  constructor(
++    now: () => number = Date.now,
++    limit = maoyiRequestCorrelationLimit,
++    ttlMs = maoyiRequestCorrelationTtlMs
++  ) {
++    this.#now = now;
++    this.#limit = limit;
++    this.#ttlMs = ttlMs;
++  }
++
++  #prune(): void {
++    const now = this.#now();
++    for (const [requestId, entry] of this.#entries) {
++      if (entry.expiresAt <= now) {
++        this.#entries.delete(requestId);
++      }
++    }
++  }
++
++  #makeRoom(): boolean {
++    this.#prune();
++    if (this.#entries.size < this.#limit) {
++      return true;
++    }
++    for (const [requestId, entry] of this.#entries) {
++      if (entry.state === 'consumed') {
++        this.#entries.delete(requestId);
++        return true;
++      }
++    }
++    return false;
++  }
++
++  beginSnapshot(requestId: string, surviveConversationChange = false): boolean {
++    this.#prune();
++    if (this.#entries.has(requestId) || !this.#makeRoom()) {
++      return false;
++    }
++    this.#entries.set(requestId, {
++      state: 'snapshot-forwarded',
++      surviveConversationChange,
++      expiresAt: this.#now() + this.#ttlMs,
++    });
++    return true;
++  }
++
++  beginVisible(requestId: string, conversationId: string): boolean {
++    this.#prune();
++    const existing = this.#entries.get(requestId);
++    if (existing) {
++      if (existing.state !== 'snapshot-forwarded') {
++        return false;
++      }
++      this.#entries.set(requestId, {
++        state: 'awaiting-result',
++        conversationId,
++        expiresAt: this.#now() + this.#ttlMs,
++      });
++      return true;
++    }
++    if (!this.#makeRoom()) {
++      return false;
++    }
++    this.#entries.set(requestId, {
++      state: 'awaiting-result',
++      conversationId,
++      expiresAt: this.#now() + this.#ttlMs,
++    });
++    return true;
++  }
++
++  acceptResult(requestId: string, conversationId: string): boolean {
++    this.#prune();
++    const existing = this.#entries.get(requestId);
++    if (
++      !existing ||
++      existing.state !== 'awaiting-result' ||
++      existing.conversationId !== conversationId
++    ) {
++      return false;
++    }
++    this.#entries.set(requestId, {
++      state: 'awaiting-ack',
++      conversationId,
++      expiresAt: this.#now() + this.#ttlMs,
++    });
++    return true;
++  }
++
++  acceptAck(requestId: string): boolean {
++    this.#prune();
++    const existing = this.#entries.get(requestId);
++    if (!existing || existing.state !== 'awaiting-ack') {
++      return false;
++    }
++    this.consume(requestId);
++    return true;
++  }
++
++  consume(requestId: string): void {
++    if (!this.#entries.has(requestId)) {
++      return;
++    }
++    this.#entries.set(requestId, {
++      state: 'consumed',
++      expiresAt: this.#now() + this.#ttlMs,
++    });
++  }
++
++  invalidateAll(): void {
++    for (const requestId of this.#entries.keys()) {
++      this.consume(requestId);
++    }
++  }
++
++  invalidateForConversationChange(): void {
++    for (const [requestId, entry] of this.#entries) {
++      if (
++        entry.state === 'snapshot-forwarded' &&
++        entry.surviveConversationChange
++      ) {
++        this.#entries.set(requestId, {
++          ...entry,
++          surviveConversationChange: false,
++        });
++      } else {
++        this.consume(requestId);
++      }
++    }
++  }
++
++  clear(): void {
++    this.#entries.clear();
++  }
++}
++
++export type MaoyiMessageBridge = Readonly<{
++  attachMainWindow: (window: BrowserWindow) => void;
++  stop: () => void;
++}>;
++
++type MaoyiIpcMain = Pick<IpcMain, 'handle' | 'removeHandler'>;
++
++export function getMaoyiMessageBridge(): MaoyiMessageBridge | undefined {
++  return Reflect.get(globalThis, messageBridgeKey) as
++    | MaoyiMessageBridge
++    | undefined;
++}
++
++export function startMaoyiMessageBridge(
++  bridgeArgument?: MaoyiControlBridge,
++  controllerArgument?: MaoyiWindowController,
++  ipcArgument: MaoyiIpcMain = ipcMain
++): MaoyiMessageBridge {
++  const existing = getMaoyiMessageBridge();
++  if (existing) {
++    return existing;
++  }
++
++  const controlBridge = bridgeArgument ?? getMaoyiControlBridge();
++  const windowController = controllerArgument ?? getMaoyiWindowController();
++  if (!controlBridge || !windowController) {
++    throw new Error('Maoyi message bridge dependencies are unavailable');
++  }
++
++  const requestLedger = new MaoyiRequestLedger();
++  let mainWindow: BrowserWindow | undefined;
++  let currentConversationId: string | undefined;
++  let transportAuthenticated = false;
++  let stopped = false;
++
++  const sendRendererCommand = (command: MaoyiRendererCommand): boolean => {
++    if (
++      !mainWindow ||
++      mainWindow.isDestroyed() ||
++      mainWindow.webContents.isDestroyed()
++    ) {
++      return false;
++    }
++    try {
++      mainWindow.webContents.send(maoyiMessageCommandChannel, command);
++      return true;
++    } catch {
++      return false;
++    }
++  };
++
++  const clearRendererRuntime = (): void => {
++    currentConversationId = undefined;
++    requestLedger.invalidateAll();
++    sendRendererCommand({ type: 'translation.runtime.clear' });
++  };
++
++  const canForward = (): boolean =>
++    Boolean(
++      !stopped &&
++      transportAuthenticated &&
++      mainWindow &&
++      !mainWindow.isDestroyed() &&
++      !mainWindow.webContents.isDestroyed() &&
++      mainWindow.isVisible() &&
++      windowController.canExposeWindows()
++    );
++
++  const handleRendererEvent = (
++    event: IpcMainInvokeEvent,
++    value: unknown
++  ): boolean => {
++    if (!mainWindow || event.sender !== mainWindow.webContents) {
++      return false;
++    }
++    if (!canForward()) {
++      clearRendererRuntime();
++      return false;
++    }
++
++    const parsed = parseMaoyiMessageControlEvent(value);
++    if (!parsed) {
++      return false;
++    }
++
++    switch (parsed.type) {
++      case 'conversation.changed': {
++        if (currentConversationId !== parsed.conversationId) {
++          requestLedger.invalidateForConversationChange();
++        }
++        currentConversationId = parsed.conversationId;
++        if (!controlBridge.send(parsed)) {
++          currentConversationId = undefined;
++          return false;
++        }
++        return true;
++      }
++      case 'message.visibleBatch': {
++        if (
++          currentConversationId !== parsed.conversationId ||
++          !requestLedger.beginVisible(parsed.requestId, parsed.conversationId)
++        ) {
++          return false;
++        }
++        if (!controlBridge.send(parsed)) {
++          requestLedger.consume(parsed.requestId);
++          return false;
++        }
++        return true;
++      }
++      case 'translation.cacheResultApplied': {
++        if (!requestLedger.acceptAck(parsed.requestId)) {
++          return false;
++        }
++        return controlBridge.send(parsed);
++      }
++      default:
++        return false;
++    }
++  };
++
++  const handleControlCommand = (command: MaoyiControlCommand): void => {
++    if (command.type === 'security.visibility' && command.locked) {
++      clearRendererRuntime();
++      return;
++    }
++    if (command.type === 'window.hide' || command.type === 'shutdown') {
++      clearRendererRuntime();
++      return;
++    }
++    if (command.type === 'window.show') {
++      if (!canForward()) {
++        clearRendererRuntime();
++        return;
++      }
++      const requestId = randomUUID();
++      if (!requestLedger.beginSnapshot(requestId, true)) {
++        return;
++      }
++      if (
++        !sendRendererCommand({
++          type: 'message.snapshot.request',
++          requestId,
++        })
++      ) {
++        requestLedger.consume(requestId);
++      }
++      return;
++    }
++
++    if (
++      command.type !== 'message.snapshot.request' &&
++      command.type !== 'translation.cacheResultBatch'
++    ) {
++      return;
++    }
++    if (!canForward()) {
++      clearRendererRuntime();
++      return;
++    }
++
++    if (command.type === 'message.snapshot.request') {
++      if (!requestLedger.beginSnapshot(command.requestId)) {
++        return;
++      }
++      if (!sendRendererCommand(command)) {
++        requestLedger.consume(command.requestId);
++      }
++      return;
++    }
++
++    if (
++      currentConversationId !== command.conversationId ||
++      !requestLedger.acceptResult(command.requestId, command.conversationId)
++    ) {
++      return;
++    }
++    if (!sendRendererCommand(command)) {
++      requestLedger.consume(command.requestId);
++    }
++  };
++
++  ipcArgument.handle(maoyiMessageEventChannel, handleRendererEvent);
++  const removeCommandHandler = controlBridge.onCommand(handleControlCommand);
++  const removeTransportHandler = controlBridge.onTransportState(
++    authenticated => {
++      transportAuthenticated = authenticated;
++      if (!authenticated) {
++        clearRendererRuntime();
++      }
++    }
++  );
++
++  let attachedWindow: BrowserWindow | undefined;
++  const handleWindowUnavailable = (): void => {
++    clearRendererRuntime();
++  };
++  const handleWindowClosed = (): void => {
++    clearRendererRuntime();
++    mainWindow = undefined;
++  };
++  const handleRendererLoaded = (): void => {
++    clearRendererRuntime();
++  };
++
++  const removeWindowListeners = (): void => {
++    if (!attachedWindow) {
++      return;
++    }
++    attachedWindow.off('hide', handleWindowUnavailable);
++    attachedWindow.off('closed', handleWindowClosed);
++    if (!attachedWindow.webContents.isDestroyed()) {
++      attachedWindow.webContents.off('did-finish-load', handleRendererLoaded);
++    }
++    attachedWindow = undefined;
++  };
++
++  const messageBridge: MaoyiMessageBridge = Object.freeze({
++    attachMainWindow(window: BrowserWindow) {
++      if (stopped) {
++        return;
++      }
++      clearRendererRuntime();
++      removeWindowListeners();
++      mainWindow = window;
++      attachedWindow = window;
++      window.on('hide', handleWindowUnavailable);
++      window.on('closed', handleWindowClosed);
++      window.webContents.on('did-finish-load', handleRendererLoaded);
++      clearRendererRuntime();
++    },
++    stop() {
++      if (stopped) {
++        return;
++      }
++      stopped = true;
++      clearRendererRuntime();
++      removeWindowListeners();
++      ipcArgument.removeHandler(maoyiMessageEventChannel);
++      removeCommandHandler();
++      removeTransportHandler();
++      mainWindow = undefined;
++      requestLedger.clear();
++      Reflect.deleteProperty(globalThis, messageBridgeKey);
++    },
++  });
++  Reflect.set(globalThis, messageBridgeKey, messageBridge);
++  return messageBridge;
++}
+diff --git a/app/main.main.ts b/app/main.main.ts
+index a7b89bc6d63c9824b5eb7684c7770a67d2318083..0d62cb0bb5d20672c2fec2469d824f81dcc32871 100644
+--- a/app/main.main.ts
++++ b/app/main.main.ts
+@@ -51,6 +51,7 @@ import * as debugLog from '../ts/logging/debuglogs.node.ts';
+ import * as uploadDebugLog from '../ts/logging/uploadDebugLog.node.ts';
+ import { explodePromise } from '../ts/util/explodePromise.std.ts';
+ import { isMaoyiEmbedLaunch } from './maoyi/launchContext.main.ts';
++import { getMaoyiMessageBridge } from './maoyi/messageBridge.main.ts';
+ import { getMaoyiWindowController } from './maoyi/windowController.main.ts';
+ 
+ import './startup_config.main.ts';
+@@ -165,6 +166,7 @@ let mainWindow: BrowserWindow | undefined;
+ let mainWindowCreated = false;
+ let loadingWindow: BrowserWindow | undefined;
+ const maoyiWindowController = getMaoyiWindowController();
++const maoyiMessageBridge = getMaoyiMessageBridge();
+ 
+ // These will be set after app fires the 'ready' event
+ let preferredSystemLocales: Array<string> | undefined;
+@@ -789,6 +791,7 @@ async function createWindow() {
+   // Create the browser window.
+   mainWindow = new BrowserWindow(windowOptions);
+   maoyiWindowController?.attachMainWindow(mainWindow);
++  maoyiMessageBridge?.attachMainWindow(mainWindow);
+   if (isMaoyiEmbedLaunch()) {
+     mainWindow.setMenu(null);
+     mainWindow.setMenuBarVisibility(false);
+diff --git a/stylesheets/_modules.scss b/stylesheets/_modules.scss
+index fc69df6736e2d03b02f72da9b389b251f81e0611..417d140558921f61ce5d1b91c566038057decab8 100644
+--- a/stylesheets/_modules.scss
++++ b/stylesheets/_modules.scss
+@@ -1175,6 +1175,20 @@ $message-padding-horizontal: 12px;
+   color: light-dark(variables.$color-gray-60, variables.$color-gray-25);
+ }
+ 
++.module-message__maoyi-translation {
++  @include mixins.font-body-1;
++
++  border-block-start: 1px solid
++    color-mix(in srgb, currentColor 24%, transparent);
++  color: inherit;
++  margin-block-start: 5px;
++  overflow-wrap: break-word;
++  padding-block-start: 5px;
++  text-align: start;
++  white-space: pre-wrap;
++  word-break: auto-phrase;
++}
++
+ .module-message__metadata {
+   @include mixins.font-caption;
+ 
+diff --git a/ts/components/conversation/Message.dom.tsx b/ts/components/conversation/Message.dom.tsx
+index 009e29b84612ae9f5e4a64fee3566fba9964b024..2c8ed8c30865dfe51614b37f9f510edc495019db 100644
+--- a/ts/components/conversation/Message.dom.tsx
++++ b/ts/components/conversation/Message.dom.tsx
+@@ -219,6 +219,7 @@ export type PropsData = {
+   conversationTitle: string;
+   customColor?: CustomColorType;
+   conversationId: string;
++  maoyiTranslationText?: string;
+   displayLimit?: number;
+   activeCallConversationId?: string;
+   text?: string;
+@@ -804,6 +805,7 @@ export class Message extends PureComponent<Props, State> {
+       attachmentDroppedDueToSize,
+       attachments,
+       deletedForEveryone,
++      maoyiTranslationText,
+       direction,
+       expirationLength,
+       expirationTimestamp,
+@@ -831,6 +833,10 @@ export class Message extends PureComponent<Props, State> {
+       return MetadataPlacement.NotRendered;
+     }
+ 
++    if (maoyiTranslationText) {
++      return MetadataPlacement.Bottom;
++    }
++
+     if (giftBadge) {
+       const description =
+         direction === 'incoming'
+@@ -2539,6 +2545,23 @@ export class Message extends PureComponent<Props, State> {
+     );
+   }
+ 
++  public renderMaoyiTranslation(): JSX.Element | null {
++    const { maoyiTranslationText } = this.props;
++    if (!maoyiTranslationText) {
++      return null;
++    }
++
++    return (
++      <div
++        className="module-message__maoyi-translation"
++        dir="auto"
++        lang="zh-CN"
++      >
++        {maoyiTranslationText}
++      </div>
++    );
++  }
++
+   #shouldShowActionButton(): boolean {
+     const { previews } = this.props;
+ 
+@@ -3112,6 +3135,7 @@ export class Message extends PureComponent<Props, State> {
+         {this.renderPoll()}
+         {this.renderEmbeddedContact()}
+         {this.renderText()}
++        {this.renderMaoyiTranslation()}
+         {this.renderUndownloadableTextAttachment()}
+         {this.#renderAction()}
+         {this.#renderMetadata()}
+diff --git a/ts/components/conversation/TimelineItem.dom.tsx b/ts/components/conversation/TimelineItem.dom.tsx
+index 53a8d790747108eb34947f02222847d4f14567ea..f72a0594cfa957e5e57fa1fc955986236346644f 100644
+--- a/ts/components/conversation/TimelineItem.dom.tsx
++++ b/ts/components/conversation/TimelineItem.dom.tsx
+@@ -208,6 +208,7 @@ export type TimelineItemType = (
+ type PropsLocalType = {
+   containerElementRef: RefObject<HTMLElement | null>;
+   conversationId: string;
++  maoyiTranslationText?: string;
+   getSharedGroupNames: GetSharedGroupNamesType;
+   item?: TimelineItemType;
+   id: string;
+@@ -266,6 +267,7 @@ export type PropsType = PropsLocalType &
+ export const TimelineItem = memo(function TimelineItem({
+   containerElementRef,
+   conversationId,
++  maoyiTranslationText,
+   getPreferredBadge,
+   getSharedGroupNames,
+   i18n,
+@@ -317,6 +319,7 @@ export const TimelineItem = memo(function TimelineItem({
+       <TimelineMessage
+         {...reducedProps}
+         {...item.data}
++        maoyiTranslationText={maoyiTranslationText}
+         interactivity={interactivity}
+         isTargeted={isTargeted}
+         targetMessage={targetMessage}
+diff --git a/ts/components/conversation/TimelineMessage.dom.tsx b/ts/components/conversation/TimelineMessage.dom.tsx
+index 0a40c8886ccc6e35e8eeccb1f9403afb9b5e363f..9f407c61855a9da485dd6be970168e581f57674c 100644
+--- a/ts/components/conversation/TimelineMessage.dom.tsx
++++ b/ts/components/conversation/TimelineMessage.dom.tsx
+@@ -118,6 +118,7 @@ export function TimelineMessage(props: Props): JSX.Element {
+     containerElementRef,
+     containerWidthBreakpoint,
+     conversationId,
++    maoyiTranslationText,
+     direction,
+     i18n,
+     id,
+@@ -475,6 +476,7 @@ export function TimelineMessage(props: Props): JSX.Element {
+   return (
+     <Message
+       {...props}
++      maoyiTranslationText={maoyiTranslationText}
+       renderingContext="conversation/TimelineItem"
+       renderMenu={isSignalConversation ? undefined : renderMenu}
+       renderMessageContextMenu={renderMessageContextMenu}
+diff --git a/ts/maoyi/messageBatching.std.ts b/ts/maoyi/messageBatching.std.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..de3c0876b8ff05af97709f0d4d0c243203c5ad7d
+--- /dev/null
++++ b/ts/maoyi/messageBatching.std.ts
+@@ -0,0 +1,97 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import type { MaoyiMessageProjection } from './messageProjection.std.ts';
++
++export const maoyiVisibleBatchItemLimit = 100;
++export const maoyiVisibleBatchByteLimit = 768 * 1024;
++
++const requestIdBytePlaceholder = '00000000-0000-4000-8000-000000000000';
++
++function byteLength(value: unknown): number {
++  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
++}
++
++export function createMaoyiVisibleProjectionSignature(
++  conversationId: string,
++  messages: ReadonlyArray<MaoyiMessageProjection>
++): string {
++  const messageIds = new Set<string>();
++  const identities: Array<ReadonlyArray<string>> = [];
++  for (const message of messages) {
++    const messageId = message.messageId.toLowerCase();
++    if (
++      message.conversationId !== conversationId ||
++      messageIds.has(messageId)
++    ) {
++      continue;
++    }
++    messageIds.add(messageId);
++    identities.push([messageId, message.sourceHash, message.sourceText]);
++  }
++  return JSON.stringify([conversationId, identities]);
++}
++
++export function maoyiVisibleBatchJsonBytes(
++  conversationId: string,
++  messages: ReadonlyArray<MaoyiMessageProjection>,
++  requestId = requestIdBytePlaceholder
++): number {
++  return byteLength({
++    type: 'message.visibleBatch',
++    requestId,
++    conversationId,
++    messages,
++  });
++}
++
++export function createMaoyiVisibleMessageBatches(
++  conversationId: string,
++  messages: ReadonlyArray<MaoyiMessageProjection>,
++  jsonByteLength: (value: unknown) => number = byteLength
++): Array<Array<MaoyiMessageProjection>> {
++  const batches: Array<Array<MaoyiMessageProjection>> = [];
++  let current: Array<MaoyiMessageProjection> = [];
++  const emptyBatchBytes = jsonByteLength({
++    type: 'message.visibleBatch',
++    requestId: requestIdBytePlaceholder,
++    conversationId,
++    messages: [],
++  });
++  let currentBytes = emptyBatchBytes;
++  const messageIds = new Set<string>();
++
++  for (const message of messages) {
++    const normalizedMessageId = message.messageId.toLowerCase();
++    if (
++      message.conversationId !== conversationId ||
++      messageIds.has(normalizedMessageId)
++    ) {
++      continue;
++    }
++    const messageBytes = jsonByteLength(message);
++    if (emptyBatchBytes + messageBytes > maoyiVisibleBatchByteLimit) {
++      continue;
++    }
++    const separatorBytes = current.length > 0 ? 1 : 0;
++    if (
++      current.length > 0 &&
++      (current.length >= maoyiVisibleBatchItemLimit ||
++        currentBytes + separatorBytes + messageBytes >
++          maoyiVisibleBatchByteLimit)
++    ) {
++      batches.push(current);
++      current = [];
++      currentBytes = emptyBatchBytes;
++    }
++
++    messageIds.add(normalizedMessageId);
++    currentBytes += (current.length > 0 ? 1 : 0) + messageBytes;
++    current.push(message);
++  }
++
++  if (current.length > 0 || batches.length === 0) {
++    batches.push(current);
++  }
++  return batches;
++}
+diff --git a/ts/maoyi/messageBridge.preload.ts b/ts/maoyi/messageBridge.preload.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..89305b38f8ec66efa09a9409ec266770715095d6
+--- /dev/null
++++ b/ts/maoyi/messageBridge.preload.ts
+@@ -0,0 +1,530 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import { randomUUID } from 'node:crypto';
++import { ipcRenderer, type IpcRendererEvent } from 'electron';
++
++import {
++  maoyiTranslationMatchesProjection,
++  type MaoyiMessageProjection,
++  type MaoyiTranslationResult,
++} from './messageProjection.std.ts';
++import {
++  applyMaoyiTranslationBatch,
++  clearMaoyiTranslationRuntime,
++} from './translationRuntime.preload.ts';
++import {
++  createMaoyiVisibleProjectionSignature,
++  createMaoyiVisibleMessageBatches,
++  maoyiVisibleBatchByteLimit,
++  maoyiVisibleBatchItemLimit,
++} from './messageBatching.std.ts';
++import {
++  maoyiMessageCommandChannel,
++  maoyiMessageEventChannel,
++  type MaoyiRendererCommand,
++} from './messageBridgeChannels.std.ts';
++
++const rendererMessageBridgeKey = Symbol.for(
++  'maoyi.signal.renderer-message-bridge.v1'
++);
++const requestIdPattern =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++const sourceHashPattern = /^(?:0|[1-9a-z][0-9a-z]{0,6})$/;
++const pendingRequestLimit = 128;
++const pendingRequestTtlMs = 30_000;
++const pendingProjectionByteLimit = 15 * 1024 * 1024;
++const maximumTextBytes = 64 * 1024;
++
++type Snapshot = Readonly<{
++  conversationId: string;
++  messages: ReadonlyArray<MaoyiMessageProjection>;
++}>;
++type SnapshotProvider = () => Snapshot | undefined;
++
++type PendingBatch = {
++  conversationId: string;
++  projections: ReadonlyMap<string, MaoyiMessageProjection>;
++  estimatedBytes: number;
++  expiresAt: number;
++};
++
++type MaoyiIpcRenderer = Readonly<{
++  invoke: (channel: string, value: unknown) => Promise<unknown>;
++  on: (
++    channel: string,
++    listener: (event: IpcRendererEvent, value: unknown) => void
++  ) => unknown;
++  off: (
++    channel: string,
++    listener: (event: IpcRendererEvent, value: unknown) => void
++  ) => unknown;
++}>;
++
++export type MaoyiRendererMessageBridge = Readonly<{
++  publishVisibleMessages: (
++    conversationId: string,
++    messages: ReadonlyArray<MaoyiMessageProjection>
++  ) => Promise<void>;
++  setSnapshotProvider: (provider: SnapshotProvider) => () => void;
++  clear: () => void;
++  stop: () => void;
++}>;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value != null && !Array.isArray(value);
++}
++
++function hasOnlyKeys(
++  value: Record<string, unknown>,
++  allowed: ReadonlyArray<string>
++): boolean {
++  const keys = new Set(allowed);
++  return Object.keys(value).every(key => keys.has(key));
++}
++
++function isUuid(value: unknown): value is string {
++  return typeof value === 'string' && requestIdPattern.test(value);
++}
++
++function utf8Bytes(value: string): number {
++  return new TextEncoder().encode(value).byteLength;
++}
++
++function jsonBytes(value: unknown): number {
++  return utf8Bytes(JSON.stringify(value));
++}
++
++function parseTranslationResult(
++  value: unknown,
++  conversationId: string
++): MaoyiTranslationResult | undefined {
++  if (
++    !isRecord(value) ||
++    !hasOnlyKeys(value, [
++      'conversationId',
++      'messageId',
++      'sourceHash',
++      'sourceText',
++      'translatedText',
++    ]) ||
++    value.conversationId !== conversationId ||
++    !isUuid(value.messageId) ||
++    typeof value.sourceHash !== 'string' ||
++    !sourceHashPattern.test(value.sourceHash) ||
++    typeof value.sourceText !== 'string' ||
++    value.sourceText.length === 0 ||
++    utf8Bytes(value.sourceText) > maximumTextBytes ||
++    typeof value.translatedText !== 'string' ||
++    value.translatedText.length === 0 ||
++    utf8Bytes(value.translatedText) > maximumTextBytes
++  ) {
++    return undefined;
++  }
++  return {
++    conversationId,
++    messageId: value.messageId,
++    sourceHash: value.sourceHash,
++    sourceText: value.sourceText,
++    translatedText: value.translatedText,
++  };
++}
++
++function parseRendererCommand(
++  value: unknown
++): MaoyiRendererCommand | undefined {
++  if (
++    !isRecord(value) ||
++    typeof value.type !== 'string' ||
++    jsonBytes(value) > maoyiVisibleBatchByteLimit
++  ) {
++    return undefined;
++  }
++  if (
++    value.type === 'translation.runtime.clear' &&
++    hasOnlyKeys(value, ['type'])
++  ) {
++    return { type: 'translation.runtime.clear' };
++  }
++  if (
++    value.type === 'message.snapshot.request' &&
++    hasOnlyKeys(value, ['type', 'requestId']) &&
++    isUuid(value.requestId)
++  ) {
++    return {
++      type: 'message.snapshot.request',
++      requestId: value.requestId,
++    };
++  }
++  if (
++    value.type !== 'translation.cacheResultBatch' ||
++    !hasOnlyKeys(value, ['type', 'requestId', 'conversationId', 'results']) ||
++    !isUuid(value.requestId) ||
++    !isUuid(value.conversationId) ||
++    !Array.isArray(value.results) ||
++    value.results.length > maoyiVisibleBatchItemLimit
++  ) {
++    return undefined;
++  }
++
++  const results: Array<MaoyiTranslationResult> = [];
++  const messageIds = new Set<string>();
++  for (const item of value.results) {
++    const parsed = parseTranslationResult(item, value.conversationId);
++    const normalizedMessageId = parsed?.messageId.toLowerCase();
++    if (
++      !parsed ||
++      !normalizedMessageId ||
++      messageIds.has(normalizedMessageId)
++    ) {
++      return undefined;
++    }
++    messageIds.add(normalizedMessageId);
++    results.push(parsed);
++  }
++  return {
++    type: 'translation.cacheResultBatch',
++    requestId: value.requestId,
++    conversationId: value.conversationId,
++    results,
++  };
++}
++
++export function createMaoyiRendererMessageBridge(
++  transport: MaoyiIpcRenderer = ipcRenderer
++): MaoyiRendererMessageBridge {
++  const pending = new Map<string, PendingBatch>();
++  let pendingBytes = 0;
++  let announcedConversationId: string | undefined;
++  let activeProjectionSignature: string | undefined;
++  let snapshotProvider: SnapshotProvider | undefined;
++  let securityGeneration = 0;
++  let normalPublishRevision = 0;
++  let queue: Promise<void> = Promise.resolve();
++  let stopped = false;
++
++  const removePending = (requestId: string): PendingBatch | undefined => {
++    const value = pending.get(requestId);
++    if (!value) {
++      return undefined;
++    }
++    pending.delete(requestId);
++    pendingBytes = Math.max(0, pendingBytes - value.estimatedBytes);
++    return value;
++  };
++
++  const prunePending = (): void => {
++    const now = Date.now();
++    for (const [requestId, value] of pending) {
++      if (value.expiresAt <= now) {
++        removePending(requestId);
++      }
++    }
++  };
++
++  const clearPending = (): void => {
++    pending.clear();
++    pendingBytes = 0;
++  };
++
++  const reservePending = (
++    requestId: string,
++    conversationId: string,
++    messages: ReadonlyArray<MaoyiMessageProjection>
++  ): boolean => {
++    prunePending();
++    if (pending.has(requestId)) {
++      return false;
++    }
++
++    const estimatedBytes = jsonBytes(messages);
++    if (estimatedBytes > pendingProjectionByteLimit) {
++      return false;
++    }
++    while (
++      pending.size >= pendingRequestLimit ||
++      pendingBytes + estimatedBytes > pendingProjectionByteLimit
++    ) {
++      const oldest = pending.keys().next();
++      if (oldest.done) {
++        return false;
++      }
++      removePending(oldest.value);
++    }
++
++    pending.set(requestId, {
++      conversationId,
++      projections: new Map(messages.map(item => [item.messageId, item])),
++      estimatedBytes,
++      expiresAt: Date.now() + pendingRequestTtlMs,
++    });
++    pendingBytes += estimatedBytes;
++    return true;
++  };
++
++  const sendEvent = async (value: unknown): Promise<boolean> => {
++    try {
++      return (
++        (await transport.invoke(maoyiMessageEventChannel, value)) === true
++      );
++    } catch {
++      return false;
++    }
++  };
++
++  const runPublish = async (
++    snapshot: Snapshot,
++    generation: number,
++    forcedRequestId?: string,
++    revision?: number
++  ): Promise<void> => {
++    if (
++      stopped ||
++      generation !== securityGeneration ||
++      (revision != null && revision !== normalPublishRevision) ||
++      !isUuid(snapshot.conversationId)
++    ) {
++      return;
++    }
++
++    if (announcedConversationId !== snapshot.conversationId) {
++      clearPending();
++      activeProjectionSignature = undefined;
++      if (
++        !(await sendEvent({
++          type: 'conversation.changed',
++          conversationId: snapshot.conversationId,
++        })) ||
++        stopped ||
++        generation !== securityGeneration ||
++        (revision != null && revision !== normalPublishRevision)
++      ) {
++        announcedConversationId = undefined;
++        return;
++      }
++      announcedConversationId = snapshot.conversationId;
++    }
++
++    const projectionSignature = createMaoyiVisibleProjectionSignature(
++      snapshot.conversationId,
++      snapshot.messages
++    );
++    if (activeProjectionSignature === projectionSignature && !forcedRequestId) {
++      return;
++    }
++    if (
++      activeProjectionSignature != null &&
++      activeProjectionSignature !== projectionSignature
++    ) {
++      clearPending();
++    }
++    activeProjectionSignature = projectionSignature;
++
++    const batches = createMaoyiVisibleMessageBatches(
++      snapshot.conversationId,
++      snapshot.messages
++    );
++    let allBatchesAccepted = true;
++    for (let index = 0; index < batches.length; index += 1) {
++      if (
++        stopped ||
++        generation !== securityGeneration ||
++        (revision != null && revision !== normalPublishRevision)
++      ) {
++        if (
++          generation === securityGeneration &&
++          activeProjectionSignature === projectionSignature
++        ) {
++          activeProjectionSignature = undefined;
++        }
++        return;
++      }
++      const messages = batches[index] ?? [];
++      const requestId =
++        index === 0 && forcedRequestId ? forcedRequestId : randomUUID();
++      if (!reservePending(requestId, snapshot.conversationId, messages)) {
++        allBatchesAccepted = false;
++        continue;
++      }
++      // Batches must preserve their visible-order request sequence.
++      // oxlint-disable-next-line no-await-in-loop
++      const accepted = await sendEvent({
++        type: 'message.visibleBatch',
++        requestId,
++        conversationId: snapshot.conversationId,
++        messages,
++      });
++      if (!accepted) {
++        allBatchesAccepted = false;
++        removePending(requestId);
++      }
++    }
++    if (
++      (!allBatchesAccepted ||
++        generation !== securityGeneration ||
++        (revision != null && revision !== normalPublishRevision)) &&
++      activeProjectionSignature === projectionSignature
++    ) {
++      activeProjectionSignature = undefined;
++    }
++  };
++
++  const enqueue = (work: () => Promise<void>): Promise<void> => {
++    // This is a deliberately serialized, bounded renderer publication queue.
++    // oxlint-disable-next-line promise/prefer-await-to-then, signal-desktop/no-then
++    const next = queue.then(work, work);
++    // oxlint-disable-next-line promise/prefer-await-to-then
++    queue = next.catch(() => undefined);
++    return next;
++  };
++
++  const handleResultBatch = async (
++    command: Extract<
++      MaoyiRendererCommand,
++      { type: 'translation.cacheResultBatch' }
++    >
++  ): Promise<void> => {
++    const expected = removePending(command.requestId);
++    let appliedCount = 0;
++    if (
++      expected &&
++      expected.conversationId === command.conversationId &&
++      command.results.every(result => {
++        const projection = expected.projections.get(result.messageId);
++        return Boolean(
++          projection && maoyiTranslationMatchesProjection(projection, result)
++        );
++      })
++    ) {
++      appliedCount = applyMaoyiTranslationBatch(command.results);
++    }
++    await sendEvent({
++      type: 'translation.cacheResultApplied',
++      requestId: command.requestId,
++      appliedCount,
++    });
++  };
++
++  const handleCommand = (_event: IpcRendererEvent, value: unknown): void => {
++    const command = parseRendererCommand(value);
++    if (!command) {
++      return;
++    }
++    if (command.type === 'translation.runtime.clear') {
++      securityGeneration += 1;
++      normalPublishRevision += 1;
++      announcedConversationId = undefined;
++      activeProjectionSignature = undefined;
++      clearPending();
++      clearMaoyiTranslationRuntime();
++      return;
++    }
++    if (command.type === 'translation.cacheResultBatch') {
++      void handleResultBatch(command);
++      return;
++    }
++
++    const generation = securityGeneration;
++    void enqueue(async () => {
++      if (stopped || generation !== securityGeneration) {
++        return;
++      }
++      const snapshot = snapshotProvider?.();
++      if (!snapshot) {
++        return;
++      }
++      const revision = normalPublishRevision;
++      await runPublish(snapshot, generation, command.requestId, revision);
++    });
++  };
++
++  transport.on(maoyiMessageCommandChannel, handleCommand);
++
++  return Object.freeze({
++    publishVisibleMessages(
++      conversationId: string,
++      messages: ReadonlyArray<MaoyiMessageProjection>
++    ) {
++      normalPublishRevision += 1;
++      const revision = normalPublishRevision;
++      const generation = securityGeneration;
++      return enqueue(() =>
++        runPublish(
++          { conversationId, messages },
++          generation,
++          undefined,
++          revision
++        )
++      );
++    },
++    setSnapshotProvider(provider: SnapshotProvider) {
++      snapshotProvider = provider;
++      return () => {
++        if (snapshotProvider === provider) {
++          snapshotProvider = undefined;
++        }
++      };
++    },
++    clear() {
++      securityGeneration += 1;
++      normalPublishRevision += 1;
++      announcedConversationId = undefined;
++      activeProjectionSignature = undefined;
++      clearPending();
++      clearMaoyiTranslationRuntime();
++    },
++    stop() {
++      if (stopped) {
++        return;
++      }
++      stopped = true;
++      securityGeneration += 1;
++      normalPublishRevision += 1;
++      transport.off(maoyiMessageCommandChannel, handleCommand);
++      snapshotProvider = undefined;
++      announcedConversationId = undefined;
++      activeProjectionSignature = undefined;
++      clearPending();
++      clearMaoyiTranslationRuntime();
++    },
++  });
++}
++
++export function startMaoyiRendererMessageBridge(): MaoyiRendererMessageBridge {
++  const existing = Reflect.get(globalThis, rendererMessageBridgeKey) as
++    | MaoyiRendererMessageBridge
++    | undefined;
++  if (existing) {
++    return existing;
++  }
++  const bridge = createMaoyiRendererMessageBridge();
++  Reflect.set(globalThis, rendererMessageBridgeKey, bridge);
++  return bridge;
++}
++
++function getRendererMessageBridge(): MaoyiRendererMessageBridge | undefined {
++  return Reflect.get(globalThis, rendererMessageBridgeKey) as
++    | MaoyiRendererMessageBridge
++    | undefined;
++}
++
++export function publishMaoyiVisibleMessages(
++  conversationId: string,
++  messages: ReadonlyArray<MaoyiMessageProjection>
++): Promise<void> {
++  return (
++    getRendererMessageBridge()?.publishVisibleMessages(
++      conversationId,
++      messages
++    ) ?? Promise.resolve()
++  );
++}
++
++export function setMaoyiSnapshotProvider(
++  provider: SnapshotProvider
++): () => void {
++  return (
++    getRendererMessageBridge()?.setSnapshotProvider(provider) ??
++    (() => undefined)
++  );
++}
+diff --git a/ts/maoyi/messageBridgeChannels.std.ts b/ts/maoyi/messageBridgeChannels.std.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2925eda5014ec4b179b09dd630f993fe394ad8d3
+--- /dev/null
++++ b/ts/maoyi/messageBridgeChannels.std.ts
+@@ -0,0 +1,20 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import type { MaoyiTranslationResult } from './messageProjection.std.ts';
++
++export const maoyiMessageEventChannel = 'maoyi:message-event';
++export const maoyiMessageCommandChannel = 'maoyi:message-command';
++
++export type MaoyiRendererCommand =
++  | Readonly<{
++      type: 'message.snapshot.request';
++      requestId: string;
++    }>
++  | Readonly<{
++      type: 'translation.cacheResultBatch';
++      requestId: string;
++      conversationId: string;
++      results: ReadonlyArray<MaoyiTranslationResult>;
++    }>
++  | Readonly<{ type: 'translation.runtime.clear' }>;
+diff --git a/ts/maoyi/messageProjection.std.ts b/ts/maoyi/messageProjection.std.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc801c4e4423bd14fcc49101f47f3ef38ec1a62e
+--- /dev/null
++++ b/ts/maoyi/messageProjection.std.ts
+@@ -0,0 +1,123 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++export const maoyiMaximumSourceTextLength = 4_000;
++
++export type MaoyiMessageProjectionInput = Readonly<{
++  id: string;
++  conversationId: string;
++  text?: string;
++  direction: 'incoming' | 'outgoing';
++  timestamp: number;
++  attachments?: ReadonlyArray<unknown>;
++  textAttachment?: unknown;
++  attachmentDroppedDueToSize?: boolean;
++  contact?: unknown;
++  deletedForEveryone?: boolean;
++  giftBadge?: unknown;
++  isSticker?: boolean;
++  isTapToView?: boolean;
++  payment?: unknown;
++  poll?: unknown;
++  storyReplyContext?: unknown;
++}>;
++
++export type MaoyiMessageProjection = Readonly<{
++  conversationId: string;
++  messageId: string;
++  sourceHash: string;
++  sourceText: string;
++  direction: 'incoming' | 'outgoing';
++  timestamp: number;
++}>;
++
++export type MaoyiTranslationResult = Readonly<{
++  conversationId: string;
++  messageId: string;
++  sourceHash: string;
++  sourceText: string;
++  translatedText: string;
++}>;
++
++export function normalizeMaoyiSourceText(text: string): string {
++  return text.replace(/\s+/g, ' ').trim();
++}
++
++// Keep this byte-for-byte compatible with the legacy renderer cache hash. Message and
++// conversation IDs remain the primary identity; this 32-bit hash is never sufficient
++// on its own.
++export function legacyMaoyiSourceHash(text: string): string {
++  let hash = 2166136261;
++  for (const char of normalizeMaoyiSourceText(text)) {
++    // The legacy implementation intentionally hashes UTF-16 code units this way.
++    // oxlint-disable-next-line no-bitwise
++    hash ^= char.charCodeAt(0);
++    hash = Math.imul(hash, 16777619);
++  }
++  // oxlint-disable-next-line no-bitwise
++  return (hash >>> 0).toString(36);
++}
++
++function hasExcludedMessagePayload(
++  message: MaoyiMessageProjectionInput
++): boolean {
++  return Boolean(
++    message.attachments?.length ||
++    message.textAttachment ||
++    message.attachmentDroppedDueToSize ||
++    message.contact ||
++    message.deletedForEveryone ||
++    message.giftBadge ||
++    message.isSticker ||
++    message.isTapToView ||
++    message.payment ||
++    message.poll ||
++    message.storyReplyContext
++  );
++}
++
++export function projectMaoyiMessage(
++  message: MaoyiMessageProjectionInput | undefined
++): MaoyiMessageProjection | undefined {
++  if (
++    !message ||
++    !message.id ||
++    !message.conversationId ||
++    !Number.isFinite(message.timestamp) ||
++    hasExcludedMessagePayload(message)
++  ) {
++    return undefined;
++  }
++
++  const sourceText = normalizeMaoyiSourceText(message.text ?? '');
++  if (
++    sourceText.length === 0 ||
++    sourceText.length > maoyiMaximumSourceTextLength ||
++    !/[A-Za-z]/.test(sourceText) ||
++    /[\u3400-\u9fff]/u.test(sourceText)
++  ) {
++    return undefined;
++  }
++
++  return {
++    conversationId: message.conversationId,
++    messageId: message.id,
++    sourceHash: legacyMaoyiSourceHash(sourceText),
++    sourceText,
++    direction: message.direction,
++    timestamp: message.timestamp,
++  };
++}
++
++export function maoyiTranslationMatchesProjection(
++  projection: MaoyiMessageProjection,
++  result: MaoyiTranslationResult
++): boolean {
++  return (
++    result.conversationId === projection.conversationId &&
++    result.messageId === projection.messageId &&
++    result.sourceText === projection.sourceText &&
++    result.sourceHash === projection.sourceHash &&
++    legacyMaoyiSourceHash(result.sourceText) === result.sourceHash
++  );
++}
+diff --git a/ts/maoyi/translationRuntime.preload.ts b/ts/maoyi/translationRuntime.preload.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..18e3c58d64a0f6d70d7b26d571d2024de26d5df9
+--- /dev/null
++++ b/ts/maoyi/translationRuntime.preload.ts
+@@ -0,0 +1,239 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++// The runtime is deliberately preload-scoped even before its IPC adapter is added.
++// oxlint-disable-next-line signal-desktop/enforce-file-suffix
++import { useCallback, useEffect, useSyncExternalStore } from 'react';
++
++import {
++  maoyiTranslationMatchesProjection,
++  legacyMaoyiSourceHash,
++  normalizeMaoyiSourceText,
++  type MaoyiMessageProjection,
++  type MaoyiTranslationResult,
++} from './messageProjection.std.ts';
++
++export const maoyiTranslationEntryLimit = 1_500;
++export const maoyiTranslationByteLimit = 15 * 1024 * 1024;
++
++const maximumIdentityLength = 256;
++const maximumTranslationLength = 30_000;
++
++type StoredMaoyiTranslation = MaoyiTranslationResult &
++  Readonly<{
++    estimatedBytes: number;
++  }>;
++
++type TranslationRuntimeStats = Readonly<{
++  entries: number;
++  estimatedBytes: number;
++}>;
++
++const translations = new Map<string, StoredMaoyiTranslation>();
++const subscribers = new Set<() => void>();
++let estimatedBytes = 0;
++
++function translationKey(conversationId: string, messageId: string): string {
++  return JSON.stringify([conversationId, messageId]);
++}
++
++function estimateTranslationBytes(result: MaoyiTranslationResult): number {
++  return (
++    128 +
++    (result.conversationId.length +
++      result.messageId.length +
++      result.sourceHash.length +
++      result.sourceText.length +
++      result.translatedText.length) *
++      2
++  );
++}
++
++function isBoundedIdentity(value: string): boolean {
++  return value.length > 0 && value.length <= maximumIdentityLength;
++}
++
++function normalizeTranslationResult(
++  result: MaoyiTranslationResult
++): StoredMaoyiTranslation | undefined {
++  if (
++    !isBoundedIdentity(result.conversationId) ||
++    !isBoundedIdentity(result.messageId) ||
++    !isBoundedIdentity(result.sourceHash) ||
++    result.sourceText !== normalizeMaoyiSourceText(result.sourceText) ||
++    legacyMaoyiSourceHash(result.sourceText) !== result.sourceHash
++  ) {
++    return undefined;
++  }
++
++  const translatedText = result.translatedText.trim();
++  if (
++    translatedText.length === 0 ||
++    translatedText.length > maximumTranslationLength
++  ) {
++    return undefined;
++  }
++
++  const normalized: MaoyiTranslationResult = {
++    conversationId: result.conversationId,
++    messageId: result.messageId,
++    sourceHash: result.sourceHash,
++    sourceText: result.sourceText,
++    translatedText,
++  };
++  return {
++    ...normalized,
++    estimatedBytes: estimateTranslationBytes(normalized),
++  };
++}
++
++function notifySubscribers(): void {
++  for (const subscriber of subscribers) {
++    try {
++      subscriber();
++    } catch {
++      // One React subscriber must not prevent the rest of a batch from rendering.
++    }
++  }
++}
++
++function touchTranslation(key: string): void {
++  const existing = translations.get(key);
++  if (!existing) {
++    return;
++  }
++  translations.delete(key);
++  translations.set(key, existing);
++}
++
++function trimTranslationCache(): boolean {
++  let changed = false;
++  while (
++    translations.size > maoyiTranslationEntryLimit ||
++    estimatedBytes > maoyiTranslationByteLimit
++  ) {
++    const oldest = translations.entries().next();
++    if (oldest.done) {
++      break;
++    }
++    const [key, value] = oldest.value;
++    translations.delete(key);
++    estimatedBytes = Math.max(0, estimatedBytes - value.estimatedBytes);
++    changed = true;
++  }
++  return changed;
++}
++
++export function applyMaoyiTranslationBatch(
++  results: ReadonlyArray<MaoyiTranslationResult>
++): number {
++  const changedKeys = new Set<string>();
++
++  for (const result of results) {
++    const normalized = normalizeTranslationResult(result);
++    if (!normalized) {
++      continue;
++    }
++
++    const key = translationKey(normalized.conversationId, normalized.messageId);
++    const existing = translations.get(key);
++    if (
++      existing &&
++      existing.sourceHash === normalized.sourceHash &&
++      existing.sourceText === normalized.sourceText &&
++      existing.translatedText === normalized.translatedText
++    ) {
++      touchTranslation(key);
++      continue;
++    }
++
++    if (existing) {
++      estimatedBytes = Math.max(0, estimatedBytes - existing.estimatedBytes);
++      translations.delete(key);
++    }
++    translations.set(key, normalized);
++    estimatedBytes += normalized.estimatedBytes;
++    changedKeys.add(key);
++  }
++
++  const evicted = trimTranslationCache();
++  if (changedKeys.size > 0 || evicted) {
++    notifySubscribers();
++  }
++  return changedKeys.size;
++}
++
++function peekMaoyiTranslation(
++  projection: MaoyiMessageProjection | undefined
++): string | undefined {
++  if (!projection) {
++    return undefined;
++  }
++  const result = translations.get(
++    translationKey(projection.conversationId, projection.messageId)
++  );
++  return result && maoyiTranslationMatchesProjection(projection, result)
++    ? result.translatedText
++    : undefined;
++}
++
++export function getMaoyiTranslation(
++  projection: MaoyiMessageProjection | undefined
++): string | undefined {
++  const translatedText = peekMaoyiTranslation(projection);
++  if (projection && translatedText) {
++    touchTranslation(
++      translationKey(projection.conversationId, projection.messageId)
++    );
++  }
++  return translatedText;
++}
++
++export function subscribeToMaoyiTranslations(
++  subscriber: () => void
++): () => void {
++  subscribers.add(subscriber);
++  return () => {
++    subscribers.delete(subscriber);
++  };
++}
++
++export function useMaoyiTranslation(
++  projection: MaoyiMessageProjection | undefined
++): string | undefined {
++  const getSnapshot = useCallback(
++    () => peekMaoyiTranslation(projection),
++    [projection]
++  );
++  const translatedText = useSyncExternalStore(
++    subscribeToMaoyiTranslations,
++    getSnapshot,
++    getSnapshot
++  );
++
++  useEffect(() => {
++    if (projection && translatedText) {
++      touchTranslation(
++        translationKey(projection.conversationId, projection.messageId)
++      );
++    }
++  }, [projection, translatedText]);
++
++  return translatedText;
++}
++
++export function clearMaoyiTranslationRuntime(): void {
++  if (translations.size === 0) {
++    return;
++  }
++  translations.clear();
++  estimatedBytes = 0;
++  notifySubscribers();
++}
++
++export function getMaoyiTranslationRuntimeStats(): TranslationRuntimeStats {
++  return {
++    entries: translations.size,
++    estimatedBytes,
++  };
++}
+diff --git a/ts/maoyi/visibleMessageProjection.std.ts b/ts/maoyi/visibleMessageProjection.std.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..af9c8673e390f311be837196f0051888cfad2be7
+--- /dev/null
++++ b/ts/maoyi/visibleMessageProjection.std.ts
+@@ -0,0 +1,58 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import type { MessageLookupType } from '../state/ducks/conversations.preload.ts';
++import {
++  projectMaoyiMessage,
++  type MaoyiMessageProjection,
++} from './messageProjection.std.ts';
++
++export function projectMaoyiVisibleMessages(
++  conversationId: string,
++  messageIds: ReadonlyArray<string>,
++  messages: MessageLookupType
++): Array<MaoyiMessageProjection> {
++  const result: Array<MaoyiMessageProjection> = [];
++  const seen = new Set<string>();
++
++  for (const messageId of messageIds) {
++    if (seen.has(messageId)) {
++      continue;
++    }
++    seen.add(messageId);
++
++    const message = messages[messageId];
++    if (
++      !message ||
++      message.conversationId !== conversationId ||
++      (message.type !== 'incoming' && message.type !== 'outgoing') ||
++      !Number.isSafeInteger(message.timestamp) ||
++      message.timestamp < 0
++    ) {
++      continue;
++    }
++
++    const projection = projectMaoyiMessage({
++      id: message.id,
++      conversationId: message.conversationId,
++      text: message.body,
++      direction: message.type,
++      timestamp: message.timestamp,
++      attachments: message.attachments,
++      textAttachment: message.bodyAttachment,
++      contact: message.contact,
++      deletedForEveryone: message.deletedForEveryone,
++      giftBadge: message.giftBadge,
++      isSticker: Boolean(message.sticker),
++      isTapToView: Boolean(message.isViewOnce),
++      payment: message.payment,
++      poll: message.poll,
++      storyReplyContext: message.storyReplyContext,
++    });
++    if (projection) {
++      result.push(projection);
++    }
++  }
++
++  return result;
++}
+diff --git a/ts/state/smart/Timeline.preload.tsx b/ts/state/smart/Timeline.preload.tsx
+index 96417e5ca6c673b1b8e2b54e9a0f9aa1420e20d4..f6f6c75e911aab5c0a0ff8568459de119f36558d 100644
+--- a/ts/state/smart/Timeline.preload.tsx
++++ b/ts/state/smart/Timeline.preload.tsx
+@@ -1,7 +1,7 @@
+ // Copyright 2019 Signal Messenger, LLC
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+-import { memo, useCallback, useRef, useMemo, type JSX } from 'react';
++import { memo, useCallback, useEffect, useRef, useMemo, type JSX } from 'react';
+ import { useSelector } from 'react-redux';
+ import { isEqual } from 'lodash';
+ 
+@@ -35,6 +35,12 @@ import { mapItemsIntoCollapseSets } from '../../util/CollapseSet.std.ts';
+ import type { CollapseSet } from '../../util/CollapseSet.std.ts';
+ import { isSignalConversation } from '../../util/isSignalConversation.dom.ts';
+ import { getIsInFullScreenCall } from '../selectors/isInFullScreenCall.std.ts';
++import {
++  publishMaoyiVisibleMessages,
++  setMaoyiSnapshotProvider,
++} from '../../maoyi/messageBridge.preload.ts';
++import { createMaoyiVisibleProjectionSignature } from '../../maoyi/messageBatching.std.ts';
++import { projectMaoyiVisibleMessages } from '../../maoyi/visibleMessageProjection.std.ts';
+ 
+ type ExternalProps = {
+   id: string;
+@@ -184,6 +190,77 @@ export const SmartTimeline = memo(function SmartTimeline({
+   const isSomeoneTyping = Object.keys(typingContactIdTimestamps).length > 0;
+   const targetedMessageId = targetedMessage?.id;
+   const isSignalConvo = isSignalConversation(conversation);
++  const visibleMessageIdsRef = useRef<Array<string>>([]);
++  const messagesRef = useRef(messages);
++  const isConversationSelectedRef = useRef(isConversationSelected);
++  messagesRef.current = messages;
++  isConversationSelectedRef.current = isConversationSelected;
++
++  const maoyiVisibleProjectionSignature = useMemo(() => {
++    if (!isConversationSelected) {
++      return undefined;
++    }
++    const projections = projectMaoyiVisibleMessages(
++      id,
++      visibleMessageIdsRef.current,
++      messages
++    );
++    return createMaoyiVisibleProjectionSignature(id, projections);
++  }, [id, isConversationSelected, messages]);
++
++  const getMaoyiVisibleSnapshot = useCallback(() => {
++    if (!isConversationSelectedRef.current) {
++      return undefined;
++    }
++    return {
++      conversationId: id,
++      messages: projectMaoyiVisibleMessages(
++        id,
++        visibleMessageIdsRef.current,
++        messagesRef.current
++      ),
++    };
++  }, [id]);
++
++  useEffect(() => {
++    if (!isConversationSelected) {
++      return undefined;
++    }
++    return setMaoyiSnapshotProvider(getMaoyiVisibleSnapshot);
++  }, [getMaoyiVisibleSnapshot, isConversationSelected]);
++
++  useEffect(() => {
++    if (!isConversationSelected) {
++      visibleMessageIdsRef.current = [];
++      return;
++    }
++    const snapshot = getMaoyiVisibleSnapshot();
++    if (snapshot) {
++      void publishMaoyiVisibleMessages(
++        snapshot.conversationId,
++        snapshot.messages
++      );
++    }
++  }, [
++    maoyiVisibleProjectionSignature,
++    getMaoyiVisibleSnapshot,
++    isConversationSelected,
++  ]);
++
++  const updateVisibleMessages = useCallback(
++    (messageIds: Array<string>): void => {
++      AttachmentDownloadManager.updateVisibleTimelineMessages(messageIds);
++      visibleMessageIdsRef.current = messageIds;
++      if (!isConversationSelectedRef.current) {
++        return;
++      }
++      void publishMaoyiVisibleMessages(
++        id,
++        projectMaoyiVisibleMessages(id, messageIds, messagesRef.current)
++      );
++    },
++    [id]
++  );
+ 
+   return (
+     <Timeline
+@@ -219,9 +296,7 @@ export const SmartTimeline = memo(function SmartTimeline({
+       maybePeekGroupCall={maybePeekGroupCall}
+       messageChangeCounter={messageChangeCounter}
+       messageLoadingState={messageLoadingState}
+-      updateVisibleMessages={
+-        AttachmentDownloadManager.updateVisibleTimelineMessages
+-      }
++      updateVisibleMessages={updateVisibleMessages}
+       oldestUnseenIndex={updatedOldestLastSeenIndex}
+       renderContactSpoofingReviewDialog={renderContactSpoofingReviewDialog}
+       renderHeroRow={renderHeroRow}
+diff --git a/ts/state/smart/TimelineItem.preload.tsx b/ts/state/smart/TimelineItem.preload.tsx
+index 69010daacb9413eab76cc1fa8de32b9ca51ac884..2eac6fdbe70ac8dd78316e5b07bb71938a0fa0ce 100644
+--- a/ts/state/smart/TimelineItem.preload.tsx
++++ b/ts/state/smart/TimelineItem.preload.tsx
+@@ -2,7 +2,7 @@
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import type { RefObject, JSX } from 'react';
+-import { useCallback, memo } from 'react';
++import { useCallback, memo, useMemo } from 'react';
+ import { useSelector } from 'react-redux';
+ 
+ import { TimelineItem } from '../../components/conversation/TimelineItem.dom.tsx';
+@@ -48,6 +48,8 @@ import { DataReader } from '../../sql/Client.preload.ts';
+ import { isInternalFeaturesEnabled } from '../../util/isInternalFeaturesEnabled.dom.ts';
+ import type { CollapseSet } from '../../util/CollapseSet.std.ts';
+ import { isSignalConversation } from '../../util/isSignalConversation.dom.ts';
++import { projectMaoyiMessage } from '../../maoyi/messageProjection.std.ts';
++import { useMaoyiTranslation } from '../../maoyi/translationRuntime.preload.ts';
+ 
+ export type RenderItemProps = Omit<SmartTimelineItemProps, 'renderItem'>;
+ 
+@@ -102,6 +104,16 @@ export const SmartTimelineItem = memo(function SmartTimelineItem(
+   const itemFromSelector = useTimelineItem(messageId, conversationId);
+   const previousItem = useTimelineItem(previousMessageId, conversationId);
+   const nextItem = useTimelineItem(nextMessageId, conversationId);
++  const maoyiMessageProjection = useMemo(
++    () =>
++      projectMaoyiMessage(
++        itemFromSelector?.type === 'message' ? itemFromSelector.data : undefined
++      ),
++    [itemFromSelector]
++  );
++  const maoyiTranslationText = useMaoyiTranslation(
++    maoyiMessageProjection
++  );
+   const targetedMessage = useSelector(getTargetedMessage);
+   const targetedMessageSource = useSelector(getTargetedMessageSource);
+   const isTargeted = Boolean(
+@@ -246,6 +258,7 @@ export const SmartTimelineItem = memo(function SmartTimelineItem(
+     <TimelineItem
+       item={processedTimelineItem}
+       id={messageId}
++      maoyiTranslationText={maoyiTranslationText}
+       containerElementRef={containerElementRef}
+       containerWidthBreakpoint={containerWidthBreakpoint}
+       conversationId={conversationId}
+diff --git a/ts/test-node/maoyi/controlProtocol_test.node.ts b/ts/test-node/maoyi/controlProtocol_test.node.ts
+index 76256c47c485d266a62e43c79d060c14400b25b1..0108c11ddefdebb0130d5c6c83b0fe6f9bdb98a8 100644
+--- a/ts/test-node/maoyi/controlProtocol_test.node.ts
++++ b/ts/test-node/maoyi/controlProtocol_test.node.ts
+@@ -7,8 +7,14 @@ import { createHmac, randomBytes } from 'node:crypto';
+ import {
+   createMaoyiAuthResponse,
+   createMaoyiSignalEnvelope,
++  maoyiControlMaxBatchItems,
++  maoyiControlMaxTextBytes,
++  isMaoyiControlBusinessPayloadWithinLimit,
++  isMaoyiControlSourceHash,
++  isMaoyiControlUuid,
+   parseMaoyiAuthChallenge,
+   parseMaoyiControlCommand,
++  parseMaoyiMessageControlEvent,
+   verifyMaoyiLauncherEnvelope,
+ } from '../../../app/maoyi/controlProtocol.node.ts';
+ 
+@@ -16,6 +22,26 @@ describe('Maoyi typed control protocol', () => {
+   const appId = 'Signal-00000000-0000-4000-8000-000000000001';
+   const processId = 4242;
+   const key = Buffer.alloc(32, 7);
++  const requestId = '11111111-1111-4111-8111-111111111111';
++  const conversationId = '22222222-2222-4222-8222-222222222222';
++  const messageId = 'abcdefab-cdef-7abc-8def-abcdefabcdef';
++
++  const visibleMessage = {
++    conversationId,
++    messageId,
++    sourceHash: '1abc23',
++    sourceText: 'hello',
++    direction: 'incoming' as const,
++    timestamp: 1_800_000_000_000,
++  };
++
++  const cacheResult = {
++    conversationId,
++    messageId,
++    sourceHash: '1abc23',
++    sourceText: 'hello',
++    translatedText: '你好',
++  };
+ 
+   it('accepts only whitelisted bounded commands', () => {
+     assert.deepEqual(
+@@ -127,6 +153,268 @@ describe('Maoyi typed control protocol', () => {
+     assert.equal(response.mac, expectedMac);
+   });
+ 
++  it('parses strict bounded message commands', () => {
++    assert.deepEqual(
++      parseMaoyiControlCommand({
++        type: 'message.snapshot.request',
++        requestId,
++      }),
++      { type: 'message.snapshot.request', requestId }
++    );
++    assert.deepEqual(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [cacheResult],
++      }),
++      {
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [cacheResult],
++      }
++    );
++    assert.deepEqual(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [],
++      }),
++      {
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [],
++      }
++    );
++  });
++
++  it('rejects malformed message commands and bounded-field overflows', () => {
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'message.snapshot.request',
++        requestId: 'not-a-uuid',
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'message.snapshot.request',
++        requestId,
++        extra: true,
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [cacheResult, { ...cacheResult, translatedText: '重复项' }],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [
++          cacheResult,
++          { ...cacheResult, messageId: cacheResult.messageId.toUpperCase() },
++        ],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [
++          {
++            ...cacheResult,
++            conversationId: '44444444-4444-4444-8444-444444444444',
++          },
++        ],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [{ ...cacheResult, sourceHash: 'ABC123' }],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: [
++          {
++            ...cacheResult,
++            translatedText: 'x'.repeat(maoyiControlMaxTextBytes + 1),
++          },
++        ],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: Array.from(
++          { length: maoyiControlMaxBatchItems + 1 },
++          (_, index) => ({
++            ...cacheResult,
++            messageId: `${index.toString(16).padStart(8, '0')}-3333-7333-8333-333333333333`,
++          })
++        ),
++      }),
++      undefined
++    );
++
++    const oversizedBusinessResults = Array.from({ length: 12 }, (_, index) => ({
++      ...cacheResult,
++      messageId: `${index.toString(16).padStart(8, '0')}-3333-7333-8333-333333333333`,
++      sourceText: 's'.repeat(maoyiControlMaxTextBytes),
++    }));
++    assert.equal(
++      parseMaoyiControlCommand({
++        type: 'translation.cacheResultBatch',
++        requestId,
++        conversationId,
++        results: oversizedBusinessResults,
++      }),
++      undefined
++    );
++  });
++
++  it('parses strict message events', () => {
++    assert.deepEqual(
++      parseMaoyiMessageControlEvent({
++        type: 'conversation.changed',
++        conversationId,
++      }),
++      { type: 'conversation.changed', conversationId }
++    );
++    assert.deepEqual(
++      parseMaoyiMessageControlEvent({
++        type: 'message.visibleBatch',
++        requestId,
++        conversationId,
++        messages: [visibleMessage],
++      }),
++      {
++        type: 'message.visibleBatch',
++        requestId,
++        conversationId,
++        messages: [visibleMessage],
++      }
++    );
++    assert.deepEqual(
++      parseMaoyiMessageControlEvent({
++        type: 'translation.cacheResultApplied',
++        requestId,
++        appliedCount: maoyiControlMaxBatchItems,
++      }),
++      {
++        type: 'translation.cacheResultApplied',
++        requestId,
++        appliedCount: maoyiControlMaxBatchItems,
++      }
++    );
++  });
++
++  it('rejects malformed message events', () => {
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'conversation.changed',
++        conversationId,
++        extra: true,
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'message.visibleBatch',
++        requestId,
++        conversationId,
++        messages: [{ ...visibleMessage, direction: 'unknown' }],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'message.visibleBatch',
++        requestId,
++        conversationId,
++        messages: [{ ...visibleMessage, timestamp: 1.5 }],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'message.visibleBatch',
++        requestId,
++        conversationId,
++        messages: [visibleMessage, visibleMessage],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'message.visibleBatch',
++        requestId,
++        conversationId,
++        messages: [
++          visibleMessage,
++          {
++            ...visibleMessage,
++            messageId: visibleMessage.messageId.toUpperCase(),
++          },
++        ],
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'translation.cacheResultApplied',
++        requestId,
++        appliedCount: maoyiControlMaxBatchItems + 1,
++      }),
++      undefined
++    );
++  });
++
++  it('validates message identifiers, hashes, and business payload size', () => {
++    assert.equal(isMaoyiControlUuid(requestId), true);
++    assert.equal(isMaoyiControlUuid(requestId.toUpperCase()), true);
++    assert.equal(
++      isMaoyiControlUuid('00000000-0000-0000-0000-000000000000'),
++      false
++    );
++    assert.equal(isMaoyiControlSourceHash('0'), true);
++    assert.equal(isMaoyiControlSourceHash('1abc23'), true);
++    assert.equal(isMaoyiControlSourceHash('01abc23'), false);
++    assert.equal(isMaoyiControlSourceHash('ABC123'), false);
++    assert.equal(isMaoyiControlSourceHash('12345678'), false);
++    assert.equal(
++      isMaoyiControlBusinessPayloadWithinLimit({
++        type: 'translation.cacheResultBatch',
++        results: oversizedTextArray(13),
++      }),
++      false
++    );
++  });
++
+   it('rejects tampering and replayed launcher envelopes', () => {
+     const payload = { type: 'window.hide' };
+     const sequence = 1;
+@@ -191,4 +479,10 @@ describe('Maoyi typed control protocol', () => {
+       .digest('base64url');
+     assert.equal(signalEnvelope.mac, signalExpectedMac);
+   });
++
++  function oversizedTextArray(count: number): ReadonlyArray<string> {
++    return Array.from({ length: count }, () =>
++      'x'.repeat(maoyiControlMaxTextBytes)
++    );
++  }
+ });
+diff --git a/ts/test-node/maoyi/messageBatching_test.node.ts b/ts/test-node/maoyi/messageBatching_test.node.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..41cc2ef67670ab6f13a0e720dd957d6a5eea8447
+--- /dev/null
++++ b/ts/test-node/maoyi/messageBatching_test.node.ts
+@@ -0,0 +1,140 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++
++import {
++  createMaoyiVisibleProjectionSignature,
++  createMaoyiVisibleMessageBatches,
++  maoyiVisibleBatchByteLimit,
++  maoyiVisibleBatchItemLimit,
++  maoyiVisibleBatchJsonBytes,
++} from '../../maoyi/messageBatching.std.ts';
++import {
++  projectMaoyiMessage,
++  type MaoyiMessageProjection,
++} from '../../maoyi/messageProjection.std.ts';
++
++const conversationId = '22222222-2222-4222-8222-222222222222';
++
++function projection(index: number): MaoyiMessageProjection {
++  const value = projectMaoyiMessage({
++    id: `33333333-3333-4333-8333-${index.toString().padStart(12, '0')}`,
++    conversationId,
++    text: `English visible message ${index}`,
++    direction: 'incoming',
++    timestamp: 1_800_000_000_000 + index,
++  });
++  assert.ok(value);
++  return value;
++}
++
++describe('Maoyi visible message batching', () => {
++  it('keeps every batch within the item and byte limits', () => {
++    const messages = Array.from({ length: 205 }, (_, index) =>
++      projection(index)
++    );
++    const batches = createMaoyiVisibleMessageBatches(
++      conversationId,
++      messages
++    );
++
++    assert.deepEqual(
++      batches.map(batch => batch.length),
++      [100, 100, 5]
++    );
++    for (const batch of batches) {
++      assert.ok(batch.length <= maoyiVisibleBatchItemLimit);
++      assert.ok(
++        maoyiVisibleBatchJsonBytes(conversationId, batch) <=
++          maoyiVisibleBatchByteLimit
++      );
++    }
++  });
++
++  it('deduplicates message IDs, drops cross-conversation items, and emits an empty snapshot', () => {
++    const first = {
++      ...projection(1),
++      messageId: 'abcdefab-cdef-4abc-8def-abcdefabcdef',
++    };
++    const caseEquivalent = {
++      ...first,
++      messageId: first.messageId.toUpperCase(),
++    };
++    const wrongConversation = {
++      ...projection(2),
++      conversationId: '44444444-4444-4444-8444-444444444444',
++    };
++    assert.deepEqual(
++      createMaoyiVisibleMessageBatches(conversationId, [
++        first,
++        first,
++        caseEquivalent,
++        wrongConversation,
++      ]),
++      [[first]]
++    );
++    assert.deepEqual(createMaoyiVisibleMessageBatches(conversationId, []), [
++      [],
++    ]);
++  });
++
++  it('counts 100 long messages in one linear byte-measurement pass', () => {
++    const messages = Array.from({ length: 100 }, (_, index) => {
++      const value = projectMaoyiMessage({
++        id: `abcdefab-cdef-4abc-8def-${index.toString(16).padStart(12, '0')}`,
++        conversationId,
++        text: `A${index.toString().padStart(4, '0')}${'b'.repeat(3_995)}`,
++        direction: 'incoming',
++        timestamp: 1_800_000_000_000 + index,
++      });
++      assert.ok(value);
++      return value;
++    });
++    let byteMeasurementCount = 0;
++    const batches = createMaoyiVisibleMessageBatches(
++      conversationId,
++      messages,
++      value => {
++        byteMeasurementCount += 1;
++        return new TextEncoder().encode(JSON.stringify(value)).byteLength;
++      }
++    );
++
++    assert.equal(byteMeasurementCount, messages.length + 1);
++    assert.deepEqual(
++      batches.map(batch => batch.length),
++      [100]
++    );
++    assert.equal(batches.flat().length, messages.length);
++    for (const batch of batches) {
++      assert.ok(
++        maoyiVisibleBatchJsonBytes(conversationId, batch) <=
++          maoyiVisibleBatchByteLimit
++      );
++    }
++  });
++
++  it('changes the exact projection signature on same-ID source edits and hash collisions', () => {
++    const original = projection(1);
++    const edited = {
++      ...original,
++      sourceText: 'Edited English source',
++    };
++    const sameHashCollision = {
++      ...original,
++      sourceHash: original.sourceHash,
++      sourceText: 'Collision English source',
++    };
++    assert.notEqual(
++      createMaoyiVisibleProjectionSignature(conversationId, [original]),
++      createMaoyiVisibleProjectionSignature(conversationId, [edited])
++    );
++    assert.notEqual(
++      createMaoyiVisibleProjectionSignature(conversationId, [original]),
++      createMaoyiVisibleProjectionSignature(conversationId, [
++        sameHashCollision,
++      ])
++    );
++  });
++});
+diff --git a/ts/test-node/maoyi/messageBridge_test.main.ts b/ts/test-node/maoyi/messageBridge_test.main.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cdd27524f90092bbf1719c43db4657176762e34
+--- /dev/null
++++ b/ts/test-node/maoyi/messageBridge_test.main.ts
+@@ -0,0 +1,330 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++import { EventEmitter } from 'node:events';
++import type { BrowserWindow, IpcMainInvokeEvent, WebContents } from 'electron';
++
++import type { MaoyiControlBridge } from '../../../app/maoyi/controlBridge.main.ts';
++import type {
++  MaoyiControlCommand,
++  MaoyiControlEvent,
++} from '../../../app/maoyi/controlProtocol.node.ts';
++import {
++  MaoyiRequestLedger,
++  startMaoyiMessageBridge,
++} from '../../../app/maoyi/messageBridge.main.ts';
++import type { MaoyiWindowController } from '../../../app/maoyi/windowController.main.ts';
++import {
++  maoyiMessageCommandChannel,
++  maoyiMessageEventChannel,
++} from '../../maoyi/messageBridgeChannels.std.ts';
++
++const conversationId = '22222222-2222-4222-8222-222222222222';
++const messageId = '33333333-3333-4333-8333-333333333333';
++const requestId = '11111111-1111-4111-8111-111111111111';
++const secondRequestId = '55555555-5555-4555-8555-555555555555';
++
++class FakeWebContents extends EventEmitter {
++  public destroyed = false;
++  public readonly commands: Array<unknown> = [];
++
++  public isDestroyed(): boolean {
++    return this.destroyed;
++  }
++
++  public send(channel: string, command: unknown): void {
++    assert.equal(channel, maoyiMessageCommandChannel);
++    this.commands.push(command);
++  }
++}
++
++// oxlint-disable-next-line max-classes-per-file
++class FakeWindow extends EventEmitter {
++  public destroyed = false;
++  public visible = true;
++  public readonly webContents = new FakeWebContents();
++
++  public isDestroyed(): boolean {
++    return this.destroyed;
++  }
++
++  public isVisible(): boolean {
++    return this.visible;
++  }
++}
++
++class FakeIpcMain {
++  public handler:
++    | ((event: IpcMainInvokeEvent, value: unknown) => boolean)
++    | undefined;
++
++  public handle(
++    channel: string,
++    handler: (event: IpcMainInvokeEvent, value: unknown) => boolean
++  ): void {
++    assert.equal(channel, maoyiMessageEventChannel);
++    this.handler = handler;
++  }
++
++  public removeHandler(channel: string): void {
++    assert.equal(channel, maoyiMessageEventChannel);
++    this.handler = undefined;
++  }
++}
++
++class FakeControlBridge {
++  public authenticated = true;
++  public readonly sent: Array<MaoyiControlEvent> = [];
++  readonly #commandHandlers = new Set<
++    (command: MaoyiControlCommand) => void
++  >();
++  readonly #transportHandlers = new Set<(authenticated: boolean) => void>();
++
++  public onCommand(
++    handler: (command: MaoyiControlCommand) => void
++  ): () => void {
++    this.#commandHandlers.add(handler);
++    return () => this.#commandHandlers.delete(handler);
++  }
++
++  public onTransportState(
++    handler: (authenticated: boolean) => void
++  ): () => void {
++    this.#transportHandlers.add(handler);
++    handler(this.authenticated);
++    return () => this.#transportHandlers.delete(handler);
++  }
++
++  public send(event: MaoyiControlEvent): boolean {
++    if (!this.authenticated) {
++      return false;
++    }
++    this.sent.push(event);
++    return true;
++  }
++
++  public emitCommand(command: MaoyiControlCommand): void {
++    for (const handler of this.#commandHandlers) {
++      handler(command);
++    }
++  }
++
++  public setAuthenticated(authenticated: boolean): void {
++    this.authenticated = authenticated;
++    for (const handler of this.#transportHandlers) {
++      handler(authenticated);
++    }
++  }
++}
++
++describe('Maoyi main message bridge', () => {
++  it('bounds request IDs and rejects stale, replayed, and cross-conversation transitions', () => {
++    let now = 1_000;
++    const ledger = new MaoyiRequestLedger(() => now, 2, 100);
++    const otherConversationId = '44444444-4444-4444-8444-444444444444';
++
++    assert.equal(ledger.beginSnapshot(requestId), true);
++    assert.equal(ledger.beginSnapshot(requestId), false);
++    assert.equal(ledger.beginVisible(requestId, conversationId), true);
++    assert.equal(ledger.acceptResult(requestId, otherConversationId), false);
++    assert.equal(ledger.acceptResult(requestId, conversationId), true);
++    assert.equal(ledger.acceptResult(requestId, conversationId), false);
++    assert.equal(ledger.acceptAck(requestId), true);
++    assert.equal(ledger.acceptAck(requestId), false);
++    assert.equal(ledger.beginVisible(requestId, conversationId), false);
++
++    now += 101;
++    assert.equal(ledger.beginVisible(requestId, conversationId), true);
++
++    const oneShotLedger = new MaoyiRequestLedger(() => now, 2, 100);
++    assert.equal(oneShotLedger.beginSnapshot(secondRequestId, true), true);
++    oneShotLedger.invalidateForConversationChange();
++    oneShotLedger.invalidateForConversationChange();
++    assert.equal(
++      oneShotLedger.beginVisible(secondRequestId, conversationId),
++      false
++    );
++  });
++
++  it('accepts only the attached visible main renderer and forwards each result once', () => {
++    const control = new FakeControlBridge();
++    const ipc = new FakeIpcMain();
++    let exposable = true;
++    const controller = {
++      canExposeWindows: () => exposable,
++    } as MaoyiWindowController;
++    const bridge = startMaoyiMessageBridge(
++      control as unknown as MaoyiControlBridge,
++      controller,
++      ipc as never
++    );
++    const window = new FakeWindow();
++    bridge.attachMainWindow(window as unknown as BrowserWindow);
++    window.webContents.commands.length = 0;
++    assert.ok(ipc.handler);
++    const event = {
++      sender: window.webContents as unknown as WebContents,
++    } as IpcMainInvokeEvent;
++
++    assert.equal(
++      ipc.handler(event, {
++        type: 'conversation.changed',
++        conversationId,
++      }),
++      true
++    );
++    assert.equal(
++      ipc.handler(event, {
++        type: 'message.visibleBatch',
++        requestId,
++        conversationId,
++        messages: [
++          {
++            conversationId,
++            messageId,
++            sourceHash: '1abc23',
++            sourceText: 'hello',
++            direction: 'incoming',
++            timestamp: 1_800_000_000_000,
++          },
++        ],
++      }),
++      true
++    );
++
++    const resultCommand: MaoyiControlCommand = {
++      type: 'translation.cacheResultBatch',
++      requestId,
++      conversationId,
++      results: [
++        {
++          conversationId,
++          messageId,
++          sourceHash: '1abc23',
++          sourceText: 'hello',
++          translatedText: 'translation',
++        },
++      ],
++    };
++    control.emitCommand(resultCommand);
++    control.emitCommand(resultCommand);
++    assert.equal(window.webContents.commands.length, 1);
++    assert.deepEqual(window.webContents.commands[0], resultCommand);
++
++    assert.equal(
++      ipc.handler(event, {
++        type: 'translation.cacheResultApplied',
++        requestId,
++        appliedCount: 1,
++      }),
++      true
++    );
++    assert.equal(
++      ipc.handler(event, {
++        type: 'translation.cacheResultApplied',
++        requestId,
++        appliedCount: 1,
++      }),
++      false
++    );
++
++    const foreignEvent = {
++      sender: new FakeWebContents() as unknown as WebContents,
++    } as IpcMainInvokeEvent;
++    const commandCountBeforeForeignEvent = window.webContents.commands.length;
++    assert.equal(
++      ipc.handler(foreignEvent, {
++        type: 'conversation.changed',
++        conversationId,
++      }),
++      false
++    );
++    assert.equal(
++      window.webContents.commands.length,
++      commandCountBeforeForeignEvent
++    );
++
++    control.emitCommand({
++      type: 'message.snapshot.request',
++      requestId: secondRequestId,
++    });
++    assert.deepEqual(window.webContents.commands.at(-1), {
++      type: 'message.snapshot.request',
++      requestId: secondRequestId,
++    });
++    const otherConversationId = '44444444-4444-4444-8444-444444444444';
++    assert.equal(
++      ipc.handler(event, {
++        type: 'conversation.changed',
++        conversationId: otherConversationId,
++      }),
++      true
++    );
++    assert.equal(
++      ipc.handler(event, {
++        type: 'message.visibleBatch',
++        requestId: secondRequestId,
++        conversationId: otherConversationId,
++        messages: [],
++      }),
++      false
++    );
++
++    const commandsBeforeReload = window.webContents.commands.length;
++    window.webContents.emit('did-finish-load');
++    assert.equal(window.webContents.commands.length, commandsBeforeReload + 1);
++    assert.deepEqual(window.webContents.commands.at(-1), {
++      type: 'translation.runtime.clear',
++    });
++
++    exposable = false;
++    window.visible = false;
++    window.emit('hide');
++    assert.deepEqual(window.webContents.commands.at(-1), {
++      type: 'translation.runtime.clear',
++    });
++    assert.equal(
++      ipc.handler(event, {
++        type: 'conversation.changed',
++        conversationId,
++      }),
++      false
++    );
++
++    exposable = true;
++    window.visible = true;
++    control.emitCommand({ type: 'window.show' });
++    const localSnapshot = window.webContents.commands.at(-1);
++    assert.ok(
++      typeof localSnapshot === 'object' &&
++        localSnapshot != null &&
++        'type' in localSnapshot &&
++        localSnapshot.type === 'message.snapshot.request' &&
++        'requestId' in localSnapshot &&
++        typeof localSnapshot.requestId === 'string'
++    );
++    assert.match(
++      localSnapshot.requestId,
++      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
++    );
++    assert.equal(
++      ipc.handler(event, {
++        type: 'conversation.changed',
++        conversationId: otherConversationId,
++      }),
++      true
++    );
++    assert.equal(
++      ipc.handler(event, {
++        type: 'message.visibleBatch',
++        requestId: localSnapshot.requestId,
++        conversationId: otherConversationId,
++        messages: [],
++      }),
++      true
++    );
++
++    bridge.stop();
++  });
++});
+diff --git a/ts/test-node/maoyi/messageProjection_test.node.ts b/ts/test-node/maoyi/messageProjection_test.node.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d601f8a7e00a3cc7f5c968c99852467a31182d7
+--- /dev/null
++++ b/ts/test-node/maoyi/messageProjection_test.node.ts
+@@ -0,0 +1,113 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++
++import {
++  maoyiMaximumSourceTextLength,
++  maoyiTranslationMatchesProjection,
++  legacyMaoyiSourceHash,
++  normalizeMaoyiSourceText,
++  projectMaoyiMessage,
++  type MaoyiMessageProjectionInput,
++} from '../../maoyi/messageProjection.std.ts';
++
++function message(
++  overrides: Partial<MaoyiMessageProjectionInput> = {}
++): MaoyiMessageProjectionInput {
++  return {
++    id: 'message-1',
++    conversationId: 'conversation-1',
++    text: 'Hello world',
++    direction: 'incoming',
++    timestamp: 1_800_000_000_000,
++    ...overrides,
++  };
++}
++
++describe('Maoyi message projection', () => {
++  it('normalizes and hashes exactly like the legacy renderer cache', () => {
++    assert.equal(
++      normalizeMaoyiSourceText('  Hello\n\tworld  '),
++      'Hello world'
++    );
++    assert.equal(legacyMaoyiSourceHash('  Hello\n\tworld  '), 'os091j');
++    assert.equal(legacyMaoyiSourceHash('Hello world'), 'os091j');
++  });
++
++  it('projects a stable identity for an ordinary English body', () => {
++    assert.deepEqual(projectMaoyiMessage(message()), {
++      conversationId: 'conversation-1',
++      messageId: 'message-1',
++      sourceHash: 'os091j',
++      sourceText: 'Hello world',
++      direction: 'incoming',
++      timestamp: 1_800_000_000_000,
++    });
++  });
++
++  it('excludes non-English, oversized, attachment, and special bubbles', () => {
++    assert.equal(projectMaoyiMessage(message({ text: '你好' })), undefined);
++    assert.equal(
++      projectMaoyiMessage(message({ text: 'Hello 你好' })),
++      undefined
++    );
++    assert.equal(
++      projectMaoyiMessage(
++        message({ text: `A${'b'.repeat(maoyiMaximumSourceTextLength)}` })
++      ),
++      undefined
++    );
++
++    const excluded: ReadonlyArray<Partial<MaoyiMessageProjectionInput>> = [
++      { attachments: [{}] },
++      { textAttachment: {} },
++      { attachmentDroppedDueToSize: true },
++      { contact: {} },
++      { deletedForEveryone: true },
++      { giftBadge: {} },
++      { isSticker: true },
++      { isTapToView: true },
++      { payment: {} },
++      { poll: {} },
++      { storyReplyContext: {} },
++    ];
++    for (const payload of excluded) {
++      assert.equal(projectMaoyiMessage(message(payload)), undefined);
++    }
++  });
++
++  it('requires exact message, conversation, source text, and hash matches', () => {
++    const projection = projectMaoyiMessage(message());
++    assert.ok(projection);
++    const exact = {
++      conversationId: projection.conversationId,
++      messageId: projection.messageId,
++      sourceHash: projection.sourceHash,
++      sourceText: projection.sourceText,
++      translatedText: '你好，世界',
++    };
++    assert.equal(maoyiTranslationMatchesProjection(projection, exact), true);
++    assert.equal(
++      maoyiTranslationMatchesProjection(projection, {
++        ...exact,
++        sourceText: 'Hello  world',
++      }),
++      false
++    );
++    assert.equal(
++      maoyiTranslationMatchesProjection(projection, {
++        ...exact,
++        messageId: 'message-2',
++      }),
++      false
++    );
++    assert.equal(
++      maoyiTranslationMatchesProjection(projection, {
++        ...exact,
++        sourceHash: 'tampered',
++      }),
++      false
++    );
++  });
++});
+diff --git a/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts b/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfafc040d8e0df48485e212e61abc03f22f523c0
+--- /dev/null
++++ b/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts
+@@ -0,0 +1,405 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++import type { IpcRendererEvent } from 'electron';
++
++import { createMaoyiRendererMessageBridge } from '../../maoyi/messageBridge.preload.ts';
++import {
++  projectMaoyiMessage,
++  type MaoyiMessageProjection,
++} from '../../maoyi/messageProjection.std.ts';
++import {
++  clearMaoyiTranslationRuntime,
++  getMaoyiTranslation,
++} from '../../maoyi/translationRuntime.preload.ts';
++import {
++  maoyiMessageCommandChannel,
++  maoyiMessageEventChannel,
++} from '../../maoyi/messageBridgeChannels.std.ts';
++
++const conversationId = '22222222-2222-4222-8222-222222222222';
++const otherConversationId = '44444444-4444-4444-8444-444444444444';
++const messageId = 'abcdefab-cdef-4abc-8def-abcdefabcdef';
++
++function projection(
++  overrides: Readonly<{
++    messageId?: string;
++    conversationId?: string;
++    text?: string;
++    timestamp?: number;
++  }> = {}
++): MaoyiMessageProjection {
++  const value = projectMaoyiMessage({
++    id: overrides.messageId ?? messageId,
++    conversationId: overrides.conversationId ?? conversationId,
++    text: overrides.text ?? 'Hello world',
++    direction: 'incoming',
++    timestamp: overrides.timestamp ?? 1_800_000_000_000,
++  });
++  assert.ok(value);
++  return value;
++}
++
++type InvocationBlocker = Readonly<{
++  type: string;
++  observed: Promise<void>;
++  markObserved: () => void;
++  wait: Promise<void>;
++  release: () => void;
++}>;
++
++function isVisibleBatch(value: unknown): value is Readonly<{
++  type: 'message.visibleBatch';
++  requestId: string;
++  conversationId: string;
++  messages: ReadonlyArray<MaoyiMessageProjection>;
++}> {
++  return (
++    typeof value === 'object' &&
++    value != null &&
++    'type' in value &&
++    value.type === 'message.visibleBatch' &&
++    'requestId' in value &&
++    typeof value.requestId === 'string' &&
++    'conversationId' in value &&
++    typeof value.conversationId === 'string' &&
++    'messages' in value &&
++    Array.isArray(value.messages)
++  );
++}
++
++class FakeRendererTransport {
++  public readonly invocations: Array<unknown> = [];
++  public listener:
++    | ((event: IpcRendererEvent, value: unknown) => void)
++    | undefined;
++  public blocker: InvocationBlocker | undefined;
++  public rejectedType: string | undefined;
++
++  public async invoke(channel: string, value: unknown): Promise<boolean> {
++    assert.equal(channel, maoyiMessageEventChannel);
++    this.invocations.push(value);
++    const blocker = this.blocker;
++    if (
++      blocker &&
++      typeof value === 'object' &&
++      value != null &&
++      'type' in value &&
++      value.type === blocker.type
++    ) {
++      blocker.markObserved();
++      await blocker.wait;
++      if (this.blocker === blocker) {
++        this.blocker = undefined;
++      }
++    }
++    if (
++      this.rejectedType &&
++      typeof value === 'object' &&
++      value != null &&
++      'type' in value &&
++      value.type === this.rejectedType
++    ) {
++      this.rejectedType = undefined;
++      return false;
++    }
++    return true;
++  }
++
++  public blockNext(type: string): InvocationBlocker {
++    let markObserved: (() => void) | undefined;
++    let release: (() => void) | undefined;
++    const blocker: InvocationBlocker = {
++      type,
++      observed: new Promise<void>(resolve => {
++        markObserved = resolve;
++      }),
++      markObserved: () => markObserved?.(),
++      wait: new Promise<void>(resolve => {
++        release = resolve;
++      }),
++      release: () => release?.(),
++    };
++    this.blocker = blocker;
++    return blocker;
++  }
++
++  public rejectNext(type: string): void {
++    this.rejectedType = type;
++  }
++
++  public on(
++    channel: string,
++    listener: (event: IpcRendererEvent, value: unknown) => void
++  ): void {
++    assert.equal(channel, maoyiMessageCommandChannel);
++    this.listener = listener;
++  }
++
++  public off(
++    channel: string,
++    listener: (event: IpcRendererEvent, value: unknown) => void
++  ): void {
++    assert.equal(channel, maoyiMessageCommandChannel);
++    if (this.listener === listener) {
++      this.listener = undefined;
++    }
++  }
++
++  public emit(value: unknown): void {
++    this.listener?.({} as IpcRendererEvent, value);
++  }
++}
++
++describe('Maoyi renderer message bridge', () => {
++  beforeEach(() => clearMaoyiTranslationRuntime());
++  afterEach(() => clearMaoyiTranslationRuntime());
++
++  it('applies only an exact one-time result and clears on the main-process gate', async () => {
++    const transport = new FakeRendererTransport();
++    const bridge = createMaoyiRendererMessageBridge(transport);
++    const value = projection();
++
++    await bridge.publishVisibleMessages(conversationId, [value]);
++    const visible = transport.invocations.find(
++      item =>
++        typeof item === 'object' &&
++        item != null &&
++        'type' in item &&
++        item.type === 'message.visibleBatch'
++    );
++    assert.ok(
++      typeof visible === 'object' && visible != null && 'requestId' in visible
++    );
++    const requestId = visible.requestId;
++    assert.equal(typeof requestId, 'string');
++
++    transport.emit({
++      type: 'translation.cacheResultBatch',
++      requestId,
++      conversationId,
++      results: [
++        {
++          conversationId,
++          messageId,
++          sourceHash: value.sourceHash,
++          sourceText: value.sourceText,
++          translatedText: '译文',
++        },
++      ],
++    });
++    assert.equal(getMaoyiTranslation(value), '译文');
++
++    transport.emit({
++      type: 'translation.cacheResultBatch',
++      requestId,
++      conversationId,
++      results: [
++        {
++          conversationId,
++          messageId,
++          sourceHash: value.sourceHash,
++          sourceText: value.sourceText,
++          translatedText: 'replayed translation',
++        },
++      ],
++    });
++    assert.equal(getMaoyiTranslation(value), '译文');
++
++    transport.emit({ type: 'translation.runtime.clear' });
++    assert.equal(getMaoyiTranslation(value), undefined);
++    bridge.stop();
++  });
++
++  it('rejects a result batch when any returned source identity is mismatched', async () => {
++    const transport = new FakeRendererTransport();
++    const bridge = createMaoyiRendererMessageBridge(transport);
++    const value = projection();
++
++    await bridge.publishVisibleMessages(conversationId, [value]);
++    const visible = transport.invocations.at(-1);
++    assert.ok(
++      typeof visible === 'object' &&
++        visible != null &&
++        'requestId' in visible &&
++        typeof visible.requestId === 'string'
++    );
++    transport.emit({
++      type: 'translation.cacheResultBatch',
++      requestId: visible.requestId,
++      conversationId,
++      results: [
++        {
++          conversationId,
++          messageId,
++          sourceHash: value.sourceHash,
++          sourceText: 'Edited source text',
++          translatedText: 'must not render',
++        },
++      ],
++    });
++    assert.equal(getMaoyiTranslation(value), undefined);
++    bridge.stop();
++  });
++
++  it('rejects message UUID duplicates that differ only by letter case', async () => {
++    const transport = new FakeRendererTransport();
++    const bridge = createMaoyiRendererMessageBridge(transport);
++    const value = projection();
++
++    await bridge.publishVisibleMessages(conversationId, [value]);
++    const visible = transport.invocations.at(-1);
++    assert.ok(
++      typeof visible === 'object' &&
++        visible != null &&
++        'requestId' in visible &&
++        typeof visible.requestId === 'string'
++    );
++    const invocationCount = transport.invocations.length;
++    transport.emit({
++      type: 'translation.cacheResultBatch',
++      requestId: visible.requestId,
++      conversationId,
++      results: [
++        {
++          conversationId,
++          messageId,
++          sourceHash: value.sourceHash,
++          sourceText: value.sourceText,
++          translatedText: 'first translation',
++        },
++        {
++          conversationId,
++          messageId: messageId.toUpperCase(),
++          sourceHash: value.sourceHash,
++          sourceText: value.sourceText,
++          translatedText: 'second translation',
++        },
++      ],
++    });
++    assert.equal(getMaoyiTranslation(value), undefined);
++    assert.equal(transport.invocations.length, invocationCount);
++    bridge.stop();
++  });
++
++  it('invalidates an old result when the same visible message body is edited', async () => {
++    const transport = new FakeRendererTransport();
++    const bridge = createMaoyiRendererMessageBridge(transport);
++    const original = projection();
++    const edited = projection({ text: 'Edited English body' });
++
++    await bridge.publishVisibleMessages(conversationId, [original]);
++    const originalVisible = transport.invocations.find(isVisibleBatch);
++    assert.ok(originalVisible);
++    await bridge.publishVisibleMessages(conversationId, [edited]);
++    const visibleBatches = transport.invocations.filter(isVisibleBatch);
++    const editedVisible = visibleBatches.at(-1);
++    assert.ok(editedVisible);
++    assert.notEqual(editedVisible.requestId, originalVisible.requestId);
++    assert.equal(editedVisible.messages[0]?.sourceText, edited.sourceText);
++
++    transport.emit({
++      type: 'translation.cacheResultBatch',
++      requestId: originalVisible.requestId,
++      conversationId,
++      results: [
++        {
++          conversationId,
++          messageId,
++          sourceHash: original.sourceHash,
++          sourceText: original.sourceText,
++          translatedText: 'stale translation',
++        },
++      ],
++    });
++    assert.equal(getMaoyiTranslation(original), undefined);
++    assert.equal(getMaoyiTranslation(edited), undefined);
++
++    transport.emit({
++      type: 'translation.cacheResultBatch',
++      requestId: editedVisible.requestId,
++      conversationId,
++      results: [
++        {
++          conversationId,
++          messageId,
++          sourceHash: edited.sourceHash,
++          sourceText: edited.sourceText,
++          translatedText: 'fresh translation',
++        },
++      ],
++    });
++    assert.equal(getMaoyiTranslation(edited), 'fresh translation');
++    bridge.stop();
++  });
++
++  it('re-reads a queued snapshot after A/B switch and stops remaining A batches', async () => {
++    const transport = new FakeRendererTransport();
++    const bridge = createMaoyiRendererMessageBridge(transport);
++    const messagesA = Array.from({ length: 101 }, (_, index) =>
++      projection({
++        messageId: `abcdefab-cdef-4abc-8def-${index
++          .toString(16)
++          .padStart(12, '0')}`,
++        text: `English A message ${index}`,
++        timestamp: 1_800_000_000_000 + index,
++      })
++    );
++    const messageB = projection({
++      conversationId: otherConversationId,
++      text: 'English B message',
++    });
++    const removeProviderA = bridge.setSnapshotProvider(() => ({
++      conversationId,
++      messages: messagesA,
++    }));
++    const blocker = transport.blockNext('message.visibleBatch');
++    const publishA = bridge.publishVisibleMessages(conversationId, messagesA);
++    await blocker.observed;
++
++    const forcedRequestId = '66666666-6666-4666-8666-666666666666';
++    transport.emit({
++      type: 'message.snapshot.request',
++      requestId: forcedRequestId,
++    });
++    removeProviderA();
++    bridge.setSnapshotProvider(() => ({
++      conversationId: otherConversationId,
++      messages: [messageB],
++    }));
++    const publishB = bridge.publishVisibleMessages(otherConversationId, [
++      messageB,
++    ]);
++    blocker.release();
++    await Promise.all([publishA, publishB]);
++
++    const visibleBatches = transport.invocations.filter(isVisibleBatch);
++    assert.equal(
++      visibleBatches.filter(item => item.conversationId === conversationId)
++        .length,
++      1
++    );
++    const forcedBatch = visibleBatches.find(
++      item => item.requestId === forcedRequestId
++    );
++    assert.ok(forcedBatch);
++    assert.equal(forcedBatch.conversationId, otherConversationId);
++    assert.equal(forcedBatch.messages[0]?.sourceText, messageB.sourceText);
++    bridge.stop();
++  });
++
++  it('retries the same visible signature after transport rejection', async () => {
++    const transport = new FakeRendererTransport();
++    const bridge = createMaoyiRendererMessageBridge(transport);
++    const value = projection();
++    transport.rejectNext('message.visibleBatch');
++
++    await bridge.publishVisibleMessages(conversationId, [value]);
++    await bridge.publishVisibleMessages(conversationId, [value]);
++    const visibleBatches = transport.invocations.filter(isVisibleBatch);
++    assert.equal(visibleBatches.length, 2);
++    assert.notEqual(visibleBatches[0]?.requestId, visibleBatches[1]?.requestId);
++    bridge.stop();
++  });
++});
+diff --git a/ts/test-node/maoyi/translationRuntime_test.preload.ts b/ts/test-node/maoyi/translationRuntime_test.preload.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f2d5306675669ba659e5c6e7cc043f156967410
+--- /dev/null
++++ b/ts/test-node/maoyi/translationRuntime_test.preload.ts
+@@ -0,0 +1,158 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++
++import {
++  legacyMaoyiSourceHash,
++  projectMaoyiMessage,
++  type MaoyiMessageProjection,
++  type MaoyiTranslationResult,
++} from '../../maoyi/messageProjection.std.ts';
++import {
++  applyMaoyiTranslationBatch,
++  clearMaoyiTranslationRuntime,
++  maoyiTranslationByteLimit,
++  maoyiTranslationEntryLimit,
++  getMaoyiTranslation,
++  getMaoyiTranslationRuntimeStats,
++  subscribeToMaoyiTranslations,
++} from '../../maoyi/translationRuntime.preload.ts';
++
++function projection(
++  messageId: string,
++  sourceText = `English message ${messageId}`,
++  conversationId = 'conversation-1'
++): MaoyiMessageProjection {
++  const value = projectMaoyiMessage({
++    id: messageId,
++    conversationId,
++    text: sourceText,
++    direction: 'incoming',
++    timestamp: 1_800_000_000_000,
++  });
++  assert.ok(value);
++  return value;
++}
++
++function result(
++  value: MaoyiMessageProjection,
++  translatedText = `译文 ${value.messageId}`
++): MaoyiTranslationResult {
++  return {
++    conversationId: value.conversationId,
++    messageId: value.messageId,
++    sourceHash: value.sourceHash,
++    sourceText: value.sourceText,
++    translatedText,
++  };
++}
++
++describe('Maoyi translation runtime', () => {
++  beforeEach(() => {
++    clearMaoyiTranslationRuntime();
++  });
++
++  afterEach(() => {
++    clearMaoyiTranslationRuntime();
++  });
++
++  it('applies a whole batch before notifying subscribers once', () => {
++    const first = projection('message-1');
++    const second = projection('message-2');
++    let notifications = 0;
++    const unsubscribe = subscribeToMaoyiTranslations(() => {
++      notifications += 1;
++    });
++    try {
++      assert.equal(
++        applyMaoyiTranslationBatch([result(first), result(second)]),
++        2
++      );
++      assert.equal(notifications, 1);
++      assert.equal(getMaoyiTranslation(first), '译文 message-1');
++      assert.equal(getMaoyiTranslation(second), '译文 message-2');
++
++      assert.equal(
++        applyMaoyiTranslationBatch([result(first), result(second)]),
++        0
++      );
++      assert.equal(notifications, 1);
++    } finally {
++      unsubscribe();
++    }
++  });
++
++  it('isolates identical message IDs by conversation and rejects edited text', () => {
++    const firstConversation = projection('same-id', 'Original English text');
++    const secondConversation = projection(
++      'same-id',
++      'Other English text',
++      'conversation-2'
++    );
++    applyMaoyiTranslationBatch([
++      result(firstConversation, '第一段译文'),
++      result(secondConversation, '第二段译文'),
++    ]);
++
++    assert.equal(getMaoyiTranslation(firstConversation), '第一段译文');
++    assert.equal(getMaoyiTranslation(secondConversation), '第二段译文');
++    assert.equal(
++      getMaoyiTranslation(
++        projection('same-id', 'Edited English text', 'conversation-1')
++      ),
++      undefined
++    );
++  });
++
++  it('rejects non-canonical source text and tampered legacy hashes', () => {
++    const value = projection('message-1');
++    assert.equal(
++      applyMaoyiTranslationBatch([
++        { ...result(value), sourceText: 'English  message message-1' },
++        { ...result(value), sourceHash: 'tampered' },
++      ]),
++      0
++    );
++    assert.equal(getMaoyiTranslation(value), undefined);
++    assert.equal(legacyMaoyiSourceHash(value.sourceText), value.sourceHash);
++  });
++
++  it('evicts the least-recently-used entry at the 1500-entry limit', () => {
++    const projections = Array.from(
++      { length: maoyiTranslationEntryLimit },
++      (_, index) => projection(`message-${index}`)
++    );
++    applyMaoyiTranslationBatch(projections.map(value => result(value)));
++
++    // Reading an entry makes it the most recently used without notifying subscribers.
++    const first = projections[0];
++    const second = projections[1];
++    assert.ok(first);
++    assert.ok(second);
++    assert.equal(getMaoyiTranslation(first), '译文 message-0');
++    const newest = projection('message-newest');
++    applyMaoyiTranslationBatch([result(newest)]);
++
++    assert.equal(getMaoyiTranslation(first), '译文 message-0');
++    assert.equal(getMaoyiTranslation(second), undefined);
++    assert.equal(getMaoyiTranslation(newest), '译文 message-newest');
++    assert.equal(
++      getMaoyiTranslationRuntimeStats().entries,
++      maoyiTranslationEntryLimit
++    );
++  });
++
++  it('keeps the in-memory cache below the 15 MiB byte limit', () => {
++    const largeResults = Array.from({ length: 300 }, (_, index) => {
++      const value = projection(`large-${index}`);
++      return result(value, '中'.repeat(30_000));
++    });
++    applyMaoyiTranslationBatch(largeResults);
++
++    const stats = getMaoyiTranslationRuntimeStats();
++    assert.ok(stats.entries > 0);
++    assert.ok(stats.entries < largeResults.length);
++    assert.ok(stats.estimatedBytes <= maoyiTranslationByteLimit);
++  });
++});
+diff --git a/ts/test-node/maoyi/translationSlot_test.node.ts b/ts/test-node/maoyi/translationSlot_test.node.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ff885550c5c0214b7fd875571e12c13464c66a2
+--- /dev/null
++++ b/ts/test-node/maoyi/translationSlot_test.node.ts
+@@ -0,0 +1,43 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++
++describe('Maoyi translation slot', () => {
++  it('places metadata below translated text and preserves hidden metadata', () => {
++    const source = readFileSync(
++      'ts/components/conversation/Message.dom.tsx',
++      'utf8'
++    );
++    const methodStart = source.indexOf('#getMetadataPlacement(');
++    const methodEnd = source.indexOf(
++      '\n  public startTargetedTimer',
++      methodStart
++    );
++    assert.notEqual(methodStart, -1);
++    assert.notEqual(methodEnd, -1);
++    const method = source.slice(methodStart, methodEnd);
++
++    const hiddenIndex = method.indexOf('return MetadataPlacement.NotRendered;');
++    const translationIndex = method.indexOf('if (maoyiTranslationText)');
++    const bottomIndex = method.indexOf(
++      'return MetadataPlacement.Bottom;',
++      translationIndex
++    );
++    assert.ok(hiddenIndex >= 0);
++    assert.ok(translationIndex > hiddenIndex);
++    assert.ok(bottomIndex > translationIndex);
++  });
++
++  it('renders translation as escaped React text with language direction hints', () => {
++    const source = readFileSync(
++      'ts/components/conversation/Message.dom.tsx',
++      'utf8'
++    );
++    assert.match(source, /className="module-message__maoyi-translation"/);
++    assert.match(source, /dir="auto"/);
++    assert.match(source, /lang="zh-CN"/);
++    assert.match(source, /\{maoyiTranslationText\}/);
++  });
++});
+diff --git a/ts/windows/main/phase1-ipc.preload.ts b/ts/windows/main/phase1-ipc.preload.ts
+index 5b3c2c74aa007f0b70a70596b844dc4f73a81f83..c99370b21dbcc684f912e8f8e88f008914f18fc7 100644
+--- a/ts/windows/main/phase1-ipc.preload.ts
++++ b/ts/windows/main/phase1-ipc.preload.ts
+@@ -33,11 +33,14 @@ import { ToastType } from '../../types/Toast.dom.tsx';
+ import { ConversationController } from '../../ConversationController.preload.ts';
+ import { isEnabled } from '../../RemoteConfig.dom.ts';
+ import { itemStorage } from '../../textsecure/Storage.preload.ts';
++import { startMaoyiRendererMessageBridge } from '../../maoyi/messageBridge.preload.ts';
+ 
+ const { mapValues } = lodash;
+ 
+ const log = createLogger('phase1-ipc');
+ 
++startMaoyiRendererMessageBridge();
++
+ // We are comfortable doing this because we verified the type on the other side!
+ const { config } = SignalContext;
+ 

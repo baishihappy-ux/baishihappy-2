@@ -7,7 +7,7 @@
 - 打包后强制关闭 RunAsNode、NODE_OPTIONS、Node 调试等 Electron Fuses，并启用 ASAR 完整性与 OnlyLoadAppFromAsar。
 - 客户端不再向渲染页返回服务密钥；正式包不携带试用密钥文件、授权端私钥或授权端源码入口。
 - 已删除会从旧配置提取明文密钥的过时 `prepare-trial-config.cjs` 工具，并加入防回归门禁。
-- 授权升级为 `MYM2 + MYLIC2`：设备 X25519 密钥由 DPAPI 保护，授权载荷使用 X25519/HKDF-SHA256/AES-256-GCM 加密，并由套装 Ed25519 私钥签名。
+- 授权升级为 `DFM2 + DFLIC2`：设备 X25519 密钥由 DPAPI 保护，授权载荷使用 X25519/HKDF-SHA256/AES-256-GCM 加密，并由套装 Ed25519 私钥签名。
 - 翻译磁盘缓存升级为 `TranslationCache/v3`：每条记录独立 AES-256-GCM 加密，密钥由 DPAPI 保护并绑定套装和数据根；旧明文缓存定向删除，不迁移。
 - 主渲染页和指纹浏览器不再把译文明文写入 `localStorage`；页面侧只保留最多 1500 条或 15 MB 的进程内热缓存，重启后从机器绑定的加密 `TranslationCache/v3` 批量恢复。
 - 主渲染页旧明文键在启动时立即删除；WhatsApp/Telegram 在 WebView 就绪时删除；Signal 在每个实例下次合法启动时删除。清理不迁移译文、不清除平台登录态。
@@ -27,7 +27,7 @@
 
 - 在真实 WhatsApp、Telegram、Signal 中分别验证翻译后第二次回车发送与发送后气泡核对。
 - 在三个平台分别验证纯数字账号、TRC20、ERC20/BEP20 网络选择和 Solana 地址的第一次确认、第二次发送、内容变化作废。
-- 在新生成但尚未制作的完整套装中验证授权程序签发 `MYLIC2`、客户端激活、重启自动验签和第 5 次错误后的实际卸载。
+- 在新生成但尚未制作的完整套装中验证授权程序签发 `DFLIC2`、客户端激活、重启自动验签和第 5 次错误后的实际卸载。
 - 在第二台实体 Windows 电脑验证外来 Signal 和完整数据根的初始化。
 
 ## 无服务器边界

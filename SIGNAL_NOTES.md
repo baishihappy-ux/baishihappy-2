@@ -2,10 +2,10 @@
 
 ## 2026-07-08 Competitor Runtime Findings
 
-Confirmed from the running external reference client and extracted runtime:
+Confirmed from the running Look World client and extracted runtime:
 
-- external reference launches embedded Signal with `--appId`, `--wsPort`, `--windowMode=embed`, and a per-instance `--user-data-dir`.
-- The active test instance used `--wsPort=23510` and connected back to the main external reference process over localhost WebSocket.
+- Look World launches embedded Signal with `--appId`, `--wsPort`, `--windowMode=embed`, and a per-instance `--user-data-dir`.
+- The active test instance used `--wsPort=23510` and connected back to the main Look World process over localhost WebSocket.
 - The embedded Signal window was still a top-level `Chrome_WidgetWin_0` window with `Parent=0x0`; no native `SetParent` child-window embedding was observed in the window handle inspection.
 - The embedded Signal control code handles `window.show`, `window.hide`, `window.bounds-changed`, `shutdown`, `heartbeat`, and `notification`.
 - Its `window.show` handler temporarily calls `setAlwaysOnTop(true)`, then `show()`, `focus()`, and finally `setAlwaysOnTop(false)`.

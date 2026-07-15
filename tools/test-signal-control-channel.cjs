@@ -6,16 +6,20 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
-const runtimeDir = path.resolve('.runtime/signal-desktop');
+const runtimeDir = process.env.MAOYI_SIGNAL_RUNTIME_DIR
+  ? path.resolve(process.env.MAOYI_SIGNAL_RUNTIME_DIR)
+  : path.resolve('.runtime/signal-desktop');
 const signalExe = path.join(runtimeDir, 'Signal.exe');
 const testRoot = path.resolve('.tmp', `signal-control-test-${Date.now().toString(36)}`);
 const dataRoot = path.join(testRoot, 'maoyi Data');
-const profileId = 'control-test';
+const profileId = '00000000-0000-4000-8000-000000000001';
 const dataDir = path.join(dataRoot, 'SignalInstances', `Signal-${profileId}`);
 const appId = `Signal-${profileId}`;
 
 async function main() {
   const security = await import('../dist-electron/runtime-security-core.js');
+  const signalStat = await fs.stat(signalExe).catch(() => null);
+  if (!signalStat?.isFile()) throw new Error(`Signal runtime executable is missing: ${signalExe}`);
   await fs.rm(testRoot, { recursive: true, force: true });
   await fs.mkdir(dataDir, { recursive: true });
 
@@ -65,7 +69,12 @@ async function main() {
     '--title=SignalControlTest'
   ], {
     stdio: 'ignore',
-    windowsHide: false
+    windowsHide: false,
+    env: {
+      ...process.env,
+      MAOYI_SIGNAL_GUARD_DIAGNOSTIC: path.join(testRoot, 'guard.json'),
+      MAOYI_SIGNAL_GUARD_TEST_AUTOCLOSE: '1'
+    }
   });
   if (!child.pid) throw new Error('Signal control test process did not receive a process ID.');
   const credential = security.createSignalLaunchCredential(
@@ -78,7 +87,14 @@ async function main() {
   controlState.processId = child.pid;
   credentialPipe.deliver(credential);
 
-  const success = await waitFor(() => messages.some(message => message.type === 'window.state'), 60_000);
+  // Source-hardened Signal keeps its window fail-closed until a real Maoyi
+  // BrowserWindow owner is attached. This transport test has no owner window.
+  // Receiving a MAC-verified window state proves the guarded process accepted
+  // the launch credential and authenticated the bidirectional control channel.
+  const success = await waitFor(
+    () => messages.some(message => message.type === 'window.state'),
+    60_000
+  );
   if (success) {
     for (const socket of controlSockets) sendSecureFrame(socket, controlState, { type: 'shutdown' });
   }
@@ -89,10 +105,29 @@ async function main() {
   controlSockets.clear();
   await closeServer(server);
   await new Promise(resolve => setTimeout(resolve, 500));
+  let diagnostic = null;
+  try {
+    diagnostic = JSON.parse(await fs.readFile(path.join(testRoot, 'guard.json'), 'utf8'));
+  } catch {
+    diagnostic = null;
+  }
+  let preloadLog = '';
+  try {
+    preloadLog = await fs.readFile(path.join(dataDir, 'logs', 'main.log'), 'utf8');
+  } catch {
+    preloadLog = '';
+  }
   await fs.rm(testRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
 
-  if (!success) throw new Error('Signal control channel did not receive window.state within 60 seconds.');
-  console.log('signal-control: guarded launch and window control checks passed');
+  if (!success) {
+    const observed = messages.map(message => message?.type).filter(Boolean).join(', ') || 'none';
+    const stage = diagnostic?.stage || 'unavailable';
+    throw new Error(`Signal control channel did not authenticate and report window state within 60 seconds. Observed: ${observed}; guard: ${stage}.`);
+  }
+  if (/Preload error/i.test(preloadLog)) {
+    throw new Error(`Signal preload bridge failed for runtime ${runtimeDir}.`);
+  }
+  console.log('signal-control: guarded launch and authenticated transport checks passed');
 }
 
 const controlSockets = new Set();

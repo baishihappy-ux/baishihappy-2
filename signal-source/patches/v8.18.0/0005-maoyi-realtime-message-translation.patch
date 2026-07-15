@@ -1,0 +1,815 @@
+diff --git a/app/maoyi/controlProtocol.node.ts b/app/maoyi/controlProtocol.node.ts
+index 426f624..dbd8afb 100644
+--- a/app/maoyi/controlProtocol.node.ts
++++ b/app/maoyi/controlProtocol.node.ts
+@@ -3,6 +3,8 @@
+ 
+ import { createHmac, timingSafeEqual } from 'node:crypto';
+ 
++import { projectMaoyiMessage } from '../../ts/maoyi/messageProjection.std.ts';
++
+ export const maoyiControlProtocolVersion = 1;
+ export const maoyiControlMaxMessageBytes = 1024 * 1024;
+ export const maoyiControlMaxBusinessPayloadBytes = 768 * 1024;
+@@ -100,6 +102,7 @@ export type MaoyiControlEvent =
+   | Readonly<{ type: 'shutdown.ack' }>
+   | Readonly<{ type: 'protocol.opened'; requestId?: string }>
+   | Readonly<{ type: 'conversation.changed'; conversationId: string }>
++  | (Readonly<{ type: 'message.added' }> & MaoyiVisibleMessage)
+   | Readonly<{
+       type: 'message.visibleBatch';
+       requestId: string;
+@@ -467,6 +470,7 @@ export function parseMaoyiMessageControlEvent(value: unknown):
+       {
+         type:
+           | 'conversation.changed'
++          | 'message.added'
+           | 'message.visibleBatch'
+           | 'translation.cacheResultApplied';
+       }
+@@ -492,6 +496,48 @@ export function parseMaoyiMessageControlEvent(value: unknown):
+         };
+       }
+       return undefined;
++    case 'message.added': {
++      if (
++        !hasOnlyKeys(value, [
++          'type',
++          'conversationId',
++          'messageId',
++          'sourceHash',
++          'sourceText',
++          'direction',
++          'timestamp',
++        ]) ||
++        !isMaoyiControlUuid(value.conversationId)
++      ) {
++        return undefined;
++      }
++      const parsed = parseVisibleMessage(
++        {
++          conversationId: value.conversationId,
++          messageId: value.messageId,
++          sourceHash: value.sourceHash,
++          sourceText: value.sourceText,
++          direction: value.direction,
++          timestamp: value.timestamp,
++        },
++        value.conversationId
++      );
++      if (!parsed) {
++        return undefined;
++      }
++      const projected = projectMaoyiMessage({
++        id: parsed.messageId,
++        conversationId: parsed.conversationId,
++        text: parsed.sourceText,
++        direction: parsed.direction,
++        timestamp: parsed.timestamp,
++      });
++      return projected &&
++        projected.sourceText === parsed.sourceText &&
++        projected.sourceHash === parsed.sourceHash
++        ? { type: 'message.added', ...parsed }
++        : undefined;
++    }
+     case 'message.visibleBatch': {
+       if (
+         !hasOnlyKeys(value, [
+
+diff --git a/app/maoyi/messageBridge.main.ts b/app/maoyi/messageBridge.main.ts
+index 321a4bd..703bffa 100644
+--- a/app/maoyi/messageBridge.main.ts
++++ b/app/maoyi/messageBridge.main.ts
+@@ -187,6 +187,58 @@ export class MaoyiRequestLedger {
+   }
+ }
+ 
++// oxlint-disable-next-line max-classes-per-file
++export class MaoyiAddedMessageLedger {
++  readonly #entries = new Map<string, number>();
++  readonly #now: () => number;
++  readonly #limit: number;
++  readonly #ttlMs: number;
++
++  constructor(
++    now: () => number = Date.now,
++    limit = maoyiRequestCorrelationLimit,
++    ttlMs = maoyiRequestCorrelationTtlMs
++  ) {
++    this.#now = now;
++    this.#limit = limit;
++    this.#ttlMs = ttlMs;
++  }
++
++  #prune(): void {
++    const now = this.#now();
++    for (const [messageId, expiresAt] of this.#entries) {
++      if (expiresAt <= now) {
++        this.#entries.delete(messageId);
++      }
++    }
++  }
++
++  accept(messageId: string): boolean {
++    this.#prune();
++    const normalizedMessageId = messageId.toLowerCase();
++    if (this.#entries.has(normalizedMessageId)) {
++      return false;
++    }
++    while (this.#entries.size >= this.#limit) {
++      const oldest = this.#entries.keys().next();
++      if (oldest.done) {
++        return false;
++      }
++      this.#entries.delete(oldest.value);
++    }
++    this.#entries.set(normalizedMessageId, this.#now() + this.#ttlMs);
++    return true;
++  }
++
++  remove(messageId: string): void {
++    this.#entries.delete(messageId.toLowerCase());
++  }
++
++  clear(): void {
++    this.#entries.clear();
++  }
++}
++
+ export type MaoyiMessageBridge = Readonly<{
+   attachMainWindow: (window: BrowserWindow) => void;
+   stop: () => void;
+@@ -217,6 +269,7 @@ export function startMaoyiMessageBridge(
+   }
+ 
+   const requestLedger = new MaoyiRequestLedger();
++  const addedMessageLedger = new MaoyiAddedMessageLedger();
+   let mainWindow: BrowserWindow | undefined;
+   let currentConversationId: string | undefined;
+   let transportAuthenticated = false;
+@@ -241,6 +294,7 @@ export function startMaoyiMessageBridge(
+   const clearRendererRuntime = (): void => {
+     currentConversationId = undefined;
+     requestLedger.invalidateAll();
++    addedMessageLedger.clear();
+     sendRendererCommand({ type: 'translation.runtime.clear' });
+   };
+ 
+@@ -276,6 +330,7 @@ export function startMaoyiMessageBridge(
+       case 'conversation.changed': {
+         if (currentConversationId !== parsed.conversationId) {
+           requestLedger.invalidateForConversationChange();
++          addedMessageLedger.clear();
+         }
+         currentConversationId = parsed.conversationId;
+         if (!controlBridge.send(parsed)) {
+@@ -284,6 +339,19 @@ export function startMaoyiMessageBridge(
+         }
+         return true;
+       }
++      case 'message.added': {
++        if (
++          currentConversationId !== parsed.conversationId ||
++          !addedMessageLedger.accept(parsed.messageId)
++        ) {
++          return false;
++        }
++        if (!controlBridge.send(parsed)) {
++          addedMessageLedger.remove(parsed.messageId);
++          return false;
++        }
++        return true;
++      }
+       case 'message.visibleBatch': {
+         if (
+           currentConversationId !== parsed.conversationId ||
+
+diff --git a/ts/maoyi/messageAddedObserver.std.ts b/ts/maoyi/messageAddedObserver.std.ts
+new file mode 100644
+index 0000000..f6750e3
+--- /dev/null
++++ b/ts/maoyi/messageAddedObserver.std.ts
+@@ -0,0 +1,101 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import type { UnknownAction } from 'redux';
++
++import type { StateType } from '../state/reducer.preload.ts';
++import { getSelectedConversationId } from '../state/selectors/nav.std.ts';
++import type { MaoyiMessageProjection } from './messageProjection.std.ts';
++import { projectMaoyiVisibleMessages } from './visibleMessageProjection.std.ts';
++
++type ParsedMessagesAddedAction = Readonly<{
++  conversationId: string;
++  isActive: boolean;
++  messageId: string;
++}>;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value != null && !Array.isArray(value);
++}
++
++function hasOnlyKeys(
++  value: Record<string, unknown>,
++  allowed: ReadonlyArray<string>
++): boolean {
++  const allowedKeys = new Set(allowed);
++  return Object.keys(value).every(key => allowedKeys.has(key));
++}
++
++function parseMessagesAddedAction(
++  action: UnknownAction
++): ParsedMessagesAddedAction | undefined {
++  if (action.type !== 'MESSAGES_ADDED' || !isRecord(action.payload)) {
++    return undefined;
++  }
++  const payload = action.payload;
++  if (
++    !hasOnlyKeys(payload, [
++      'conversationId',
++      'isActive',
++      'isJustSent',
++      'isNewMessage',
++      'messages',
++    ]) ||
++    typeof payload.conversationId !== 'string' ||
++    typeof payload.isActive !== 'boolean' ||
++    typeof payload.isJustSent !== 'boolean' ||
++    payload.isNewMessage !== true ||
++    !Array.isArray(payload.messages) ||
++    payload.messages.length !== 1
++  ) {
++    return undefined;
++  }
++
++  const [message] = payload.messages;
++  if (
++    !isRecord(message) ||
++    typeof message.id !== 'string' ||
++    message.conversationId !== payload.conversationId
++  ) {
++    return undefined;
++  }
++
++  return {
++    conversationId: payload.conversationId,
++    isActive: payload.isActive,
++    messageId: message.id,
++  };
++}
++
++export function projectMaoyiAddedMessageFromAction(
++  beforeState: StateType,
++  action: UnknownAction,
++  afterState: StateType
++): MaoyiMessageProjection | undefined {
++  const parsed = parseMessagesAddedAction(action);
++  if (!parsed) {
++    return undefined;
++  }
++
++  const { conversationId, messageId } = parsed;
++  if (
++    getSelectedConversationId(beforeState) !== conversationId ||
++    getSelectedConversationId(afterState) !== conversationId ||
++    beforeState.conversations.messagesLookup[messageId] != null
++  ) {
++    return undefined;
++  }
++
++  const conversation =
++    afterState.conversations.messagesByConversation[conversationId];
++  if (!conversation?.messageIds.includes(messageId)) {
++    return undefined;
++  }
++
++  const projections = projectMaoyiVisibleMessages(
++    conversationId,
++    [messageId],
++    afterState.conversations.messagesLookup
++  );
++  return projections.length === 1 ? projections[0] : undefined;
++}
+
+diff --git a/ts/maoyi/messageBridge.preload.ts b/ts/maoyi/messageBridge.preload.ts
+index 89305b3..4144b69 100644
+--- a/ts/maoyi/messageBridge.preload.ts
++++ b/ts/maoyi/messageBridge.preload.ts
+@@ -6,6 +6,8 @@ import { ipcRenderer, type IpcRendererEvent } from 'electron';
+ 
+ import {
+   maoyiTranslationMatchesProjection,
++  legacyMaoyiSourceHash,
++  normalizeMaoyiSourceText,
+   type MaoyiMessageProjection,
+   type MaoyiTranslationResult,
+ } from './messageProjection.std.ts';
+@@ -62,6 +64,7 @@ type MaoyiIpcRenderer = Readonly<{
+ }>;
+ 
+ export type MaoyiRendererMessageBridge = Readonly<{
++  publishAddedMessage: (message: MaoyiMessageProjection) => Promise<void>;
+   publishVisibleMessages: (
+     conversationId: string,
+     messages: ReadonlyArray<MaoyiMessageProjection>
+@@ -95,6 +98,23 @@ function jsonBytes(value: unknown): number {
+   return utf8Bytes(JSON.stringify(value));
+ }
+ 
++function isCanonicalProjection(
++  value: MaoyiMessageProjection
++): value is MaoyiMessageProjection {
++  return (
++    isUuid(value.conversationId) &&
++    isUuid(value.messageId) &&
++    sourceHashPattern.test(value.sourceHash) &&
++    value.sourceText === normalizeMaoyiSourceText(value.sourceText) &&
++    utf8Bytes(value.sourceText) > 0 &&
++    utf8Bytes(value.sourceText) <= maximumTextBytes &&
++    legacyMaoyiSourceHash(value.sourceText) === value.sourceHash &&
++    (value.direction === 'incoming' || value.direction === 'outgoing') &&
++    Number.isSafeInteger(value.timestamp) &&
++    value.timestamp >= 0
++  );
++}
++
+ function parseTranslationResult(
+   value: unknown,
+   conversationId: string
+@@ -441,6 +461,28 @@ export function createMaoyiRendererMessageBridge(
+   transport.on(maoyiMessageCommandChannel, handleCommand);
+ 
+   return Object.freeze({
++    publishAddedMessage(message: MaoyiMessageProjection) {
++      const generation = securityGeneration;
++      const revision = normalPublishRevision;
++      return enqueue(async () => {
++        if (
++          stopped ||
++          generation !== securityGeneration ||
++          revision !== normalPublishRevision ||
++          !isCanonicalProjection(message)
++        ) {
++          return;
++        }
++        const snapshot = snapshotProvider?.();
++        if (
++          announcedConversationId !== message.conversationId ||
++          snapshot?.conversationId !== message.conversationId
++        ) {
++          return;
++        }
++        await sendEvent({ type: 'message.added', ...message });
++      });
++    },
+     publishVisibleMessages(
+       conversationId: string,
+       messages: ReadonlyArray<MaoyiMessageProjection>
+@@ -520,6 +562,15 @@ export function publishMaoyiVisibleMessages(
+   );
+ }
+ 
++export function publishMaoyiAddedMessage(
++  message: MaoyiMessageProjection
++): Promise<void> {
++  return (
++    getRendererMessageBridge()?.publishAddedMessage(message) ??
++    Promise.resolve()
++  );
++}
++
+ export function setMaoyiSnapshotProvider(
+   provider: SnapshotProvider
+ ): () => void {
+
+diff --git a/ts/state/createStore.preload.ts b/ts/state/createStore.preload.ts
+index 2c2bfa5..6d9c933 100644
+--- a/ts/state/createStore.preload.ts
++++ b/ts/state/createStore.preload.ts
+@@ -15,6 +15,9 @@ import { dispatchItemsMiddleware } from '../shims/dispatchItemsMiddleware.preloa
+ import { isOlderThan } from '../util/timestamp.std.ts';
+ import { SECOND } from '../util/durations/index.std.ts';
+ import { getEnvironment } from '../environment.std.ts';
++import { drop } from '../util/drop.std.ts';
++import { projectMaoyiAddedMessageFromAction } from '../maoyi/messageAddedObserver.std.ts';
++import { publishMaoyiAddedMessage } from '../maoyi/messageBridge.preload.ts';
+ 
+ const log = createLogger('createStore');
+ 
+@@ -78,10 +81,28 @@ const actionRateLogger: Middleware = () => next => _action => {
+   return next(action);
+ };
+ 
++const maoyiMessageAddedObserver: Middleware = store => next => _action => {
++  // oxlint-disable-next-line typescript/no-explicit-any
++  const action = _action as any as UnknownAction;
++  const beforeState = store.getState() as StateType;
++  const result = next(action);
++  const afterState = store.getState() as StateType;
++  const projection = projectMaoyiAddedMessageFromAction(
++    beforeState,
++    action,
++    afterState
++  );
++  if (projection) {
++    drop(publishMaoyiAddedMessage(projection));
++  }
++  return result;
++};
++
+ const middlewareList = [
+   promise,
+   thunk,
+   dispatchItemsMiddleware,
++  maoyiMessageAddedObserver,
+   actionRateLogger,
+   ...(env === 'production' || !REDUX_LOGGER_ENABLED ? [] : [logger]),
+ ];
+
+diff --git a/ts/test-node/maoyi/controlProtocol_test.node.ts b/ts/test-node/maoyi/controlProtocol_test.node.ts
+index 0108c11..265d5f9 100644
+--- a/ts/test-node/maoyi/controlProtocol_test.node.ts
++++ b/ts/test-node/maoyi/controlProtocol_test.node.ts
+@@ -17,6 +17,7 @@ import {
+   parseMaoyiMessageControlEvent,
+   verifyMaoyiLauncherEnvelope,
+ } from '../../../app/maoyi/controlProtocol.node.ts';
++import { legacyMaoyiSourceHash } from '../../maoyi/messageProjection.std.ts';
+ 
+ describe('Maoyi typed control protocol', () => {
+   const appId = 'Signal-00000000-0000-4000-8000-000000000001';
+@@ -43,6 +44,11 @@ describe('Maoyi typed control protocol', () => {
+     translatedText: '你好',
+   };
+ 
++  const addedMessage = {
++    ...visibleMessage,
++    sourceHash: legacyMaoyiSourceHash(visibleMessage.sourceText),
++  };
++
+   it('accepts only whitelisted bounded commands', () => {
+     assert.deepEqual(
+       parseMaoyiControlCommand({
+@@ -298,6 +304,13 @@ describe('Maoyi typed control protocol', () => {
+   });
+ 
+   it('parses strict message events', () => {
++    assert.deepEqual(
++      parseMaoyiMessageControlEvent({
++        type: 'message.added',
++        ...addedMessage,
++      }),
++      { type: 'message.added', ...addedMessage }
++    );
+     assert.deepEqual(
+       parseMaoyiMessageControlEvent({
+         type: 'conversation.changed',
+@@ -334,6 +347,39 @@ describe('Maoyi typed control protocol', () => {
+   });
+ 
+   it('rejects malformed message events', () => {
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'message.added',
++        ...addedMessage,
++        sourceHash: '1abc23',
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'message.added',
++        ...addedMessage,
++        sourceText: 'hello   world',
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'message.added',
++        ...addedMessage,
++        sourceText: '你好',
++        sourceHash: legacyMaoyiSourceHash('你好'),
++      }),
++      undefined
++    );
++    assert.equal(
++      parseMaoyiMessageControlEvent({
++        type: 'message.added',
++        ...addedMessage,
++        extra: true,
++      }),
++      undefined
++    );
+     assert.equal(
+       parseMaoyiMessageControlEvent({
+         type: 'conversation.changed',
+
+diff --git a/ts/test-node/maoyi/messageAddedObserver_test.node.ts b/ts/test-node/maoyi/messageAddedObserver_test.node.ts
+new file mode 100644
+index 0000000..3875d07
+--- /dev/null
++++ b/ts/test-node/maoyi/messageAddedObserver_test.node.ts
+@@ -0,0 +1,172 @@
++// Copyright 2026 Signal Messenger, LLC
++// SPDX-License-Identifier: AGPL-3.0-only
++
++import assert from 'node:assert/strict';
++import type { UnknownAction } from 'redux';
++
++// This observer is pure and does not require Electron renderer globals.
++import { projectMaoyiAddedMessageFromAction } from '../../maoyi/messageAddedObserver.std.ts';
++import { legacyMaoyiSourceHash } from '../../maoyi/messageProjection.std.ts';
++import type { StateType } from '../../state/reducer.preload.ts';
++import { NavTab } from '../../types/Nav.std.ts';
++
++const conversationId = '22222222-2222-4222-8222-222222222222';
++const otherConversationId = '44444444-4444-4444-8444-444444444444';
++const messageId = '33333333-3333-4333-8333-333333333333';
++
++const message = {
++  id: messageId,
++  conversationId,
++  type: 'incoming',
++  body: 'Hello world',
++  timestamp: 1_800_000_000_000,
++};
++
++function state(
++  selectedConversationId: string,
++  messages: ReadonlyArray<Record<string, unknown>> = []
++): StateType {
++  const messagesLookup = Object.fromEntries(
++    messages.map(item => [String(item.id), item])
++  );
++  return {
++    nav: {
++      selectedLocation: {
++        tab: NavTab.Chats,
++        details: { conversationId: selectedConversationId },
++      },
++    },
++    conversations: {
++      messagesLookup,
++      messagesByConversation: {
++        [conversationId]: {
++          messageIds: messages
++            .filter(item => item.conversationId === conversationId)
++            .map(item => String(item.id)),
++        },
++      },
++    },
++  } as unknown as StateType;
++}
++
++function addedAction(
++  overrides: Readonly<Record<string, unknown>> = {}
++): UnknownAction {
++  return {
++    type: 'MESSAGES_ADDED',
++    payload: {
++      conversationId,
++      isActive: true,
++      isJustSent: false,
++      isNewMessage: true,
++      messages: [message],
++      ...overrides,
++    },
++  };
++}
++
++describe('Maoyi message-added observer', () => {
++  it('projects one reducer-accepted safe message in the selected conversation when isActive is false', () => {
++    const projected = projectMaoyiAddedMessageFromAction(
++      state(conversationId),
++      addedAction({ isActive: false }),
++      state(conversationId, [message])
++    );
++
++    assert.deepEqual(projected, {
++      conversationId,
++      messageId,
++      sourceHash: legacyMaoyiSourceHash('Hello world'),
++      sourceText: 'Hello world',
++      direction: 'incoming',
++      timestamp: message.timestamp,
++    });
++  });
++
++  it('rejects history, non-boolean activity, background-conversation, replay, and reducer-dropped actions', () => {
++    const before = state(conversationId);
++    const after = state(conversationId, [message]);
++
++    assert.equal(
++      projectMaoyiAddedMessageFromAction(
++        before,
++        addedAction({ isNewMessage: false }),
++        after
++      ),
++      undefined
++    );
++    assert.equal(
++      projectMaoyiAddedMessageFromAction(
++        before,
++        addedAction({ isActive: 'false' }),
++        after
++      ),
++      undefined
++    );
++    assert.equal(
++      projectMaoyiAddedMessageFromAction(
++        state(otherConversationId),
++        addedAction(),
++        state(otherConversationId, [message])
++      ),
++      undefined
++    );
++    assert.equal(
++      projectMaoyiAddedMessageFromAction(
++        state(conversationId, [message]),
++        addedAction(),
++        after
++      ),
++      undefined
++    );
++    assert.equal(
++      projectMaoyiAddedMessageFromAction(
++        before,
++        addedAction(),
++        state(conversationId)
++      ),
++      undefined
++    );
++  });
++
++  it('rejects batches, cross-conversation payloads, and unsafe message bodies', () => {
++    const before = state(conversationId);
++
++    assert.equal(
++      projectMaoyiAddedMessageFromAction(
++        before,
++        addedAction({
++          messages: [message, { ...message, id: otherConversationId }],
++        }),
++        state(conversationId, [message])
++      ),
++      undefined
++    );
++    assert.equal(
++      projectMaoyiAddedMessageFromAction(
++        before,
++        addedAction({
++          messages: [{ ...message, conversationId: otherConversationId }],
++        }),
++        state(conversationId, [message])
++      ),
++      undefined
++    );
++
++    for (const unsafe of [
++      { ...message, body: '你好' },
++      { ...message, attachments: [{ contentType: 'image/png' }] },
++      { ...message, poll: { question: 'Hello?' } },
++      { ...message, timestamp: 1.5 },
++    ]) {
++      assert.equal(
++        projectMaoyiAddedMessageFromAction(
++          before,
++          addedAction({ messages: [unsafe] }),
++          state(conversationId, [unsafe])
++        ),
++        undefined
++      );
++    }
++  });
++});
+
+diff --git a/ts/test-node/maoyi/messageBridge_test.main.ts b/ts/test-node/maoyi/messageBridge_test.main.ts
+index 1cdd275..80cef7f 100644
+--- a/ts/test-node/maoyi/messageBridge_test.main.ts
++++ b/ts/test-node/maoyi/messageBridge_test.main.ts
+@@ -11,6 +11,7 @@ import type {
+   MaoyiControlEvent,
+ } from '../../../app/maoyi/controlProtocol.node.ts';
+ import {
++  MaoyiAddedMessageLedger,
+   MaoyiRequestLedger,
+   startMaoyiMessageBridge,
+ } from '../../../app/maoyi/messageBridge.main.ts';
+@@ -19,6 +20,7 @@ import {
+   maoyiMessageCommandChannel,
+   maoyiMessageEventChannel,
+ } from '../../maoyi/messageBridgeChannels.std.ts';
++import { legacyMaoyiSourceHash } from '../../maoyi/messageProjection.std.ts';
+ 
+ const conversationId = '22222222-2222-4222-8222-222222222222';
+ const messageId = '33333333-3333-4333-8333-333333333333';
+@@ -119,6 +121,22 @@ class FakeControlBridge {
+ }
+ 
+ describe('Maoyi main message bridge', () => {
++  it('bounds and expires message-added identities without retaining bodies', () => {
++    let now = 1_000;
++    const ledger = new MaoyiAddedMessageLedger(() => now, 2, 100);
++
++    assert.equal(ledger.accept(messageId), true);
++    assert.equal(ledger.accept(messageId.toUpperCase()), false);
++    assert.equal(ledger.accept(requestId), true);
++    assert.equal(ledger.accept(secondRequestId), true);
++    assert.equal(ledger.accept(messageId), true);
++
++    now += 101;
++    assert.equal(ledger.accept(messageId), true);
++    ledger.clear();
++    assert.equal(ledger.accept(messageId), true);
++  });
++
+   it('bounds request IDs and rejects stale, replayed, and cross-conversation transitions', () => {
+     let now = 1_000;
+     const ledger = new MaoyiRequestLedger(() => now, 2, 100);
+@@ -174,6 +192,25 @@ describe('Maoyi main message bridge', () => {
+       }),
+       true
+     );
++    const addedEvent = {
++      type: 'message.added',
++      conversationId,
++      messageId,
++      sourceHash: legacyMaoyiSourceHash('hello'),
++      sourceText: 'hello',
++      direction: 'incoming',
++      timestamp: 1_800_000_000_000,
++    } as const;
++    assert.equal(ipc.handler(event, addedEvent), true);
++    assert.equal(ipc.handler(event, addedEvent), false);
++    assert.deepEqual(control.sent.at(-1), addedEvent);
++    assert.equal(
++      ipc.handler(event, {
++        ...addedEvent,
++        conversationId: '44444444-4444-4444-8444-444444444444',
++      }),
++      false
++    );
+     assert.equal(
+       ipc.handler(event, {
+         type: 'message.visibleBatch',
+
+diff --git a/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts b/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts
+index cfafc04..57f4635 100644
+--- a/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts
++++ b/ts/test-node/maoyi/rendererMessageBridge_test.preload.ts
+@@ -156,6 +156,52 @@ describe('Maoyi renderer message bridge', () => {
+   beforeEach(() => clearMaoyiTranslationRuntime());
+   afterEach(() => clearMaoyiTranslationRuntime());
+ 
++  it('publishes a canonical added message only for the announced current conversation', async () => {
++    const transport = new FakeRendererTransport();
++    const bridge = createMaoyiRendererMessageBridge(transport);
++    const value = projection();
++    let currentConversationId = conversationId;
++    bridge.setSnapshotProvider(() => ({
++      conversationId: currentConversationId,
++      messages: [value],
++    }));
++
++    await bridge.publishVisibleMessages(conversationId, [value]);
++    await bridge.publishAddedMessage(value);
++    assert.deepEqual(transport.invocations.at(-1), {
++      type: 'message.added',
++      ...value,
++    });
++
++    currentConversationId = otherConversationId;
++    await bridge.publishAddedMessage(value);
++    assert.equal(
++      transport.invocations.filter(
++        item =>
++          typeof item === 'object' &&
++          item != null &&
++          'type' in item &&
++          item.type === 'message.added'
++      ).length,
++      1
++    );
++
++    bridge.clear();
++    currentConversationId = conversationId;
++    await bridge.publishAddedMessage(value);
++    assert.equal(
++      transport.invocations.filter(
++        item =>
++          typeof item === 'object' &&
++          item != null &&
++          'type' in item &&
++          item.type === 'message.added'
++      ).length,
++      1
++    );
++    bridge.stop();
++  });
++
+   it('applies only an exact one-time result and clears on the main-process gate', async () => {
+     const transport = new FakeRendererTransport();
+     const bridge = createMaoyiRendererMessageBridge(transport);

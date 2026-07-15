@@ -9,21 +9,37 @@ const suitesRoot = path.join(workspaceRoot, 'taozhuang');
 const secretsRoot = path.join(projectRoot, '.package-secrets');
 const issuerBuildSecrets = path.join(secretsRoot, 'issuer-build');
 const issuerKeyPath = path.join(projectRoot, 'dist-electron', 'issuer-suite-key.json');
+const packageStagingRoot = path.join(projectRoot, '.package-staging');
 
 function localStamp(date) {
   return `${date.getMonth() + 1}_${date.getDate()}_${String(date.getHours()).padStart(2, '0')}.${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
-function nextDirectory() {
+function targetDirectory() {
   fs.mkdirSync(suitesRoot, { recursive: true });
-  const used = fs.readdirSync(suitesRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => /^taozhuang(\d{3})_/.exec(entry.name))
-    .filter(Boolean)
-    .map((match) => Number(match[1]));
-  const sequence = (used.length ? Math.max(...used) : 0) + 1;
-  if (sequence > 999) throw new Error('Suite directory sequence exceeded 999.');
-  return path.join(suitesRoot, `taozhuang${String(sequence).padStart(3, '0')}_${localStamp(new Date())}`);
+  const requested = String(process.env.MAOYI_SUITE_SEQUENCE || '').trim();
+  if (!/^\d{3}$/.test(requested) || requested === '000') {
+    throw new Error('MAOYI_SUITE_SEQUENCE must be an explicit three-digit sequence such as 006.');
+  }
+  const existing = fs.readdirSync(suitesRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(`taozhuang${requested}_`));
+  if (existing.length > 1) throw new Error(`Suite sequence ${requested} has multiple directories and cannot be resumed safely.`);
+  if (existing.length === 1) {
+    const directory = path.join(suitesRoot, existing[0].name);
+    const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'suite-manifest.json'), 'utf8'));
+    const suitePath = path.join(secretsRoot, 'license-suites', `${manifest.suiteId}.json`);
+    const explicitlyRepairing = process.env.MAOYI_REPAIR_SUITE === '1';
+    const resumableStatus = manifest.status === 'failed' || (manifest.status === 'complete' && explicitlyRepairing);
+    if (!resumableStatus || !/^\d{9}$/.test(manifest.suiteId) || !fs.statSync(suitePath, { throwIfNoEntry: false })?.isFile()) {
+      throw new Error(`Suite sequence ${requested} is already present and cannot be reused.`);
+    }
+    return { directory, previousManifest: manifest, sequence: requested };
+  }
+  return {
+    directory: path.join(suitesRoot, `taozhuang${requested}_${localStamp(new Date())}`),
+    previousManifest: null,
+    sequence: requested
+  };
 }
 
 function run(command, args, env = {}) {
@@ -62,7 +78,12 @@ function sealIssuerSuite(suite) {
   fs.mkdirSync(issuerBuildSecrets, { recursive: true });
   fs.mkdirSync(path.dirname(issuerKeyPath), { recursive: true });
   fs.writeFileSync(path.join(issuerBuildSecrets, 'license-suite.sealed'), `${JSON.stringify(sealed)}\n`, { encoding: 'utf8', mode: 0o600 });
-  fs.writeFileSync(issuerKeyPath, `${JSON.stringify({ key: key.toString('base64') })}\n`, { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(issuerKeyPath, `${JSON.stringify({
+    key: key.toString('base64'),
+    suiteId: suite.suiteId,
+    keyId: suite.keyId,
+    publicKeySha256: suite.publicKeySha256
+  })}\n`, { encoding: 'utf8', mode: 0o600 });
 }
 
 function copySingleExe(fromDirectory, targetFile, namePattern) {
@@ -74,29 +95,39 @@ function copySingleExe(fromDirectory, targetFile, namePattern) {
 }
 
 function main() {
-  const directory = nextDirectory();
-  fs.mkdirSync(directory, { recursive: false });
+  const target = targetDirectory();
+  const { directory, previousManifest, sequence } = target;
+  if (!previousManifest) fs.mkdirSync(directory, { recursive: false });
   const buildRoot = path.join(projectRoot, '.tmp', path.basename(directory));
   const clientBuild = path.join(buildRoot, 'client');
   const issuerBuild = path.join(buildRoot, 'issuer');
+  const promptGeneratorBuild = path.join(buildRoot, 'prompt-generator');
   const manifest = {
     version: 1,
     status: 'initializing',
     directory: path.basename(directory),
-    createdAt: new Date().toISOString(),
-    suiteId: '',
-    keyId: '',
-    publicKeySha256: '',
+    createdAt: previousManifest?.createdAt || new Date().toISOString(),
+    resumedAt: previousManifest ? new Date().toISOString() : undefined,
+    attempts: previousManifest ? (previousManifest.attempts || 1) + 1 : 1,
+    suiteId: previousManifest?.suiteId || '',
+    keyId: previousManifest?.keyId || '',
+    publicKeySha256: previousManifest?.publicKeySha256 || '',
     files: []
   };
   writeManifest(directory, manifest);
 
   try {
-    const suiteOutput = run(process.execPath, ['tools/create-license-suite.cjs'], {
-      MAOYI_SUITE_OUTPUT_DIR: directory
-    });
-    const suiteId = /suiteId=(\d{9})/.exec(suiteOutput)?.[1];
-    if (!suiteId) throw new Error('Suite generator did not return a suite ID.');
+    let suiteId = manifest.suiteId;
+    if (!suiteId) {
+      const suiteOutput = run(process.execPath, ['tools/create-license-suite.cjs'], {
+        MAOYI_SUITE_OUTPUT_DIR: directory
+      });
+      suiteId = /suiteId=(\d{9})/.exec(suiteOutput)?.[1] || '';
+      if (!suiteId) throw new Error('Suite generator did not return a suite ID.');
+    } else {
+      console.log(`suiteId=${suiteId}`);
+      console.log('status=resuming-consumed-suite');
+    }
     const suitePath = path.join(secretsRoot, 'license-suites', `${suiteId}.json`);
     const suite = JSON.parse(fs.readFileSync(suitePath, 'utf8'));
     Object.assign(manifest, {
@@ -115,6 +146,10 @@ function main() {
     if (!npmCli) throw new Error('npm_execpath is unavailable. Start this workflow with npm run suite:package.');
     run(process.execPath, [npmCli, 'run', 'test:security']);
     run(process.execPath, [npmCli, 'run', 'test:signal-control']);
+    run(process.execPath, ['tools/prepare-package-signal-runtime.cjs']);
+    run(process.execPath, ['tools/test-signal-control-channel.cjs'], {
+      MAOYI_SIGNAL_RUNTIME_DIR: path.join(packageStagingRoot, 'signal')
+    });
     sealIssuerSuite(suite);
 
     const builder = path.join(projectRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js');
@@ -124,25 +159,32 @@ function main() {
     run(process.execPath, [builder, '--win', 'portable', '--config', 'electron-builder.issuer-suite.cjs'], {
       MAOYI_ISSUER_BUILD_OUTPUT: issuerBuild
     });
+    run(process.execPath, [builder, '--win', 'portable', '--config', 'electron-builder.prompt-generator.cjs'], {
+      MAOYI_PROMPT_GENERATOR_OUTPUT: promptGeneratorBuild
+    });
     run(process.execPath, [
       'tools/verify-packaged-output.cjs',
       `--client=${clientBuild}`,
-      `--issuer=${issuerBuild}`
+      `--issuer=${issuerBuild}`,
+      `--prompt-generator=${promptGeneratorBuild}`,
+      `--suite-id=${suiteId}`
     ]);
 
-    const clientTarget = path.join(directory, 'client', 'maoyi 安装包.exe');
-    const issuerTarget = path.join(directory, 'issuer', '授权程序.exe');
+    const clientTarget = path.join(directory, '\u5ba2\u6237\u5b89\u88c5\u5305', 'maoyi \u5b89\u88c5\u5305.exe');
+    const issuerTarget = path.join(directory, '\u5185\u90e8\u5de5\u5177', '\u6388\u6743\u7a0b\u5e8f.exe');
+    const promptGeneratorTarget = path.join(directory, '\u5185\u90e8\u5de5\u5177', '\u63d0\u793a\u8bcd\u6587\u4ef6\u751f\u6210\u5668.exe');
     copySingleExe(clientBuild, clientTarget, /Setup/i);
     copySingleExe(issuerBuild, issuerTarget, /AUTHORIZER/i);
+    copySingleExe(promptGeneratorBuild, promptGeneratorTarget, /PROMPT-GENERATOR/i);
 
-    const readmeZh = `# maoyi 套装\n\n- 套装 ID：${suiteId}\n- 客户端：client/maoyi 安装包.exe\n- 授权程序：issuer/授权程序.exe\n- 本套授权程序仅可为本套客户端签发授权。\n`;
-    const readmeEn = `# maoyi Suite\n\n- Suite ID: ${suiteId}\n- Client: client/maoyi 安装包.exe\n- Issuer: issuer/授权程序.exe\n- This issuer can authorize only the client bundled in this suite.\n`;
+    const readmeZh = `# maoyi \u5957\u88c5 ${sequence}\n\n- \u5957\u88c5 ID\uff1a${suiteId}\n- \u5ba2\u6237\u5b89\u88c5\u5305\uff1a\u5ba2\u6237\u5b89\u88c5\u5305/maoyi \u5b89\u88c5\u5305.exe\n- \u6388\u6743\u7a0b\u5e8f\uff1a\u5185\u90e8\u5de5\u5177/\u6388\u6743\u7a0b\u5e8f.exe\n- \u63d0\u793a\u8bcd\u751f\u6210\u5668\uff1a\u5185\u90e8\u5de5\u5177/\u63d0\u793a\u8bcd\u6587\u4ef6\u751f\u6210\u5668.exe\n- \u672c\u5957\u6388\u6743\u7a0b\u5e8f\u4ec5\u53ef\u4e3a\u672c\u5957\u5ba2\u6237\u7aef\u7b7e\u53d1\u6388\u6743\u3002\n- \u63d0\u793a\u8bcd\u751f\u6210\u5668\u662f\u5185\u90e8\u5de5\u5177\uff0c\u4e0d\u8981\u4ea4\u4ed8\u7ed9\u5ba2\u6237\u3002\n`;
+    const readmeEn = `# maoyi Suite ${sequence}\n\n- Suite ID: ${suiteId}\n- Client: \u5ba2\u6237\u5b89\u88c5\u5305/maoyi \u5b89\u88c5\u5305.exe\n- Issuer: \u5185\u90e8\u5de5\u5177/\u6388\u6743\u7a0b\u5e8f.exe\n- Prompt generator: \u5185\u90e8\u5de5\u5177/\u63d0\u793a\u8bcd\u6587\u4ef6\u751f\u6210\u5668.exe\n- This issuer can authorize only the client bundled in this suite.\n- The prompt generator is an internal tool and must not be delivered to customers.\n`;
     fs.writeFileSync(path.join(directory, 'README.md'), readmeZh, 'utf8');
     fs.writeFileSync(path.join(directory, 'README.en.md'), readmeEn, 'utf8');
 
     manifest.status = 'complete';
     manifest.completedAt = new Date().toISOString();
-    manifest.files = [clientTarget, issuerTarget, path.join(directory, 'README.md'), path.join(directory, 'README.en.md')]
+    manifest.files = [clientTarget, issuerTarget, promptGeneratorTarget, path.join(directory, 'README.md'), path.join(directory, 'README.en.md')]
       .map((file) => ({ path: path.relative(directory, file).replaceAll('\\', '/'), size: fs.statSync(file).size, sha256: sha256(file) }));
     writeManifest(directory, manifest);
     console.log(`suiteDirectory=${directory}`);
@@ -157,6 +199,7 @@ function main() {
   } finally {
     fs.rmSync(issuerKeyPath, { force: true });
     fs.rmSync(issuerBuildSecrets, { recursive: true, force: true });
+    fs.rmSync(packageStagingRoot, { recursive: true, force: true });
     fs.rmSync(buildRoot, { recursive: true, force: true });
   }
 }

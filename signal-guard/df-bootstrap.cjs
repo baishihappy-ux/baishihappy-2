@@ -272,7 +272,7 @@ async function writeAtomic(targetPath, value) {
 }
 
 function resetWorkRoot() {
-  return path.join(os.tmpdir(), 'maoyi-Reset');
+  return path.join(os.tmpdir(), 'MAOYI-TRANSLATOR-Reset');
 }
 
 async function createResetPlan({ targetRoot, bootstrapFile, runtimeBindingPaths, bindingFile }) {
@@ -422,7 +422,7 @@ async function runResetWorker(planPath, ownRuntimeBindingPath) {
 function blockLocalDirectStart(app, dialog) {
   diagnostic('local-direct-blocked');
   if (process.env.MAOYI_SIGNAL_GUARD_TEST_AUTOCLOSE !== '1') {
-    dialog.showErrorBox('maoyi', '缺少启动器，请从 maoyi 启动');
+    dialog.showErrorBox('maoyi', '缺少启动器，请从maoyi启动');
   }
   app.exit(0);
 }

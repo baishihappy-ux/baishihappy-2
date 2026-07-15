@@ -52,7 +52,7 @@ Proceed without an extra confirmation only when the user has already explicitly 
 
 ## Project-Specific Defaults
 
-For the maoyi translator project, keep these defaults unless the user changes them:
+For the Maoyi translator project, keep these defaults unless the user changes them:
 
 - Do not build a new installer unless the user explicitly says to package.
 - Do not push GitHub unless the user explicitly requests it.
