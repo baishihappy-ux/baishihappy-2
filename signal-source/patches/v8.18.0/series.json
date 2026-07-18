@@ -29,6 +29,10 @@
     {
       "file": "0007-maoyi-incoming-auto-translation-stability.patch",
       "sha256": "F260FAC184A6080E4055CF2BEA8205987841430B8DCF4E834DD0081594656B02"
+    },
+    {
+      "file": "0008-maoyi-source-smart-reply-request.patch",
+      "sha256": "8F7F892605D7A526417BF3D34269F7A97B05BA6924630D9ADFC4CC623EC47A83"
     }
   ]
 }

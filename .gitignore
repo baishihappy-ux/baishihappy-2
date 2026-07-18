@@ -14,3 +14,5 @@ node_modules/
 reference-sources/*/
 reference-sources/*.zip
 !reference-sources/Signal-Desktop-v8.18.0.zip
+.pnpm-store/
+.pnpm-store-complete/

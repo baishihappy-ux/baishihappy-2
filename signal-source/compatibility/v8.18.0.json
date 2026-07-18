@@ -32,6 +32,7 @@
     { "id": "windows-owner-window", "classification": "source-upgrade-required" },
     { "id": "main-process-lock-visibility-gate", "classification": "source-upgrade-required" },
     { "id": "source-message-added-live-translation", "classification": "source-upgrade-required" },
-    { "id": "source-bubble-manual-refresh", "classification": "source-upgrade-required" }
+    { "id": "source-bubble-manual-refresh", "classification": "source-upgrade-required" },
+    { "id": "source-native-smart-reply-request", "classification": "source-upgrade-required" }
   ]
 }

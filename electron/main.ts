@@ -6,10 +6,12 @@ import {
   dialog,
   ipcMain,
   net,
+  powerMonitor,
   protocol,
   safeStorage,
   screen,
   session,
+  shell,
   webContents,
   type IpcMainEvent,
   type IpcMainInvokeEvent,
@@ -35,6 +37,8 @@ import type {
   SensitiveSendPrepareRequest,
   SensitiveSendRequest,
   SignalWorkspaceBounds,
+  SmartReplyRequest,
+  SmartReplyResult,
   TranslateRequest,
   TranslationCacheEntry,
   TranslationCacheLoadRequest,
@@ -46,7 +50,10 @@ import type {
   LockScreenUnlockResult,
   NetworkOfflineCheckResult,
   LockScreenPinChangeMode,
-  LockScreenPinChangeAuthorizationResult
+  LockScreenPinChangeAuthorizationResult,
+  RemoteGuardActionResult,
+  RemoteGuardState,
+  RemoteGuardStatus
 } from './shared.js';
 import {
   buildWindowsChromiumUserAgent,
@@ -102,6 +109,22 @@ import {
   type TranslationPrompts
 } from './translation-prompt-bundle.js';
 import { normalizeComposerEnglishStyle } from './translation-english-style.js';
+import {
+  decryptSmartReplyPromptBundle,
+  encryptSmartReplyPromptBundle,
+  smartReplyPromptBundleFileName,
+  type SmartReplyPrompt
+} from './smart-reply-prompt-bundle.js';
+import {
+  buildProtectedSmartReplyTranscript,
+  parseSmartReplyResponse,
+  validateSmartReplyRequest
+} from './smart-reply-core.js';
+import {
+  inspectWindowsRemoteAccess,
+  remoteGuardProcessScanIntervalMs,
+  requestWindowsWorkstationLock
+} from './remote-guard.js';
 
 const defaultModel = 'deepseek-v4-flash';
 const appDisplayName = 'maoyi';
@@ -120,7 +143,7 @@ const signalSourceExperimentValue = !app.isPackaged
   : '';
 const supportedSignalSourcePatchSets: Readonly<Record<string, string>> = Object.freeze({
   '8.17.0': '6C6CE9E865BFD5904937FE77A76428021EFFDDA350CDE32D80EEE8FC65E83052',
-  '8.18.0': 'E25AA0F8308BF5DB04A41D3ED12E4F717884AFCC118BA639786A3AE523C7D1D6'
+  '8.18.0': 'BF482ACA5FEB79AFD4B0C418E56DF41BEA3C38F284EF8FBDB64C1BF17F5D2650'
 });
 const signalSourceOnlyAcceptanceValue =
   process.env.MAOYI_SIGNAL_SOURCE_ONLY_ACCEPTANCE?.trim() || '';
@@ -246,6 +269,35 @@ app.commandLine.appendSwitch(
 let mainWindow: BrowserWindow | null = null;
 const compactWindowWidth = 1100;
 const compactWindowHeight = 720;
+const remoteGuardScanIntervalMs = 8_000;
+const remoteGuardWindowsLockDelayMs = 3_000;
+let remoteGuardStatus: RemoteGuardStatus = {
+  enabled: process.platform === 'win32',
+  state: 'starting',
+  checkedAt: 0,
+  nextScanAt: 0,
+  scanDurationMs: 0,
+  scanIntervalMs: remoteGuardScanIntervalMs,
+  processScanIntervalMs: remoteGuardProcessScanIntervalMs,
+  windowsLockDelayMs: remoteGuardWindowsLockDelayMs,
+  threatActive: false,
+  incidentLatched: false,
+  windowsSessionLocked: false,
+  windowsLockState: 'idle',
+  findings: [],
+  coverage: { windowsSessions: false, processes: false, connections: 'not-needed' }
+};
+let remoteGuardStarted = false;
+let remoteGuardThreatActive = false;
+let remoteGuardIncidentLatched = false;
+let remoteGuardScanTimer: NodeJS.Timeout | null = null;
+let remoteGuardScanPromise: Promise<RemoteGuardStatus> | null = null;
+let remoteGuardWindowsLockTimer: NodeJS.Timeout | null = null;
+let remoteGuardBeepTimer: NodeJS.Timeout | null = null;
+let remoteGuardVisibilityLockPromise: Promise<void> | null = null;
+let remoteGuardLastClearState: RemoteGuardState = 'starting';
+let remoteGuardRuntimeReason = '';
+const remoteGuardAlarmWindows = new Set<BrowserWindow>();
 let clientLicenseManager: ClientLicenseManager | null = null;
 let authorizedRuntimePrepared = false;
 let activeRuntimeSecurity: { payload: RuntimeBindingPayload; devicePrivateKeyPem: string } | null = null;
@@ -330,6 +382,20 @@ const pendingSignalCacheSnapshotRequests = new Map<
 >();
 const signalCacheInFlightRequestCounts = new Map<string, number>();
 const activeSignalCacheConversations = new Map<string, ActiveSignalCacheConversation>();
+type PendingSignalSmartReplyRequest = {
+  requestId: string;
+  conversationId: string;
+  trigger: SignalVisibleMessage;
+  client: SignalControlClient;
+  state: 'generating' | 'completed';
+  acceptedAt: number;
+};
+const signalSmartReplyPendingRequestLimit = 64;
+const signalSmartReplyRequestTtlMs = 30_000;
+const pendingSignalSmartReplyRequests = new Map<
+  string,
+  Map<string, PendingSignalSmartReplyRequest>
+>();
 
 // SIGNAL_SOURCE_ONLY_ACCEPTANCE_DIAGNOSTICS_START
 const signalSourceOnlyAcceptanceStageCounts = Object.fromEntries(
@@ -1026,14 +1092,47 @@ function enqueueSignalTranslationRefresh(
 
 function clearSignalCacheRequestState(appId: string) {
   pendingSignalCacheSnapshotRequests.delete(appId);
+  pendingSignalSmartReplyRequests.delete(appId);
   activeSignalCacheConversations.delete(appId);
   cancelSignalLiveTranslationsForApp(appId);
 }
 
 function clearAllSignalCacheRequestState() {
   pendingSignalCacheSnapshotRequests.clear();
+  pendingSignalSmartReplyRequests.clear();
   activeSignalCacheConversations.clear();
   cancelAllSignalLiveTranslations();
+}
+
+function setPendingSignalSmartReplyRequest(
+  appId: string,
+  pending: PendingSignalSmartReplyRequest
+) {
+  let requests = pendingSignalSmartReplyRequests.get(appId);
+  if (!requests) {
+    requests = new Map();
+    pendingSignalSmartReplyRequests.set(appId, requests);
+  }
+  if (requests.has(pending.requestId)) return false;
+  const now = Date.now();
+  for (const [requestId, request] of requests) {
+    if (now - request.acceptedAt > signalSmartReplyRequestTtlMs) {
+      requests.delete(requestId);
+    }
+  }
+  if (requests.size >= signalSmartReplyPendingRequestLimit) {
+    const completedRequestId = Array.from(requests.entries())
+      .find(([, request]) => request.state === 'completed')?.[0];
+    if (!completedRequestId) return false;
+    requests.delete(completedRequestId);
+  }
+  if (Array.from(requests.values()).some(request => request.state === 'generating')) return false;
+  requests.set(pending.requestId, pending);
+  return true;
+}
+
+function getPendingSignalSmartReplyRequest(appId: string, requestId: string) {
+  return pendingSignalSmartReplyRequests.get(appId)?.get(requestId);
 }
 
 function getPendingSignalCacheRequest(appId: string, requestId: string) {
@@ -1165,6 +1264,26 @@ type SignalTranslationRefreshRequest = SignalVisibleMessage & {
   type: 'translation.refresh.request';
   requestId: string;
 };
+
+const signalSmartReplyContextVersion = 'df.signal.smart-reply-context.v1' as const;
+const signalSmartReplyMaxMessages = 8;
+const signalSmartReplyMaxTranscriptBytes = 8 * 1024;
+
+type SignalSmartReplyRequest = {
+  type: 'smartReply.request';
+  requestId: string;
+  contextVersion: typeof signalSmartReplyContextVersion;
+  conversationId: string;
+  triggerMessageId: string;
+  messages: SignalVisibleMessage[];
+};
+
+type SignalSmartReplyErrorCode =
+  | 'unavailable'
+  | 'rate-limited'
+  | 'timeout'
+  | 'invalid-response'
+  | 'request-failed';
 
 type SignalCacheResult = {
   conversationId: string;
@@ -1420,6 +1539,65 @@ function validateSignalTranslationRefreshRequest(
     type: 'translation.refresh.request',
     requestId,
     ...message
+  };
+}
+
+function validateSignalSmartReplyRequest(value: unknown): SignalSmartReplyRequest {
+  assertSignalProtocolBusinessJson(value);
+  const record = signalProtocolRecord(value, [
+    'type',
+    'requestId',
+    'contextVersion',
+    'conversationId',
+    'triggerMessageId',
+    'messages'
+  ]);
+  if (
+    record.type !== 'smartReply.request' ||
+    record.contextVersion !== signalSmartReplyContextVersion ||
+    !Array.isArray(record.messages) ||
+    record.messages.length < 1 ||
+    record.messages.length > signalSmartReplyMaxMessages
+  ) {
+    throw new Error('Signal smart reply request is invalid.');
+  }
+  const requestId = assertSignalProtocolUuid(record.requestId);
+  const conversationId = assertSignalProtocolUuid(record.conversationId);
+  const triggerMessageId = assertSignalProtocolUuid(record.triggerMessageId);
+  const validated = validateSignalVisibleMessageBatch({
+    type: 'message.visibleBatch',
+    requestId,
+    conversationId,
+    messages: record.messages
+  });
+  let transcriptBytes = 0;
+  let previousTimestamp = -1;
+  for (const message of validated.messages) {
+    if (!isValidSignalTranslationProjection(message)) {
+      throw new Error('Signal smart reply message projection is invalid.');
+    }
+    transcriptBytes += Buffer.byteLength(message.sourceText, 'utf8');
+    if (message.timestamp < previousTimestamp) {
+      throw new Error('Signal smart reply message order is invalid.');
+    }
+    previousTimestamp = message.timestamp;
+  }
+  const trigger = validated.messages.at(-1);
+  if (
+    transcriptBytes > signalSmartReplyMaxTranscriptBytes ||
+    !trigger ||
+    trigger.direction !== 'incoming' ||
+    trigger.messageId !== triggerMessageId
+  ) {
+    throw new Error('Signal smart reply trigger is invalid.');
+  }
+  return {
+    type: 'smartReply.request',
+    requestId,
+    contextVersion: signalSmartReplyContextVersion,
+    conversationId,
+    triggerMessageId,
+    messages: validated.messages
   };
 }
 
@@ -2358,6 +2536,7 @@ async function setLockScreenPin(senderId: number, pin: string, token: string): P
     };
     await writeLockScreenState(state);
     legacyUpgradeAuthorizedUntil = 0;
+    if (remoteGuardIncidentLatched && !remoteGuardThreatActive) clearRemoteGuardIncident();
     releaseWorkspaceVisibilityLock();
     return { ok: true, status: lockScreenStatusFromState(state) };
   } catch (error) {
@@ -2368,6 +2547,9 @@ async function setLockScreenPin(senderId: number, pin: string, token: string): P
 async function unlockLockScreen(pin: string): Promise<LockScreenUnlockResult> {
   let state = await readLockScreenState();
   if (!state?.enabled) return { ok: false, reason: '请先设置锁屏凭据', status: defaultLockScreenStatus() };
+  if (remoteGuardThreatActive) {
+    return { ok: false, reason: '御前侍卫仍检测到远控，工作区保持锁定', status: lockScreenStatusFromState(state) };
+  }
   if (state.version === 0) {
     return { ok: false, reason: `${state.credentialError}；请断网重置锁屏凭据`, status: lockScreenStatusFromState(state) };
   }
@@ -2414,6 +2596,7 @@ async function unlockLockScreen(pin: string): Promise<LockScreenUnlockResult> {
     if (protectedCredential.format === 'legacy-6-digit') {
       legacyUpgradeAuthorizedUntil = now + legacyUpgradeAuthorizationTtlMs;
     } else {
+      if (remoteGuardIncidentLatched) clearRemoteGuardIncident();
       releaseWorkspaceVisibilityLock();
     }
     return { ok: true, status: lockScreenStatusFromState(state) };
@@ -2561,6 +2744,7 @@ async function readDevelopmentServiceSecret() {
 }
 
 let translationPromptsCache: TranslationPrompts | null = null;
+let smartReplyPromptCache: SmartReplyPrompt | null = null;
 
 function packagedTranslationPromptPath() {
   return join(process.resourcesPath, translationPromptBundleFileName);
@@ -2660,6 +2844,96 @@ async function loadTranslationPrompts(serviceSecret: string) {
   await writeTextAtomic(activeTranslationPromptPath(), packagedRaw);
   await recordPackagedTranslationPromptHash(packagedHash);
   return translationPromptsCache;
+}
+
+function packagedSmartReplyPromptPath() {
+  return join(process.resourcesPath, smartReplyPromptBundleFileName);
+}
+
+function activeSmartReplyPromptPath() {
+  return join(app.getPath('userData'), 'security', smartReplyPromptBundleFileName);
+}
+
+function pendingSmartReplyPromptPath() {
+  return `${activeSmartReplyPromptPath()}.pending`;
+}
+
+function smartReplyPromptStatePath() {
+  return join(app.getPath('userData'), 'security', 'smart-reply-prompt-state.json');
+}
+
+async function recordPackagedSmartReplyPromptHash(hash: string) {
+  await mkdir(dirname(smartReplyPromptStatePath()), { recursive: true });
+  await writeJsonAtomic(smartReplyPromptStatePath(), { schemaVersion: 1, packagedHash: hash });
+}
+
+async function readRecordedPackagedSmartReplyPromptHash() {
+  try {
+    const parsed = JSON.parse(await readFile(smartReplyPromptStatePath(), 'utf8')) as Record<string, unknown>;
+    return parsed.schemaVersion === 1 && typeof parsed.packagedHash === 'string' ? parsed.packagedHash : '';
+  } catch {
+    return '';
+  }
+}
+
+async function smartReplyPromptBundleExists() {
+  const candidates = app.isPackaged
+    ? [packagedSmartReplyPromptPath(), pendingSmartReplyPromptPath(), activeSmartReplyPromptPath()]
+    : [join(developmentProjectRoot, '.package-secrets', smartReplyPromptBundleFileName)];
+  for (const path of candidates) {
+    if (await readOptionalText(path)) return true;
+  }
+  return false;
+}
+
+async function loadSmartReplyPrompt(serviceSecret: string) {
+  if (smartReplyPromptCache) return smartReplyPromptCache;
+  if (!app.isPackaged) {
+    const raw = await readOptionalText(join(developmentProjectRoot, '.package-secrets', smartReplyPromptBundleFileName));
+    if (!raw) throw new Error(`Missing encrypted smart reply prompt file: ${smartReplyPromptBundleFileName}`);
+    smartReplyPromptCache = decryptSmartReplyPromptBundle(serviceSecret, raw);
+    return smartReplyPromptCache;
+  }
+
+  const packagedRaw = await readOptionalText(packagedSmartReplyPromptPath());
+  const packagedHash = packagedRaw ? createHash('sha256').update(packagedRaw).digest('hex') : '';
+  const recordedHash = await readRecordedPackagedSmartReplyPromptHash();
+  if (packagedRaw && packagedHash !== recordedHash) {
+    try {
+      const imported = decryptSmartReplyPromptBundle(serviceSecret, packagedRaw);
+      await writeTextAtomic(activeSmartReplyPromptPath(), packagedRaw);
+      await recordPackagedSmartReplyPromptHash(packagedHash);
+      smartReplyPromptCache = imported;
+      return imported;
+    } catch {
+      // A newly installed bundle may belong to the previous authorization. A
+      // valid active copy remains authoritative in that case.
+    }
+  }
+
+  const pendingRaw = await readOptionalText(pendingSmartReplyPromptPath());
+  if (pendingRaw) {
+    try {
+      const recovered = decryptSmartReplyPromptBundle(serviceSecret, pendingRaw);
+      await writeTextAtomic(activeSmartReplyPromptPath(), pendingRaw);
+      await rm(pendingSmartReplyPromptPath(), { force: true });
+      smartReplyPromptCache = recovered;
+      return recovered;
+    } catch {
+      // Ignore data staged for an authorization that never committed.
+    }
+  }
+
+  const activeRaw = await readOptionalText(activeSmartReplyPromptPath());
+  if (activeRaw) {
+    smartReplyPromptCache = decryptSmartReplyPromptBundle(serviceSecret, activeRaw);
+    return smartReplyPromptCache;
+  }
+  if (!packagedRaw) throw new Error(`Missing encrypted smart reply prompt file: ${smartReplyPromptBundleFileName}`);
+  smartReplyPromptCache = decryptSmartReplyPromptBundle(serviceSecret, packagedRaw);
+  await writeTextAtomic(activeSmartReplyPromptPath(), packagedRaw);
+  await recordPackagedSmartReplyPromptHash(packagedHash);
+  return smartReplyPromptCache;
 }
 
 async function migrateLegacyUserDataDir() {
@@ -3618,8 +3892,308 @@ async function engageWorkspaceVisibilityLock() {
 }
 
 function releaseWorkspaceVisibilityLock() {
+  if (remoteGuardIncidentLatched) {
+    if (!workspaceVisibilityGate.locked) advanceWorkspaceVisibilityGate(true);
+    broadcastSignalVisibilityState();
+    hideAllSignalWindows();
+    return false;
+  }
   advanceWorkspaceVisibilityGate(false);
   broadcastSignalVisibilityState();
+  return true;
+}
+
+function notifyRemoteGuardStatus() {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+  mainWindow.webContents.send('remote-guard:status-changed', remoteGuardStatus);
+}
+
+function remoteGuardAlarmDocument() {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>御前侍卫安全警报</title>
+  <style>
+    *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#160408;color:#fff;font-family:"Microsoft YaHei UI","Segoe UI",sans-serif}
+    body{display:grid;place-items:center;background:radial-gradient(circle at 50% 42%,rgba(255,67,83,.28),transparent 34%),linear-gradient(145deg,#26040a,#090104 72%)}
+    main{width:min(820px,88vw);border:2px solid rgba(255,99,109,.88);border-radius:28px;padding:54px 58px;text-align:center;background:rgba(44,4,11,.92);box-shadow:0 0 0 10px rgba(255,61,76,.08),0 32px 100px rgba(0,0,0,.72);animation:pulse 1s ease-in-out infinite alternate}
+    .crest{display:grid;width:108px;height:108px;margin:0 auto 26px;place-items:center;border:4px solid #ff6570;border-radius:50%;color:#fff2d0;font-size:50px;font-weight:900;box-shadow:0 0 44px rgba(255,68,82,.55)}
+    h1{margin:0;color:#ff737c;font-size:52px;letter-spacing:8px}h2{margin:18px 0 0;color:#fff;font-size:30px}p{margin:25px 0 0;color:rgba(255,255,255,.8);font-size:20px;line-height:1.8}
+    strong{color:#ffd9a0}@keyframes pulse{from{transform:scale(.994);box-shadow:0 0 0 8px rgba(255,61,76,.07),0 32px 100px rgba(0,0,0,.72)}to{transform:scale(1);box-shadow:0 0 0 16px rgba(255,61,76,.14),0 32px 120px rgba(126,0,18,.62)}}
+  </style>
+</head>
+<body><main><div class="crest">侍</div><h1>安全警报</h1><h2>御前侍卫发现远程连接</h2><p>聊天窗口已经隐藏，系统将在 <strong>3 秒后锁定 Windows</strong><br>请在本机确认远控来源并断开可疑连接</p></main></body>
+</html>`;
+}
+
+function destroyRemoteGuardAlarmWindows() {
+  for (const alarmWindow of remoteGuardAlarmWindows) {
+    if (!alarmWindow.isDestroyed()) alarmWindow.destroy();
+  }
+  remoteGuardAlarmWindows.clear();
+}
+
+function showRemoteGuardAlarmWindows() {
+  if (!app.isReady() || remoteGuardAlarmWindows.size > 0) return;
+  const alarmUrl = `data:text/html;charset=utf-8,${encodeURIComponent(remoteGuardAlarmDocument())}`;
+  for (const display of screen.getAllDisplays()) {
+    const alarmWindow = new BrowserWindow({
+      x: display.bounds.x,
+      y: display.bounds.y,
+      width: display.bounds.width,
+      height: display.bounds.height,
+      frame: false,
+      show: false,
+      skipTaskbar: true,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      closable: false,
+      focusable: false,
+      backgroundColor: '#160408',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        webSecurity: true
+      }
+    });
+    remoteGuardAlarmWindows.add(alarmWindow);
+    alarmWindow.on('closed', () => remoteGuardAlarmWindows.delete(alarmWindow));
+    alarmWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    void alarmWindow.loadURL(alarmUrl).then(() => {
+      if (alarmWindow.isDestroyed()) return;
+      alarmWindow.setAlwaysOnTop(true, 'screen-saver');
+      alarmWindow.showInactive();
+      alarmWindow.moveTop();
+    }).catch(() => {
+      if (!alarmWindow.isDestroyed()) alarmWindow.destroy();
+    });
+  }
+}
+
+function startRemoteGuardAlarmSound() {
+  if (remoteGuardBeepTimer) return;
+  shell.beep();
+  remoteGuardBeepTimer = setInterval(() => shell.beep(), 850);
+}
+
+function stopRemoteGuardAlarmSound() {
+  if (!remoteGuardBeepTimer) return;
+  clearInterval(remoteGuardBeepTimer);
+  remoteGuardBeepTimer = null;
+}
+
+function focusMainWindowForRemoteGuardRecovery() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.moveTop();
+}
+
+function scheduleRemoteGuardWindowsLock() {
+  if (
+    remoteGuardWindowsLockTimer ||
+    remoteGuardStatus.windowsSessionLocked ||
+    !remoteGuardThreatActive ||
+    !remoteGuardIncidentLatched
+  ) return;
+  const windowsLockScheduledAt = Date.now() + remoteGuardWindowsLockDelayMs;
+  remoteGuardStatus = {
+    ...remoteGuardStatus,
+    windowsLockState: 'scheduled',
+    windowsLockScheduledAt
+  };
+  notifyRemoteGuardStatus();
+  remoteGuardWindowsLockTimer = setTimeout(() => {
+    remoteGuardWindowsLockTimer = null;
+    if (!remoteGuardThreatActive || !remoteGuardIncidentLatched || remoteGuardStatus.windowsSessionLocked) return;
+    const windowsLockAttemptedAt = Date.now();
+    remoteGuardStatus = {
+      ...remoteGuardStatus,
+      windowsLockState: 'requested',
+      windowsLockScheduledAt: undefined,
+      windowsLockAttemptedAt
+    };
+    notifyRemoteGuardStatus();
+    void requestWindowsWorkstationLock().then((requested) => {
+      if (!requested && !remoteGuardStatus.windowsSessionLocked) {
+        remoteGuardRuntimeReason = 'Windows 锁屏请求失败，安全警报保持显示';
+        remoteGuardStatus = {
+          ...remoteGuardStatus,
+          windowsLockState: 'failed',
+          reason: remoteGuardRuntimeReason
+        };
+        notifyRemoteGuardStatus();
+      }
+    });
+  }, remoteGuardWindowsLockDelayMs);
+}
+
+function beginRemoteGuardIncident() {
+  remoteGuardIncidentLatched = true;
+  showRemoteGuardAlarmWindows();
+  startRemoteGuardAlarmSound();
+  focusMainWindowForRemoteGuardRecovery();
+  scheduleRemoteGuardWindowsLock();
+  remoteGuardVisibilityLockPromise ??= engageWorkspaceVisibilityLock()
+    .catch(() => {
+      remoteGuardRuntimeReason = '聊天窗口隐藏确认未完整返回，Windows 锁屏仍将执行';
+    })
+    .finally(() => {
+      remoteGuardVisibilityLockPromise = null;
+      if (remoteGuardRuntimeReason) {
+        remoteGuardStatus = { ...remoteGuardStatus, reason: remoteGuardRuntimeReason };
+        notifyRemoteGuardStatus();
+      }
+    });
+}
+
+function clearRemoteGuardIncident() {
+  if (remoteGuardThreatActive) return false;
+  const previousRuntimeReason = remoteGuardRuntimeReason;
+  remoteGuardIncidentLatched = false;
+  remoteGuardRuntimeReason = '';
+  if (remoteGuardWindowsLockTimer) {
+    clearTimeout(remoteGuardWindowsLockTimer);
+    remoteGuardWindowsLockTimer = null;
+  }
+  destroyRemoteGuardAlarmWindows();
+  stopRemoteGuardAlarmSound();
+  remoteGuardStatus = {
+    ...remoteGuardStatus,
+    state: remoteGuardLastClearState,
+    threatActive: false,
+    incidentLatched: false,
+    windowsLockState: remoteGuardStatus.windowsSessionLocked ? 'confirmed' : 'idle',
+    windowsLockScheduledAt: undefined,
+    reason: remoteGuardStatus.reason === previousRuntimeReason ? undefined : remoteGuardStatus.reason
+  };
+  notifyRemoteGuardStatus();
+  return true;
+}
+
+async function runRemoteGuardScan(forceProcessRefresh = false) {
+  if (remoteGuardScanPromise) return remoteGuardScanPromise;
+  remoteGuardScanPromise = (async () => {
+    const startedAt = Date.now();
+    const evaluation = await inspectWindowsRemoteAccess(process.pid, { forceProcessRefresh });
+    const checkedAt = Date.now();
+    remoteGuardThreatActive = evaluation.threatActive;
+    remoteGuardLastClearState = evaluation.state;
+
+    if (evaluation.threatActive) {
+      if (!remoteGuardIncidentLatched) beginRemoteGuardIncident();
+      else {
+        showRemoteGuardAlarmWindows();
+        startRemoteGuardAlarmSound();
+        scheduleRemoteGuardWindowsLock();
+      }
+    } else {
+      if (remoteGuardWindowsLockTimer) {
+        clearTimeout(remoteGuardWindowsLockTimer);
+        remoteGuardWindowsLockTimer = null;
+      }
+      if (remoteGuardIncidentLatched) {
+        destroyRemoteGuardAlarmWindows();
+        focusMainWindowForRemoteGuardRecovery();
+      }
+    }
+
+    remoteGuardStatus = {
+      ...remoteGuardStatus,
+      enabled: process.platform === 'win32',
+      state: evaluation.threatActive ? 'alarm' : remoteGuardIncidentLatched ? 'recovery' : evaluation.state,
+      checkedAt,
+      nextScanAt: checkedAt + remoteGuardScanIntervalMs,
+      scanDurationMs: Math.max(0, checkedAt - startedAt),
+      processScanIntervalMs: remoteGuardProcessScanIntervalMs,
+      threatActive: evaluation.threatActive,
+      incidentLatched: remoteGuardIncidentLatched,
+      windowsLockState: evaluation.threatActive
+        ? remoteGuardStatus.windowsLockState
+        : remoteGuardStatus.windowsSessionLocked
+          ? 'confirmed'
+          : 'idle',
+      windowsLockScheduledAt: evaluation.threatActive ? remoteGuardStatus.windowsLockScheduledAt : undefined,
+      findings: evaluation.findings,
+      coverage: evaluation.coverage,
+      reason: remoteGuardRuntimeReason || evaluation.reason
+    };
+    notifyRemoteGuardStatus();
+    return remoteGuardStatus;
+  })().finally(() => {
+    remoteGuardScanPromise = null;
+  });
+  return remoteGuardScanPromise;
+}
+
+async function acknowledgeRemoteGuardIncident(): Promise<RemoteGuardActionResult> {
+  if (remoteGuardThreatActive) {
+    return { ok: false, reason: '远控迹象仍然存在，工作区保持锁定', status: remoteGuardStatus };
+  }
+  if (!remoteGuardIncidentLatched) return { ok: true, status: remoteGuardStatus };
+  const lockStatus = await getLockScreenStatus();
+  if (lockStatus.enabled) {
+    return { ok: false, reason: '请使用客户端锁屏密码恢复工作区', status: remoteGuardStatus };
+  }
+  clearRemoteGuardIncident();
+  releaseWorkspaceVisibilityLock();
+  return { ok: true, status: remoteGuardStatus };
+}
+
+async function startRemoteGuard() {
+  if (remoteGuardStarted) return remoteGuardStatus;
+  remoteGuardStarted = true;
+  powerMonitor.on('lock-screen', () => {
+    if (remoteGuardWindowsLockTimer) {
+      clearTimeout(remoteGuardWindowsLockTimer);
+      remoteGuardWindowsLockTimer = null;
+    }
+    remoteGuardStatus = {
+      ...remoteGuardStatus,
+      windowsSessionLocked: true,
+      windowsLockState: remoteGuardIncidentLatched ? 'confirmed' : 'idle',
+      windowsLockScheduledAt: undefined
+    };
+    notifyRemoteGuardStatus();
+  });
+  powerMonitor.on('unlock-screen', () => {
+    remoteGuardStatus = {
+      ...remoteGuardStatus,
+      windowsSessionLocked: false,
+      windowsLockState: 'idle',
+      windowsLockScheduledAt: undefined
+    };
+    if (remoteGuardThreatActive && remoteGuardIncidentLatched) {
+      showRemoteGuardAlarmWindows();
+      scheduleRemoteGuardWindowsLock();
+    }
+    notifyRemoteGuardStatus();
+    void runRemoteGuardScan();
+  });
+  powerMonitor.on('resume', () => void runRemoteGuardScan());
+  const status = await runRemoteGuardScan();
+  remoteGuardScanTimer = setInterval(() => void runRemoteGuardScan(), remoteGuardScanIntervalMs);
+  return status;
+}
+
+function stopRemoteGuard() {
+  if (remoteGuardScanTimer) {
+    clearInterval(remoteGuardScanTimer);
+    remoteGuardScanTimer = null;
+  }
+  if (remoteGuardWindowsLockTimer) {
+    clearTimeout(remoteGuardWindowsLockTimer);
+    remoteGuardWindowsLockTimer = null;
+  }
+  destroyRemoteGuardAlarmWindows();
+  stopRemoteGuardAlarmSound();
 }
 
 function canShowSignalWindows() {
@@ -3841,6 +4415,83 @@ function sendEmptySignalCacheResultBatch(
     results: []
   });
   return sendSignalControlMessage(appId, response);
+}
+
+function signalSmartReplyErrorCode(error: unknown): SignalSmartReplyErrorCode {
+  const name = error instanceof Error ? error.name : '';
+  const message = error instanceof Error ? error.message : '';
+  if (/429|busy|already running/i.test(message)) return 'rate-limited';
+  if (/timeout|timed out|abort/i.test(`${name} ${message}`)) return 'timeout';
+  if (/response|json|reply english|reply chinese|schema|placeholder|punctuation/i.test(message)) {
+    return 'invalid-response';
+  }
+  if (/not configured|missing encrypted|authorization|license|unavailable/i.test(message)) {
+    return 'unavailable';
+  }
+  return 'request-failed';
+}
+
+function signalSmartReplyPendingIsCurrent(
+  appId: string,
+  pending: PendingSignalSmartReplyRequest
+) {
+  const context = getSignalCacheControlContext(appId, pending.client);
+  const activeConversation = activeSignalCacheConversations.get(appId);
+  return Boolean(
+    context &&
+      activeConversation?.client === pending.client &&
+      activeConversation.conversationId === pending.conversationId &&
+      getPendingSignalSmartReplyRequest(appId, pending.requestId) === pending &&
+      pending.state === 'generating' &&
+      Date.now() - pending.acceptedAt <= signalSmartReplyRequestTtlMs
+  );
+}
+
+async function respondToSignalSmartReplyRequest(
+  appId: string,
+  profileId: string,
+  pending: PendingSignalSmartReplyRequest,
+  request: SignalSmartReplyRequest
+) {
+  try {
+    const result = await generateSmartRepliesWithDeepSeek({
+      requestId: request.requestId,
+      userId: `df-${profileId}`,
+      profileId,
+      platform: 'signal',
+      messages: request.messages.map(message => ({
+        speaker: message.direction === 'incoming' ? 'other' : 'self',
+        text: message.sourceText
+      })),
+      latestSpeaker: 'other',
+      replyCount: 3,
+      outputLanguage: 'en-US',
+      allowSensitiveEcho: false
+    });
+    if (!signalSmartReplyPendingIsCurrent(appId, pending)) return;
+    sendSignalControlMessage(appId, {
+      type: 'smartReply.result',
+      requestId: request.requestId,
+      contextVersion: signalSmartReplyContextVersion,
+      conversationId: request.conversationId,
+      trigger: pending.trigger,
+      replies: result.replies
+    });
+  } catch (error) {
+    if (!signalSmartReplyPendingIsCurrent(appId, pending)) return;
+    sendSignalControlMessage(appId, {
+      type: 'smartReply.error',
+      requestId: request.requestId,
+      contextVersion: signalSmartReplyContextVersion,
+      conversationId: request.conversationId,
+      trigger: pending.trigger,
+      code: signalSmartReplyErrorCode(error)
+    });
+  } finally {
+    if (getPendingSignalSmartReplyRequest(appId, pending.requestId) === pending) {
+      pending.state = 'completed';
+    }
+  }
 }
 
 async function respondToSignalVisibleMessageBatch(
@@ -4088,6 +4739,41 @@ function handleSignalControlMessage(appId: string, message: Record<string, unkno
           cacheContext.client,
           refresh
         );
+      }
+    }
+    if (client && message.type === 'smartReply.request') {
+      let request: SignalSmartReplyRequest | null = null;
+      try {
+        request = validateSignalSmartReplyRequest(message);
+      } catch {
+        // Reject malformed or non-canonical smart reply requests without logging message bodies.
+      }
+      const activeConversation = activeSignalCacheConversations.get(appId);
+      if (
+        request &&
+        cacheContext &&
+        activeConversation?.client === cacheContext.client &&
+        activeConversation.conversationId === request.conversationId
+      ) {
+        const trigger = request.messages.at(-1);
+        if (trigger) {
+          const pending: PendingSignalSmartReplyRequest = {
+            requestId: request.requestId,
+            conversationId: request.conversationId,
+            trigger,
+            client: cacheContext.client,
+            state: 'generating',
+            acceptedAt: Date.now()
+          };
+          if (setPendingSignalSmartReplyRequest(appId, pending)) {
+            void respondToSignalSmartReplyRequest(
+              appId,
+              cacheContext.profileId,
+              pending,
+              request
+            );
+          }
+        }
       }
     }
     if (cacheContext && message.type === 'message.visibleBatch') {
@@ -5395,6 +6081,103 @@ async function translateWithDeepSeek(
   }
 }
 
+const smartReplyInFlightProfiles = new Set<string>();
+let smartReplyInFlightCount = 0;
+const smartReplyRequestTimeoutMs = 25_000;
+const smartReplyTransientStatuses = new Set([429, 502, 503, 504]);
+
+async function generateSmartRepliesWithDeepSeek(request: SmartReplyRequest): Promise<SmartReplyResult> {
+  const validated = validateSmartReplyRequest(request);
+  const profileGate = validated.profileId || '__default__';
+  if (smartReplyInFlightProfiles.has(profileGate)) {
+    throw new Error('A smart reply request is already running for this profile.');
+  }
+  if (smartReplyInFlightCount >= 2) throw new Error('Smart reply is busy. Please try again shortly.');
+
+  smartReplyInFlightProfiles.add(profileGate);
+  smartReplyInFlightCount += 1;
+  try {
+    const config = await readConfig();
+    const deepseekApiKey = clientLicenseManager?.getServiceSecret() || await readDevelopmentServiceSecret();
+    if (!deepseekApiKey) throw new Error('DeepSeek API key is not configured.');
+    const { prompt } = await loadSmartReplyPrompt(deepseekApiKey);
+    const protectedTranscript = buildProtectedSmartReplyTranscript(validated);
+    const userId = (validated.userId || (validated.profileId ? `df-${validated.profileId}` : 'df-smart-reply'))
+      .replace(/[^a-zA-Z0-9\-_]/g, '_')
+      .slice(0, 256);
+    const input = JSON.stringify(protectedTranscript.payload);
+    const deadline = Date.now() + smartReplyRequestTimeoutMs;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), remainingMs);
+      try {
+        const response = await fetch('https://api.deepseek.com/chat/completions', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${deepseekApiKey}`
+          },
+          body: JSON.stringify({
+            model: config.deepseekModel || defaultModel,
+            user_id: userId,
+            messages: [
+              { role: 'system', content: prompt },
+              { role: 'user', content: input }
+            ],
+            response_format: { type: 'json_object' },
+            thinking: { type: 'disabled' },
+            temperature: attempt === 0 ? 0.65 : 0.2,
+            max_tokens: 1_000,
+            stream: false
+          })
+        });
+        const declaredResponseBytes = Number(response.headers.get('content-length') || '0');
+        if (Number.isFinite(declaredResponseBytes) && declaredResponseBytes > 512 * 1024) {
+          await response.body?.cancel();
+          throw new Error('DeepSeek smart reply response is too large.');
+        }
+        const rawBody = await response.text();
+        if (Buffer.byteLength(rawBody, 'utf8') > 512 * 1024) {
+          throw new Error('DeepSeek smart reply response is too large.');
+        }
+        if (!response.ok) {
+          const error = new Error(`DeepSeek smart reply request failed: ${response.status}`);
+          error.name = smartReplyTransientStatuses.has(response.status) ? 'TransientSmartReplyError' : 'PermanentSmartReplyError';
+          throw error;
+        }
+        let data: unknown;
+        try {
+          data = JSON.parse(rawBody);
+        } catch {
+          throw new Error('DeepSeek smart reply envelope is not valid JSON.');
+        }
+        const content = (data as { choices?: Array<{ message?: { content?: unknown } }> })
+          ?.choices?.[0]?.message?.content;
+        if (typeof content !== 'string') throw new Error('DeepSeek smart reply content is missing.');
+        return parseSmartReplyResponse(content);
+      } catch (error) {
+        lastError = error;
+        if (error instanceof Error && error.name === 'PermanentSmartReplyError') throw error;
+        if (attempt === 1 || Date.now() >= deadline) break;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    if (lastError instanceof Error && lastError.name === 'AbortError') {
+      throw new Error('Smart reply request timed out.');
+    }
+    throw lastError instanceof Error ? lastError : new Error('Smart reply request failed.');
+  } finally {
+    smartReplyInFlightProfiles.delete(profileGate);
+    smartReplyInFlightCount = Math.max(0, smartReplyInFlightCount - 1);
+  }
+}
+
 function toggleMainWindowSize(targetWindow: BrowserWindow) {
   if (!targetWindow.isMaximized()) {
     targetWindow.maximize();
@@ -5526,12 +6309,22 @@ function registerIpc() {
 
     let prompts: TranslationPrompts;
     let pendingRaw = '';
+    let smartPrompt: SmartReplyPrompt | null = null;
+    let smartPendingRaw = '';
+    const previousActiveRaw = await readOptionalText(activeTranslationPromptPath());
+    const previousSmartActiveRaw = await readOptionalText(activeSmartReplyPromptPath());
     try {
       prompts = await loadTranslationPrompts(oldServiceSecret);
       pendingRaw = encryptTranslationPromptBundle(preparation.prepared.payload.serviceSecret, prompts);
       await writeTextAtomic(pendingTranslationPromptPath(), pendingRaw);
+      if (await smartReplyPromptBundleExists()) {
+        smartPrompt = await loadSmartReplyPrompt(oldServiceSecret);
+        smartPendingRaw = encryptSmartReplyPromptBundle(preparation.prepared.payload.serviceSecret, smartPrompt);
+        await writeTextAtomic(pendingSmartReplyPromptPath(), smartPendingRaw);
+      }
     } catch (error) {
       await rm(pendingTranslationPromptPath(), { force: true });
+      await rm(pendingSmartReplyPromptPath(), { force: true });
       return {
         ok: false,
         reason: error instanceof Error ? `提示词密钥迁移失败：${error.message}` : '提示词密钥迁移失败',
@@ -5543,20 +6336,32 @@ function registerIpc() {
     try {
       snapshot = await clientLicenseManager.commitReplacement(preparation.prepared);
       await writeTextAtomic(activeTranslationPromptPath(), pendingRaw);
+      if (smartPendingRaw) await writeTextAtomic(activeSmartReplyPromptPath(), smartPendingRaw);
       await rm(pendingTranslationPromptPath(), { force: true });
+      await rm(pendingSmartReplyPromptPath(), { force: true });
       translationPromptsCache = prompts;
+      smartReplyPromptCache = smartPrompt;
       return { ok: true, status: clientLicenseManager.getStatus() };
     } catch (error) {
       let rollbackCompleted = false;
       if (snapshot) {
         try {
           await clientLicenseManager.rollbackReplacement(snapshot);
+          if (previousActiveRaw) await writeTextAtomic(activeTranslationPromptPath(), previousActiveRaw);
+          else await rm(activeTranslationPromptPath(), { force: true });
+          if (previousSmartActiveRaw) await writeTextAtomic(activeSmartReplyPromptPath(), previousSmartActiveRaw);
+          else await rm(activeSmartReplyPromptPath(), { force: true });
+          translationPromptsCache = prompts;
+          smartReplyPromptCache = smartPrompt;
           rollbackCompleted = true;
         } catch {
-          // The pending prompt remains available for startup recovery if authorization rollback cannot complete.
+          // Pending prompt files remain available for startup recovery if authorization rollback cannot complete.
         }
       }
-      if (!snapshot || rollbackCompleted) await rm(pendingTranslationPromptPath(), { force: true });
+      if (!snapshot || rollbackCompleted) {
+        await rm(pendingTranslationPromptPath(), { force: true });
+        await rm(pendingSmartReplyPromptPath(), { force: true });
+      }
       return {
         ok: false,
         reason: error instanceof Error ? `重新授权未完成：${error.message}` : '重新授权未完成',
@@ -5610,6 +6415,9 @@ function registerIpc() {
     return appendSignalTranslationDebugLog(debugEvent);
   });
   trustedHandle('translate', true, (_event, request: TranslateRequest) => translateWithDeepSeek(validateTranslateRequest(request)));
+  trustedHandle('smart-reply:generate', true, (_event, request: SmartReplyRequest) =>
+    generateSmartRepliesWithDeepSeek(validateSmartReplyRequest(request))
+  );
   trustedHandle('send-integrity:authorize', true, (_event, request: SendAuthorizationRequest) => {
     if (!request || typeof request !== 'object') throw new Error('Send authorization request is invalid.');
     assertText(request.requestId, 'Send request ID', 512);
@@ -5683,6 +6491,9 @@ function registerIpc() {
     )
   );
   trustedHandle('lock-screen:unlock', true, (_event, pin: string) => unlockLockScreen(assertText(pin, 'Lock credential', 32)));
+  trustedHandle('remote-guard:status', false, () => remoteGuardStatus);
+  trustedHandle('remote-guard:scan-now', false, () => runRemoteGuardScan(true));
+  trustedHandle('remote-guard:acknowledge', false, () => acknowledgeRemoteGuardIncident());
   trustedHandle('window:set-theme', true, (_event, theme: 'blackGold' | 'pink') => {
     if (theme !== 'blackGold' && theme !== 'pink') throw new Error('Theme is invalid.');
   });
@@ -5869,6 +6680,13 @@ async function createWindow() {
   mainWindow.on('hide', () => {
     hideAllSignalWindows();
   });
+  mainWindow.on('close', (event) => {
+    if (!remoteGuardIncidentLatched || signalShutdownBeforeQuitDone) return;
+    event.preventDefault();
+    showRemoteGuardAlarmWindows();
+    startRemoteGuardAlarmSound();
+    focusMainWindowForRemoteGuardRecovery();
+  });
   mainWindow.on('restore', requestSignalWorkspaceSyncBurst);
   mainWindow.on('show', requestSignalWorkspaceSyncBurst);
   mainWindow.on('focus', requestSignalWorkspaceSyncBurst);
@@ -5897,6 +6715,7 @@ async function createWindow() {
 
   await readyToShow;
   if (!mainWindow.isDestroyed()) {
+    await startRemoteGuard();
     releaseWorkspaceVisibilityLock();
     mainWindow.show();
     requestSignalWorkspaceSyncBurst();
@@ -5964,6 +6783,7 @@ if (!cloneResetWorkerMode) app.on('before-quit', (event) => {
       clearTimeout(signalShutdownBeforeQuitTimer);
       signalShutdownBeforeQuitTimer = null;
     }
+    stopRemoteGuard();
     signalShutdownBeforeQuitDone = true;
     app.quit();
   });

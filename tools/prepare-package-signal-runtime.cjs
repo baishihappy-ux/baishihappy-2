@@ -62,6 +62,11 @@ async function main() {
     ? Buffer.from(await asar.extractFile(signalAsar, bridgeEntry.replace(/^[/\\]/, ''))).toString('utf8')
     : signalMain;
   if (!signalBridge.includes('maoyi-signal-control-auth-v1')) throw new Error('Signal runtime is missing the authenticated control protocol.');
+  for (const marker of ['smartReply.request', 'smartReply.result', 'smartReply.error']) {
+    if (!signalBridge.includes(marker)) {
+      throw new Error(`Signal runtime is missing the native smart reply protocol: ${marker}`);
+    }
+  }
   if (!signalMain.includes('dfLaunchPipe') || !signalMain.includes('local-direct-blocked') || !signalMain.includes('credential-accepted')) {
     throw new Error('Signal runtime is missing the launcher credential guard.');
   }

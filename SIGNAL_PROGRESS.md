@@ -4,15 +4,15 @@
 
 Confirmed:
 
-- 本机可用 Signal Desktop 路径：`C:\Users\admin\AppData\Local\Programs\signal-desktop\Signal.exe`。
-- 友商内置 Signal 路径：`D:\DF fanyiqi\look world\look-world-pro-embed\signal\Signal.exe`。
+- 本机可用 Signal Desktop 路径：`%USERPROFILE%\AppData\Local\Programs\signal-desktop\Signal.exe`。
+- 友商内置 Signal 路径：`C:\maoyi-workspace\look world\look-world-pro-embed\signal\Signal.exe`。
 - 本项目已新增阶段 1 代码：创建或点击 Signal 多开时，主进程会启动 `Signal.exe`，并传入当前多开的独立 `--user-data-dir=...`。
 - 本项目关闭 Signal 多开时，会先停止已记录的 Signal 子进程，再删除对应 `signalDataDir`。
 - `npm.cmd run build` 已通过。
 
 Test result:
 
-- 单次启动测试可看到 `Signal.exe` 命令行包含独立 `--user-data-dir=D:\DF fanyiqi\chat-translator\.tmp\signal-launch-test`。
+- 单次启动测试可看到 `Signal.exe` 命令行包含独立 `--user-data-dir=C:\maoyi-workspace\chat-translator\.tmp\signal-launch-test`。
 - 连续启动两个不同 `--user-data-dir` 的官方 Signal 测试实例时，只确认到一个 `Signal.exe` 进程。
 
 Conclusion:
@@ -47,8 +47,8 @@ Confirmed:
   4. 等长替换 `.runtime\signal-desktop\Signal.exe` 内嵌的旧 header hash。
 - 改造后的 `.runtime\signal-desktop\Signal.exe` 已验证可启动。
 - 双实例测试通过：同时存在 2 个 `Signal.exe` 进程，分别使用：
-  - `D:\DF fanyiqi\chat-translator\.tmp\signal-multi-a`
-  - `D:\DF fanyiqi\chat-translator\.tmp\signal-multi-b`
+  - `C:\maoyi-workspace\chat-translator\.tmp\signal-multi-a`
+  - `C:\maoyi-workspace\chat-translator\.tmp\signal-multi-b`
 
 Current implementation:
 
@@ -73,7 +73,7 @@ Remaining gaps:
 
 Confirmed:
 
-- PowerShell `Start-Process` 测试时，如果直接传 `--user-data-dir=D:\DF fanyiqi\...`，Signal 日志会显示 `userData: D:\DF`，路径被空格截断。
+- PowerShell `Start-Process` 测试时，如果直接传 `--user-data-dir=C:\maoyi-workspace\...`，Signal 日志会显示 `userData: D:\DF`，路径被空格截断。
 - 路径被截断后会读到错误目录，出现 `sqlcipher_page_cipher: hmac check failed`、`sqlite3Codec: error decrypting page 1 data`，界面会弹错误提示。
 - 使用不含空格的数据目录测试，Signal 正常启动，没有数据库解密错误。
 - 使用本项目主程序同款 Node `spawn` 启动方式测试，即使 `user-data-dir` 含空格，Signal 日志也能显示完整路径。

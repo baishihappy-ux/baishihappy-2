@@ -95,6 +95,25 @@ function verifyPublicLicenseSuite(resources) {
   }
 }
 
+function verifyEncryptedSmartReplyPrompt(resources) {
+  const promptPath = path.join(resources, 'smart-reply-prompt.dfp');
+  const stat = fs.statSync(promptPath, { throwIfNoEntry: false });
+  if (!stat?.isFile() || stat.size < 128 || stat.size > 192 * 1024) {
+    throw new Error('Client package is missing a valid encrypted smart-reply prompt resource.');
+  }
+  const bundle = JSON.parse(fs.readFileSync(promptPath, 'utf8'));
+  const expectedKeys = ['algorithm', 'ciphertext', 'iv', 'kdf', 'salt', 'schemaVersion', 'tag'];
+  if (JSON.stringify(Object.keys(bundle).sort()) !== JSON.stringify(expectedKeys)) {
+    throw new Error('Encrypted smart-reply prompt resource contains unexpected fields.');
+  }
+  if (bundle.schemaVersion !== 1 || bundle.algorithm !== 'AES-256-GCM' || bundle.kdf !== 'HKDF-SHA256') {
+    throw new Error('Encrypted smart-reply prompt resource uses an unsupported format.');
+  }
+  for (const field of ['salt', 'iv', 'tag', 'ciphertext']) {
+    if (typeof bundle[field] !== 'string' || !bundle[field]) throw new Error(`Encrypted smart-reply prompt field is missing: ${field}`);
+  }
+}
+
 async function verifyMaoyiFuses(executablePath) {
   const wire = await getCurrentFuseWire(executablePath);
   const expected = new Map([
@@ -138,6 +157,7 @@ async function verifyClient(clientRoot) {
   const resources = path.join(appRoot, 'resources');
   verifyNoForbiddenResources(resources);
   verifyPublicLicenseSuite(resources);
+  verifyEncryptedSmartReplyPrompt(resources);
   const appAsar = path.join(resources, 'app.asar');
   const entries = await asar.listPackage(appAsar);
   for (const forbidden of [/license-issuer/i, /trial-config/i, /issuer-suite-key/i, /license-suite\.sealed/i]) {

@@ -11,7 +11,7 @@ It embeds a Signal Desktop runtime and launches a separate `Signal.exe` with a s
 Reference directory:
 
 ```text
-D:\DF fanyiqi\look world\look-world-pro-embed\
+C:\maoyi-workspace\look world\look-world-pro-embed\
 ```
 
 Key structure:
@@ -22,8 +22,8 @@ look-world-pro-embed/
     Signal.exe
     resources/app.asar
     resources/app.asar.unpacked/
-  Signal-Zh1T4pyBHEc6NK3wDkpR_/
-  Signal-ux5d6dbL17c1vQCUsUDSG/
+  Signal-<INSTANCE_ID>/
+  Signal-<INSTANCE_ID>/
 ```
 
 Meaning:
@@ -39,8 +39,8 @@ Typical competitor launch:
 ```text
 Signal.exe
   --proxy=
-  --user-data-dir=D:\DF fanyiqi\look world\look-world-pro-embed\Signal-Zh1T4pyBHEc6NK3wDkpR_
-  --appId=Signal-Zh1T4pyBHEc6NK3wDkpR_
+  --user-data-dir=C:\maoyi-workspace\look world\look-world-pro-embed\Signal-<INSTANCE_ID>
+  --appId=Signal-<INSTANCE_ID>
   --wsPort=23510
   --title=Signal01
   --windowMode=embed

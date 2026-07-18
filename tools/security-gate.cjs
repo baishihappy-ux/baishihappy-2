@@ -17,7 +17,7 @@ for (const forbidden of ['license-issuer/**/*', 'dist-electron/**/*', 'electron/
 
 for (const resource of extraResources) {
   const from = typeof resource === 'string' ? resource : resource?.from;
-  if (/trial-config|license-suite\.sealed|issuer-suite-key|translation-prompts\.source/i.test(String(from || ''))) {
+  if (/trial-config|license-suite\.sealed|issuer-suite-key|translation-prompts\.source|smart-reply-prompt\.source/i.test(String(from || ''))) {
     failures.push(`client resources include a secret-bearing entry: ${from}`);
   }
 }
@@ -92,8 +92,18 @@ if (!clientFiles.includes('dist-electron/sensitive-send-authorization.js')) fail
 if (!clientFiles.includes('dist-electron/translation-sensitive-tokens.js')) failures.push('translation sensitive-token protection module is missing from the client package');
 if (!suiteBuilderSource.includes("'dist-electron/translation-sensitive-tokens.js'")) failures.push('translation sensitive-token protection module is missing from the client suite');
 if (!clientFiles.includes('dist-electron/translation-prompt-bundle.js')) failures.push('encrypted translation prompt loader is missing from the client package');
+if (!clientFiles.includes('dist-electron/smart-reply-core.js')) failures.push('smart reply validation core is missing from the client package');
+if (!clientFiles.includes('dist-electron/smart-reply-prompt-bundle.js')) failures.push('encrypted smart-reply prompt loader is missing from the client package');
 if (!clientFiles.includes('dist-electron/translation-english-style.js')) failures.push('English chat style enforcement is missing from the client package');
+if (!clientFiles.includes('dist-electron/remote-guard.js')) failures.push('Windows remote-guard runtime is missing from the client package');
+if (!clientFiles.includes('dist-electron/remote-guard-core.js')) failures.push('Windows remote-guard policy is missing from the client package');
+if (!suiteBuilderSource.includes("'dist-electron/remote-guard.js'")) failures.push('Windows remote-guard runtime is missing from the client suite');
+if (!suiteBuilderSource.includes("'dist-electron/remote-guard-core.js'")) failures.push('Windows remote-guard policy is missing from the client suite');
 if (!suiteBuilderSource.includes("'.package-secrets/translation-prompts.dfp'")) failures.push('encrypted translation prompt file is missing from the client suite');
+if (!suiteBuilderSource.includes("'.package-secrets/smart-reply-prompt.dfp'")) failures.push('encrypted smart-reply prompt file is missing from the client suite');
+if (!extraResources.some((resource) => typeof resource === 'object' && resource?.from === '.package-secrets/smart-reply-prompt.dfp' && resource?.to === 'smart-reply-prompt.dfp')) {
+  failures.push('encrypted smart-reply prompt file is missing from the standard client package');
+}
 if (/const\s+(?:composerEnglish|messageChinese)SystemPrompt\s*=/.test(mainSource)) failures.push('plaintext translation prompts remain embedded in client source');
 
 if (failures.length) {

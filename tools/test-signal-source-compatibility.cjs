@@ -6,10 +6,10 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 const read = relativePath => fs.readFileSync(path.join(root, relativePath), 'utf8');
 const readBuffer = relativePath => fs.readFileSync(path.join(root, relativePath));
-const defaultBaselineVersion = '8.18.0';
+const defaultBaselineVersion = '8.17.0';
 const supportedBaselines = Object.freeze({
   '8.17.0': '6C6CE9E865BFD5904937FE77A76428021EFFDDA350CDE32D80EEE8FC65E83052',
-  '8.18.0': 'E25AA0F8308BF5DB04A41D3ED12E4F717884AFCC118BA639786A3AE523C7D1D6'
+  '8.18.0': 'BF482ACA5FEB79AFD4B0C418E56DF41BEA3C38F284EF8FBDB64C1BF17F5D2650'
 });
 
 function selectBaselineVersion(argv) {
@@ -91,6 +91,7 @@ const requiredCapabilities = [
 if (baselineVersion === '8.18.0') {
   requiredCapabilities.push('source-message-added-live-translation');
   requiredCapabilities.push('source-bubble-manual-refresh');
+  requiredCapabilities.push('source-native-smart-reply-request');
 }
 const capabilityIds = contract.capabilities.map(item => item.id);
 assert.deepEqual(capabilityIds, requiredCapabilities);
@@ -116,19 +117,23 @@ const expectedPatchSeries = [
 if (baselineVersion === '8.18.0') {
   expectedPatchSeries.push({
     file: '0004-maoyi-source-translation-cache-bridge.patch',
-    sha256: 'E1A261466D7D9F6C38896C7236C9E27067871320123F0BE86EE00A09ADF8F7A8'
+      sha256: 'E1A261466D7D9F6C38896C7236C9E27067871320123F0BE86EE00A09ADF8F7A8'
   });
   expectedPatchSeries.push({
     file: '0005-maoyi-realtime-message-translation.patch',
-    sha256: '43B1CBDDF3E1A9C5CDBD0B03EAA33BC464D63A214880D26F495045635823DFD6'
+      sha256: '43B1CBDDF3E1A9C5CDBD0B03EAA33BC464D63A214880D26F495045635823DFD6'
   });
   expectedPatchSeries.push({
     file: '0006-maoyi-source-bubble-refresh.patch',
-    sha256: '1E124603EC29EFE3F4B4090D70DCC9F891F48D253C5ED174CD6668B0B4A8E7A6'
+      sha256: '1E124603EC29EFE3F4B4090D70DCC9F891F48D253C5ED174CD6668B0B4A8E7A6'
   });
   expectedPatchSeries.push({
     file: '0007-maoyi-incoming-auto-translation-stability.patch',
-    sha256: 'F260FAC184A6080E4055CF2BEA8205987841430B8DCF4E834DD0081594656B02'
+      sha256: 'F260FAC184A6080E4055CF2BEA8205987841430B8DCF4E834DD0081594656B02'
+  });
+  expectedPatchSeries.push({
+    file: '0008-maoyi-source-smart-reply-request.patch',
+      sha256: '8F7F892605D7A526417BF3D34269F7A97B05BA6924630D9ADFC4CC623EC47A83'
   });
 }
 assert.deepEqual(patchSeries.patches, expectedPatchSeries);
@@ -255,6 +260,28 @@ if (baselineVersion === '8.18.0') {
       `missing incoming-stability patch marker: ${expected}`
     );
   }
+  const smartReplyPatch = read(`${patchSeriesDirectory}/${patchSeries.patches[7].file}`);
+  for (const expected of [
+    'smartReply.request',
+    'smartReply.result',
+    'smartReply.error',
+    'requestMaoyiSmartReply',
+    'module-message__maoyi-smart-reply',
+    '+  @include mixins.font-body-2;',
+    '+        clearMaoyiSmartReplyRuntime();',
+    '+        pendingSmartReplies.clear();',
+    'sourceSmartReplyContract_test.node.ts',
+    'writeMaoyiSmartReplyToComposer'
+  ]) {
+    assert.ok(
+      smartReplyPatch.includes(expected),
+      `missing source-smart-reply patch marker: ${expected}`
+    );
+  }
+  assert.ok(
+    !smartReplyPatch.includes('+  @include mixins.font-body-2-bold;'),
+    'the native Signal smart-reply button label must use regular weight'
+  );
 }
 
 const sourceExperimentTool = read('tools/signal-source-experiment.cjs');

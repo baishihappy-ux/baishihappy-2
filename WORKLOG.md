@@ -29,7 +29,7 @@
 
 ## Current Goal
 
-Recreate the Look World UI/style from `D:\DF fanyiqi\look world` inside `D:\DF fanyiqi\chat-translator`.
+Recreate the Look World UI/style from `C:\maoyi-workspace\look world` inside `C:\maoyi-workspace\chat-translator`.
 
 ## Current Truth
 
@@ -46,7 +46,7 @@ Do not claim the UI is complete until it has been compared against real screensh
 
 - Do not touch authorization or license logic.
 - Do not modify any `.exe` file.
-- Treat `D:\DF fanyiqi\look world` as read-only reference material.
+- Treat `C:\maoyi-workspace\look world` as read-only reference material.
 - Current work is UI/frontend recreation only. Do not bypass, integrate with, or simulate authorization checks.
 
 ## Completed
@@ -137,7 +137,7 @@ Vite frontend preview starts successfully, but this restricted execution environ
 npm.cmd exec vite -- --host 127.0.0.1 --port 5173
 ```
 
-Vite dev server was attempted. Its log showed ready, but this restricted environment could not connect to the local port. On the user's machine, run from `D:\DF fanyiqi\chat-translator`:
+Vite dev server was attempted. Its log showed ready, but this restricted environment could not connect to the local port. On the user's machine, run from `C:\maoyi-workspace\chat-translator`:
 
 ```powershell
 npm.cmd run dev
@@ -249,7 +249,7 @@ Verification:
 Codex 协作技能：
 
 - 已创建个人技能 `design-before-implementation`，用于约束关键改动先明确设计、参数、逻辑和验收，再落代码。
-- 个人技能位于 `C:\Users\admin\.codex\skills\design-before-implementation`。
+- 个人技能位于 `%USERPROFILE%\.codex\skills\design-before-implementation`。
 - 项目内同步副本位于 `chat-translator/codex-skills/design-before-implementation`，用于后续 GitHub 上传时一并带走。
 - 后续修改个人技能时，必须同步更新项目内副本。
 

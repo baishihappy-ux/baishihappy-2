@@ -38,9 +38,12 @@ matches(styles, /\.workspace-page\.workspace-header-collapsed\s*\{\s*grid-templa
 matches(styles, /\.workspace-header-collapsed \.runtime-header\s*\{\s*display:\s*none;/, 'no hidden header residue');
 matches(styles, /\.workspace-header-collapsed \.multi-open-tabs\s*\{\s*padding-right:\s*142px;/, 'tabs reserve the floating window-control footprint');
 matches(styles, /\.window-ctrl\.vertical\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?z-index:\s*9999;/, 'window controls remain floating');
-matches(styles, /\.runtime-side\s*\{[\s\S]*?grid-template-rows:\s*88px 88px 88px 74px 74px 74px minmax\(0, 1fr\);/, 'home, lock, and toggle use equal-height rows');
+matches(styles, /\.runtime-side\s*\{[\s\S]*?grid-template-rows:\s*88px 88px 88px 88px 74px 74px 74px minmax\(0, 1fr\);/, 'home, lock, remote guard, and toggle use equal-height rows');
+matches(app, /class="runtime-lock-button"[\s\S]*class="runtime-guard-button"[\s\S]*class="runtime-header-toggle"/, 'remote guard stays between lock and expand/collapse');
 matches(styles, /\.runtime-side \.runtime-header-toggle \.runtime-header-toggle-icon\s*\{[\s\S]*?width:\s*40px;[\s\S]*?height:\s*40px;[\s\S]*?font-size:\s*28px;/, 'enlarged Bitcoin toggle icon');
-matches(styles, /\.runtime-side \.runtime-header-toggle\s*\{[\s\S]*?transform:\s*translateY\(5px\);/, 'Bitcoin icon and expand/collapse label move down together by 5px');
+matches(styles, /\.runtime-side \.runtime-guard-button\s*\{[\s\S]*?transform:\s*translateY\(2px\);/, 'remote guard icon and labels move down together by 2px');
+matches(styles, /\.runtime-side \.runtime-header-toggle\s*\{[\s\S]*?transform:\s*translateY\(7px\);/, 'Bitcoin icon and expand/collapse label keep their prior 5px offset and move down by 2px');
+matches(styles, /\.runtime-side \.app-short\s*\{[\s\S]*?transform:\s*translateY\(2px\);/, 'all three platform shortcuts move down together by 2px');
 includes(styles, '.theme-pink .runtime-side .runtime-header-toggle .runtime-header-toggle-icon', 'pink-theme Bitcoin icon');
 assert.ok(!styles.includes('.runtime-header-toggle.active'), 'Only the expand/collapse label may change between states');
 matches(styles, /\.runtime-header-toggle-glyph\s*\{[\s\S]*?transform:\s*rotateY\(0deg\);/, 'inner glyph returns upright when animation stops');

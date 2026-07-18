@@ -33,13 +33,9 @@ function targetDirectory() {
     if (!resumableStatus || !/^\d{9}$/.test(manifest.suiteId) || !fs.statSync(suitePath, { throwIfNoEntry: false })?.isFile()) {
       throw new Error(`Suite sequence ${requested} is already present and cannot be reused.`);
     }
-    return { directory, previousManifest: manifest, sequence: requested };
+    return { directory, previousManifest: manifest };
   }
-  return {
-    directory: path.join(suitesRoot, `taozhuang${requested}_${localStamp(new Date())}`),
-    previousManifest: null,
-    sequence: requested
-  };
+  return { directory: path.join(suitesRoot, `taozhuang${requested}_${localStamp(new Date())}`), previousManifest: null };
 }
 
 function run(command, args, env = {}) {
@@ -96,7 +92,7 @@ function copySingleExe(fromDirectory, targetFile, namePattern) {
 
 function main() {
   const target = targetDirectory();
-  const { directory, previousManifest, sequence } = target;
+  const { directory, previousManifest } = target;
   if (!previousManifest) fs.mkdirSync(directory, { recursive: false });
   const buildRoot = path.join(projectRoot, '.tmp', path.basename(directory));
   const clientBuild = path.join(buildRoot, 'client');
@@ -144,6 +140,7 @@ function main() {
     run(process.execPath, ['tools/patch-signal-control-channel.cjs']);
     const npmCli = process.env.npm_execpath;
     if (!npmCli) throw new Error('npm_execpath is unavailable. Start this workflow with npm run suite:package.');
+    run(process.execPath, [npmCli, 'run', 'build:smart-reply-prompt']);
     run(process.execPath, [npmCli, 'run', 'test:security']);
     run(process.execPath, [npmCli, 'run', 'test:signal-control']);
     run(process.execPath, ['tools/prepare-package-signal-runtime.cjs']);
@@ -177,8 +174,8 @@ function main() {
     copySingleExe(issuerBuild, issuerTarget, /AUTHORIZER/i);
     copySingleExe(promptGeneratorBuild, promptGeneratorTarget, /PROMPT-GENERATOR/i);
 
-    const readmeZh = `# maoyi \u5957\u88c5 ${sequence}\n\n- \u5957\u88c5 ID\uff1a${suiteId}\n- \u5ba2\u6237\u5b89\u88c5\u5305\uff1a\u5ba2\u6237\u5b89\u88c5\u5305/maoyi \u5b89\u88c5\u5305.exe\n- \u6388\u6743\u7a0b\u5e8f\uff1a\u5185\u90e8\u5de5\u5177/\u6388\u6743\u7a0b\u5e8f.exe\n- \u63d0\u793a\u8bcd\u751f\u6210\u5668\uff1a\u5185\u90e8\u5de5\u5177/\u63d0\u793a\u8bcd\u6587\u4ef6\u751f\u6210\u5668.exe\n- \u672c\u5957\u6388\u6743\u7a0b\u5e8f\u4ec5\u53ef\u4e3a\u672c\u5957\u5ba2\u6237\u7aef\u7b7e\u53d1\u6388\u6743\u3002\n- \u63d0\u793a\u8bcd\u751f\u6210\u5668\u662f\u5185\u90e8\u5de5\u5177\uff0c\u4e0d\u8981\u4ea4\u4ed8\u7ed9\u5ba2\u6237\u3002\n`;
-    const readmeEn = `# maoyi Suite ${sequence}\n\n- Suite ID: ${suiteId}\n- Client: \u5ba2\u6237\u5b89\u88c5\u5305/maoyi \u5b89\u88c5\u5305.exe\n- Issuer: \u5185\u90e8\u5de5\u5177/\u6388\u6743\u7a0b\u5e8f.exe\n- Prompt generator: \u5185\u90e8\u5de5\u5177/\u63d0\u793a\u8bcd\u6587\u4ef6\u751f\u6210\u5668.exe\n- This issuer can authorize only the client bundled in this suite.\n- The prompt generator is an internal tool and must not be delivered to customers.\n`;
+    const readmeZh = `# maoyi \u5957\u88c5 006\n\n- \u5957\u88c5 ID\uff1a${suiteId}\n- \u5ba2\u6237\u5b89\u88c5\u5305\uff1a\u5ba2\u6237\u5b89\u88c5\u5305/maoyi \u5b89\u88c5\u5305.exe\n- \u6388\u6743\u7a0b\u5e8f\uff1a\u5185\u90e8\u5de5\u5177/\u6388\u6743\u7a0b\u5e8f.exe\n- \u63d0\u793a\u8bcd\u751f\u6210\u5668\uff1a\u5185\u90e8\u5de5\u5177/\u63d0\u793a\u8bcd\u6587\u4ef6\u751f\u6210\u5668.exe\n- \u672c\u5957\u6388\u6743\u7a0b\u5e8f\u4ec5\u53ef\u4e3a\u672c\u5957\u5ba2\u6237\u7aef\u7b7e\u53d1\u6388\u6743\u3002\n- \u63d0\u793a\u8bcd\u751f\u6210\u5668\u662f\u5185\u90e8\u5de5\u5177\uff0c\u4e0d\u8981\u4ea4\u4ed8\u7ed9\u5ba2\u6237\u3002\n`;
+    const readmeEn = `# maoyi Suite 006\n\n- Suite ID: ${suiteId}\n- Client: \u5ba2\u6237\u5b89\u88c5\u5305/maoyi \u5b89\u88c5\u5305.exe\n- Issuer: \u5185\u90e8\u5de5\u5177/\u6388\u6743\u7a0b\u5e8f.exe\n- Prompt generator: \u5185\u90e8\u5de5\u5177/\u63d0\u793a\u8bcd\u6587\u4ef6\u751f\u6210\u5668.exe\n- This issuer can authorize only the client bundled in this suite.\n- The prompt generator is an internal tool and must not be delivered to customers.\n`;
     fs.writeFileSync(path.join(directory, 'README.md'), readmeZh, 'utf8');
     fs.writeFileSync(path.join(directory, 'README.en.md'), readmeEn, 'utf8');
 

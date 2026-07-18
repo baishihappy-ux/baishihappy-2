@@ -25,6 +25,10 @@
     "test:composer-question-mark": "node tools/test-composer-question-mark.mjs",
     "test:translation-sensitive-tokens": "node tools/test-translation-sensitive-tokens.mjs",
     "test:translation-prompt-bundle": "node tools/test-translation-prompt-bundle.mjs",
+    "test:smart-reply": "node tools/test-smart-reply.mjs",
+    "test:smart-reply:live": "node tools/test-smart-reply-live.mjs",
+    "test:smart-reply-ui": "node tools/test-smart-reply-ui.mjs",
+    "test:smart-reply-prompt-bundle": "node tools/test-smart-reply-prompt-bundle.mjs",
     "test:translation-english-style": "node tools/test-translation-english-style.mjs",
     "test:client-reauthorization": "node tools/test-client-reauthorization-contract.mjs",
     "test:issuer-suite-isolation": "node tools/test-issuer-suite-isolation.mjs",
@@ -33,11 +37,13 @@
     "test:signal-render-cache": "node tools/test-signal-render-cache-runtime.cjs",
     "test:signal-source-artifact": "node tools/test-signal-source-artifact.cjs",
     "test:signal-source-artifact:v8.18": "node tools/test-signal-source-artifact.cjs --version 8.18.0",
+    "test:dev-runtime-sync": "node tools/sync-signal-source-runtime.cjs --check",
     "test:signal-source-compatibility": "node tools/test-signal-source-compatibility.cjs",
     "test:signal-source-compatibility:v8.18": "node tools/test-signal-source-compatibility.cjs --version 8.18.0",
     "test:signal-source-window-ui": "npm run build && node tools/test-signal-source-window-ui.cjs",
     "test:signal-source-window-ui:v8.18": "npm run build && node tools/test-signal-source-window-ui.cjs --version 8.18.0",
     "test:lock-screen-contract": "node tools/test-lock-screen-contract.cjs",
+    "test:remote-guard": "node tools/test-remote-guard.mjs",
     "test:workspace-header-collapse": "node tools/test-workspace-header-collapse.mjs",
     "signal-source:check": "node tools/signal-source-experiment.cjs check",
     "signal-source:check:v8.18": "node tools/signal-source-experiment.cjs check --version 8.18.0",
@@ -51,7 +57,8 @@
     "signal-source:build:v8.18": "node tools/signal-source-experiment.cjs build --version 8.18.0",
     "test:electron-fuses": "node tools/test-electron-fuses.cjs",
     "test:electron-smoke": "npm run build && node tools/test-electron-smoke.cjs",
-    "test:security": "npm run build && npm run security:check && npm run test:lock-screen-contract && npm run test:workspace-header-collapse && npm run test:composer-question-mark && npm run test:translation-sensitive-tokens && npm run test:translation-prompt-bundle && npm run test:translation-english-style && npm run test:client-reauthorization && npm run test:issuer-suite-isolation && npm run test:prompt-generator-defaults && npm run test:browser-user-agent && npm run test:signal-cache-response && npm run test:signal-live-translation && npm run test:signal-transitional-status && npm run test:signal-window-visibility && npm run test:web-bubble-refresh-layout && npm run test:profile-tab-order && npm run test:signal-source-compatibility && npm run test:signal-source-compatibility:v8.18 && node tools/test-license-core.mjs && node tools/test-runtime-security.mjs && node tools/test-translation-cache-crypto.mjs && node tools/test-payment-address.mjs && node tools/test-sensitive-send-authorization.mjs && npm run test:electron-fuses",
+    "test:security": "npm run build && npm run security:check && npm run test:lock-screen-contract && npm run test:remote-guard && npm run test:workspace-header-collapse && npm run test:composer-question-mark && npm run test:translation-sensitive-tokens && npm run test:translation-prompt-bundle && npm run test:smart-reply && npm run test:smart-reply-ui && npm run test:smart-reply-prompt-bundle && npm run test:translation-english-style && npm run test:client-reauthorization && npm run test:issuer-suite-isolation && npm run test:prompt-generator-defaults && npm run test:browser-user-agent && npm run test:signal-cache-response && npm run test:signal-live-translation && npm run test:signal-transitional-status && npm run test:signal-window-visibility && npm run test:web-bubble-refresh-layout && npm run test:profile-tab-order && npm run test:signal-source-compatibility && npm run test:signal-source-compatibility:v8.18 && node tools/test-license-core.mjs && node tools/test-runtime-security.mjs && node tools/test-translation-cache-crypto.mjs && node tools/test-payment-address.mjs && node tools/test-sensitive-send-authorization.mjs && npm run test:electron-fuses",
+    "build:smart-reply-prompt": "npm run build && node tools/build-smart-reply-prompt-bundle.mjs",
     "prepare:signal-runtime": "node tools/patch-signal-control-channel.cjs",
     "prepare:package-output": "node tools/prepare-package-output.cjs release",
     "prepare:package-signal-runtime": "node tools/prepare-package-signal-runtime.cjs",
@@ -59,7 +66,7 @@
     "suite:package": "node tools/package-license-suite.cjs",
     "prepare:client-suite": "node tools/prepare-client-license-suite.cjs",
     "security:check": "node tools/security-gate.cjs",
-    "package:win": "npm run prepare:package-output && node tools/prepare-client-license-suite.cjs && npm run prepare:signal-runtime && npm run build && npm run prepare:package-signal-runtime && npm run security:check && electron-builder --win nsis && node tools/verify-packaged-output.cjs --client=release"
+    "package:win": "npm run prepare:package-output && node tools/prepare-client-license-suite.cjs && npm run prepare:signal-runtime && npm run build && node tools/build-smart-reply-prompt-bundle.mjs && npm run prepare:package-signal-runtime && npm run security:check && electron-builder --win nsis && node tools/verify-packaged-output.cjs --client=release"
   },
   "devDependencies": {
     "@electron/asar": "^4.2.0",
@@ -91,11 +98,15 @@
       "dist-electron/clone-reset.js",
       "dist-electron/runtime-security.js",
       "dist-electron/runtime-security-core.js",
+      "dist-electron/remote-guard.js",
+      "dist-electron/remote-guard-core.js",
       "dist-electron/translation-cache-crypto.js",
       "dist-electron/payment-address.js",
       "dist-electron/sensitive-send-authorization.js",
       "dist-electron/translation-sensitive-tokens.js",
       "dist-electron/translation-prompt-bundle.js",
+      "dist-electron/smart-reply-core.js",
+      "dist-electron/smart-reply-prompt-bundle.js",
       "dist-electron/translation-english-style.js",
       "dist-electron/shared.js",
       "electron/preload.cjs",
@@ -109,6 +120,10 @@
       {
         "from": ".package-secrets/translation-prompts.dfp",
         "to": "translation-prompts.dfp"
+      },
+      {
+        "from": ".package-secrets/smart-reply-prompt.dfp",
+        "to": "smart-reply-prompt.dfp"
       },
       {
         "from": ".package-staging/signal",

@@ -17,11 +17,15 @@ module.exports = {
     'dist-electron/clone-reset.js',
     'dist-electron/runtime-security.js',
     'dist-electron/runtime-security-core.js',
+    'dist-electron/remote-guard.js',
+    'dist-electron/remote-guard-core.js',
     'dist-electron/translation-cache-crypto.js',
     'dist-electron/payment-address.js',
     'dist-electron/sensitive-send-authorization.js',
     'dist-electron/translation-sensitive-tokens.js',
     'dist-electron/translation-prompt-bundle.js',
+    'dist-electron/smart-reply-core.js',
+    'dist-electron/smart-reply-prompt-bundle.js',
     'dist-electron/translation-english-style.js',
     'dist-electron/shared.js',
     'electron/preload.cjs',
@@ -30,6 +34,7 @@ module.exports = {
   extraResources: [
     { from: '.package-secrets/client-license-suite.json', to: 'license-suite-public.json' },
     { from: '.package-secrets/translation-prompts.dfp', to: 'translation-prompts.dfp' },
+    { from: '.package-secrets/smart-reply-prompt.dfp', to: 'smart-reply-prompt.dfp' },
     {
       from: '.package-staging/signal',
       to: 'signal'
@@ -38,7 +43,8 @@ module.exports = {
   afterPack: './tools/electron-builder-after-pack.cjs',
   win: {
     target: 'nsis',
-    artifactName: 'maoyi-${version}-Setup.${ext}'
+    icon: 'src/assets/black-gold-hq.ico',
+    artifactName: 'MAOYI-TRANSLATOR-Experience-${version}-Setup.${ext}'
   },
   nsis: {
     oneClick: false,

@@ -22,7 +22,7 @@ const overallTimeoutMs = 150_000;
 const visibleWindowTimeoutMs = 90_000;
 const pollIntervalMs = 350;
 const sourceAppWindowClass = 'Chrome_WidgetWin_1';
-const defaultBaselineVersion = '8.18.0';
+const defaultBaselineVersion = '8.17.0';
 const supportedBaselines = Object.freeze({
   '8.17.0': Object.freeze({
     archiveSha256: '8AC74903BE12CB6F4806CD3B218B1422CC9317560EA9E355DCB3EFAAF1CC9D96',
@@ -30,7 +30,7 @@ const supportedBaselines = Object.freeze({
   }),
   '8.18.0': Object.freeze({
     archiveSha256: 'A1FE955608134DAA81FC4EDDBEA35F8BA57E4CA54B43391B845364965D6C1A66',
-    patchSetSha256: 'E25AA0F8308BF5DB04A41D3ED12E4F717884AFCC118BA639786A3AE523C7D1D6'
+    patchSetSha256: 'BF482ACA5FEB79AFD4B0C418E56DF41BEA3C38F284EF8FBDB64C1BF17F5D2650'
   })
 });
 
@@ -43,7 +43,7 @@ function usage() {
     '  MAOYI_SIGNAL_SOURCE_SHA256    Expected 64-character SHA-256 for that executable',
     '',
     'Optional version selection:',
-    '  --version <8.17.0|8.18.0>       Defaults to 8.18.0',
+    '  --version <8.17.0|8.18.0>       Defaults to 8.17.0',
     '',
     'The test writes only below .tmp/signal-source-ui and never reads or launches .runtime.',
     'It opens real GUI windows. Run it only in an interactive Windows desktop session.',

@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   isTransientSignalScriptGateError,
@@ -14,8 +14,11 @@ import {
   type MemoryStatus,
   type Platform,
   type PlatformInfo,
+  type RemoteGuardStatus,
   type SensitiveSendKind,
   type SignalWorkspaceBounds,
+  type SmartReplyMessage,
+  type SmartReplySuggestion,
   type TranslationCacheEntry,
   type WalletNetwork,
   type WorkspaceApp
@@ -24,6 +27,10 @@ import multiSignalIcon from './assets/multi-signal.png';
 import multiTelegramIcon from './assets/multi-telegram.png';
 import multiWhatsappIcon from './assets/multi-whatsapp.png';
 import bitcoinGlyphIcon from './assets/bitcoin-glyph-cutout.png';
+import {
+  buildSmartReplyUiInstallScript,
+  buildSmartReplyUiStateScript
+} from './smart-reply-runtime';
 
 type Panel = 'apps' | 'home' | 'notice' | 'agency' | 'settings' | 'account' | 'session';
 type ThemeName = 'pink' | 'blackGold';
@@ -198,6 +205,13 @@ const sensitiveSendPreparationProfiles = new Set<string>();
 let sensitiveSendExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 const translatingMessages = new Set<string>();
 const translatedMessages = new Set<string>();
+const smartReplyInFlightProfiles = new Set<string>();
+const smartReplyResults = new Map<string, {
+  latestMessageKey: string;
+  conversationSignature: string;
+  replies: SmartReplySuggestion[];
+  at: number;
+}>();
 const unreadCounts = ref<Record<string, number>>({});
 const translationQueue: QueuedTranslationTask[] = [];
 const queuedTranslationKeys = new Set<string>();
@@ -256,6 +270,11 @@ const unreadPeekTranslationPromises = new Map<string, Promise<string>>();
 const memoryStatus = ref<MemoryStatus | null>(null);
 const lockScreenStatus = ref<LockScreenStatus | null>(null);
 const lockScreenVisible = ref(false);
+const remoteGuardStatus = ref<RemoteGuardStatus | null>(null);
+const remoteGuardPanelVisible = ref(false);
+const remoteGuardScanning = ref(false);
+const remoteGuardRecoveryPrompt = ref(false);
+const remoteGuardMessage = ref('');
 const lockScreenMode = ref<'setup' | 'unlock' | 'reset'>('setup');
 const lockKeypadVisible = ref(false);
 const lockPinDraft = ref('');
@@ -295,6 +314,7 @@ let bitcoinGlyphTimer: ReturnType<typeof setTimeout> | null = null;
 let bitcoinGlyphWaitIndex = 0;
 let removeSignalActivateProfileListener: (() => void) | null = null;
 let removeSignalWorkspaceSyncListener: (() => void) | null = null;
+let removeRemoteGuardStatusListener: (() => void) | null = null;
 
 function normalizeComposerConversationSignature(value: string) {
   return normalizeCacheText(value || '').slice(0, 360);
@@ -320,6 +340,25 @@ function deepSeekUserId(profileId: string) {
 }
 
 const themeClass = computed(() => (activeTheme.value === 'pink' ? 'theme-pink' : 'theme-black-gold'));
+const remoteGuardVisualState = computed(() => remoteGuardStatus.value?.state || 'starting');
+const remoteGuardStateLabel = computed(() => {
+  const state = remoteGuardVisualState.value;
+  if (state === 'alarm') return '发现远控';
+  if (state === 'recovery') return '等待确认';
+  if (state === 'suspicious') return '发现可疑程序';
+  if (state === 'degraded') return '巡检受限';
+  if (state === 'guarding') return '值守中';
+  return '启动中';
+});
+const remoteGuardLockCountdown = computed(() => {
+  const deadline = remoteGuardStatus.value?.windowsLockScheduledAt;
+  if (!deadline || remoteGuardStatus.value?.windowsLockState !== 'scheduled') return '';
+  return String(Math.max(0, Math.ceil((deadline - lockScreenClock.value) / 1000)));
+});
+const remoteGuardLastCheckedText = computed(() => {
+  const checkedAt = remoteGuardStatus.value?.checkedAt || 0;
+  return checkedAt ? new Date(checkedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '尚未完成';
+});
 function lockStatusRequiresUpgrade(status: LockScreenStatus | null | undefined) {
   return Boolean((status as (LockScreenStatus & { requiresUpgrade?: boolean }) | null | undefined)?.requiresUpgrade);
 }
@@ -415,6 +454,7 @@ const activeSignalProfile = computed(() => (activeProfile.value?.platform === 's
 const hasBlockingModal = computed(() => Boolean(
   lockScreenVisible.value ||
   lockSetupDialogStage.value ||
+  remoteGuardPanelVisible.value ||
   (signedIn.value && activePanel.value === 'session' && lockGuideVisible.value && !lockScreenStatus.value?.enabled) ||
   createDialogOpen.value ||
   closeTargetProfile.value ||
@@ -1068,6 +1108,74 @@ async function initializeLockScreen() {
   }
 }
 
+function applyRemoteGuardStatus(status: RemoteGuardStatus | null | undefined) {
+  if (!status) return;
+  remoteGuardStatus.value = status;
+  if (!status.incidentLatched) {
+    remoteGuardRecoveryPrompt.value = false;
+    remoteGuardMessage.value = '';
+    return;
+  }
+  remoteGuardPanelVisible.value = false;
+  if (status.threatActive) {
+    remoteGuardRecoveryPrompt.value = false;
+    lockScreenVisible.value = false;
+    lockSetupDialogStage.value = null;
+    void hideChatSurfacesForLock();
+  }
+}
+
+async function initializeRemoteGuard() {
+  const status = await window.chatTranslator?.getRemoteGuardStatus?.();
+  applyRemoteGuardStatus(status);
+}
+
+function openRemoteGuardPanel() {
+  remoteGuardMessage.value = '';
+  remoteGuardPanelVisible.value = true;
+  void nextTick(() => scheduleSignalWorkspaceSyncBurst());
+}
+
+function closeRemoteGuardPanel() {
+  remoteGuardPanelVisible.value = false;
+  void nextTick(() => scheduleSignalWorkspaceSyncBurst());
+}
+
+async function scanRemoteGuardNow() {
+  if (remoteGuardScanning.value) return;
+  remoteGuardScanning.value = true;
+  remoteGuardMessage.value = '';
+  try {
+    const status = await window.chatTranslator?.scanRemoteGuardNow?.();
+    applyRemoteGuardStatus(status);
+  } catch {
+    remoteGuardMessage.value = '本次巡检未完成，请稍后重试';
+  } finally {
+    remoteGuardScanning.value = false;
+  }
+}
+
+async function beginRemoteGuardRecovery() {
+  const status = remoteGuardStatus.value;
+  if (!status?.incidentLatched || status.threatActive) return;
+  if (!lockScreenStatus.value) await initializeLockScreen();
+  if (lockScreenStatus.value?.enabled) {
+    remoteGuardRecoveryPrompt.value = true;
+    await showLockScreen('unlock');
+    return;
+  }
+  const result = await window.chatTranslator?.acknowledgeRemoteGuardIncident?.();
+  if (!result?.ok) {
+    remoteGuardMessage.value = result?.reason || '工作区暂时不能恢复';
+    applyRemoteGuardStatus(result?.status);
+    return;
+  }
+  applyRemoteGuardStatus(result.status);
+  lockScreenLastActivityAt = Date.now();
+  resetLockScreenIdleTimer();
+  scheduleSignalWorkspaceSyncBurst();
+}
+
 function dismissLockGuide() {
   lockGuideVisible.value = false;
   scheduleSignalWorkspaceSyncBurst();
@@ -1644,6 +1752,8 @@ function setComposerStatus(profileId: string, status: string) {
 }
 
 function clearTranslationRuntimeCache(profileId: string) {
+  smartReplyInFlightProfiles.delete(profileId);
+  smartReplyResults.delete(profileId);
   for (const key of Array.from(composerTranslationSources.keys())) {
     if (key === profileId || key.startsWith(`${profileId}::`)) composerTranslationSources.delete(key);
   }
@@ -2521,6 +2631,122 @@ async function handleInjectedComposerEvent(profileId: string, action: string, te
     return;
   }
 
+  if (action === 'smart-reply-request') {
+    if (profile.platform === 'signal' || activeProfileId.value !== profileId || !text || text.length > 32_000) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const latestMessageKey = typeof payload.latestMessageKey === 'string' ? payload.latestMessageKey.trim() : '';
+    if (!/^smart-[a-z0-9]+-[a-z0-9]+$/i.test(latestMessageKey)) return;
+    if (!Array.isArray(payload.messages) || payload.messages.length < 1 || payload.messages.length > 8) return;
+    const messages: SmartReplyMessage[] = [];
+    let totalLength = 0;
+    for (const item of payload.messages) {
+      if (!item || typeof item !== 'object') return;
+      const record = item as Record<string, unknown>;
+      if (record.speaker !== 'self' && record.speaker !== 'other') return;
+      const value = typeof record.text === 'string' ? normalizeCacheText(record.text) : '';
+      if (!value || value.length > 4000 || !/[A-Za-z]{2,}/.test(value) || hasChineseText(value)) return;
+      totalLength += value.length;
+      if (totalLength > 8000) return;
+      messages.push({ speaker: record.speaker, text: value });
+    }
+    if (messages.at(-1)?.speaker !== 'other') return;
+    const activeSignature = normalizeComposerConversationSignature(composerConversationSignatures.get(profileId) || '');
+    const eventSignature = normalizeComposerConversationSignature(conversationSignature || '');
+    if (activeSignature && eventSignature !== activeSignature) return;
+    if (smartReplyInFlightProfiles.has(profileId)) return;
+
+    smartReplyInFlightProfiles.add(profileId);
+    smartReplyResults.delete(profileId);
+    const effectiveSignature = eventSignature || activeSignature;
+    setComposerStatus(profileId, '正在生成 3 组智能回复');
+    try {
+      const result = await window.chatTranslator.generateSmartReplies({
+        requestId: requestId || createTranslationRequestId('smart-reply', profileId),
+        userId: deepSeekUserId(profileId),
+        profileId,
+        platform: profile.platform,
+        messages,
+        latestSpeaker: 'other',
+        replyCount: 3,
+        outputLanguage: 'en-US',
+        allowSensitiveEcho: false
+      });
+      const currentSignature = normalizeComposerConversationSignature(composerConversationSignatures.get(profileId) || '');
+      if (activeProfileId.value !== profileId || (effectiveSignature && currentSignature !== effectiveSignature)) return;
+      if (result.schema_version !== 'df.smart_reply.output.v1' || result.replies.length !== 3) {
+        throw new Error('smart reply result invalid');
+      }
+      smartReplyResults.set(profileId, {
+        latestMessageKey,
+        conversationSignature: effectiveSignature,
+        replies: result.replies,
+        at: Date.now()
+      });
+      const applied = await executeProfileScript<boolean>(profileId, buildSmartReplyUiStateScript({
+        latestMessageKey,
+        conversationSignature: effectiveSignature,
+        state: 'success',
+        replies: result.replies
+      }));
+      setComposerStatus(profileId, applied ? '已生成 3 组智能回复' : '聊天内容已变化，旧智能回复已丢弃');
+      if (!applied) smartReplyResults.delete(profileId);
+    } catch (error) {
+      const errorUiApplied = await executeProfileScript<boolean>(profileId, buildSmartReplyUiStateScript({
+        latestMessageKey,
+        conversationSignature: effectiveSignature,
+        state: 'error',
+        message: '智能回复暂时不可用，点击重新生成'
+      })).then(Boolean).catch(() => false);
+      void window.chatTranslator.appendSignalDebugLog?.({
+        profileId,
+        type: 'smart-reply-failed',
+        platform: profile.platform,
+        requestIdPresent: Boolean(requestId),
+        messageCount: messages.length,
+        totalLength,
+        errorUiApplied,
+        error: (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, ' ').slice(0, 300)
+      });
+      setComposerStatus(profileId, '智能回复生成失败，请重试');
+    } finally {
+      smartReplyInFlightProfiles.delete(profileId);
+    }
+    return;
+  }
+
+  if (action === 'smart-reply-select') {
+    if (profile.platform === 'signal' || activeProfileId.value !== profileId || !text || text.length > 4000) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const latestMessageKey = typeof payload.latestMessageKey === 'string' ? payload.latestMessageKey.trim() : '';
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    const english = typeof payload.english === 'string' ? payload.english.trim() : '';
+    const result = smartReplyResults.get(profileId);
+    const activeSignature = normalizeComposerConversationSignature(composerConversationSignatures.get(profileId) || '');
+    const eventSignature = normalizeComposerConversationSignature(conversationSignature || '');
+    if (
+      !result ||
+      Date.now() - result.at > 10 * 60_000 ||
+      result.latestMessageKey !== latestMessageKey ||
+      result.conversationSignature !== (eventSignature || activeSignature) ||
+      (activeSignature && eventSignature !== activeSignature)
+    ) return;
+    const approved = result.replies.find((item) => item.id === id && item.english === english);
+    if (!approved) return;
+    await writeNativeComposer(profileId, approved.english, { instant: true });
+    setComposerStatus(profileId, '智能回复已填入，请确认后按 Enter 发送');
+    return;
+  }
+
   if (action === 'bubble-refresh') {
     if (profile.platform === 'signal' || !text || text.length > 6000) return;
     let payload: Record<string, unknown>;
@@ -2553,6 +2779,8 @@ async function handleInjectedComposerEvent(profileId: string, action: string, te
     if (signature && signature !== previousSignature) {
       composerConversationSignatures.set(profileId, signature);
       clearComposerVisibleState(profileId);
+      smartReplyInFlightProfiles.delete(profileId);
+      smartReplyResults.delete(profileId);
       if (sensitiveSendPending.value?.profileId === profileId) {
         await clearSensitiveSendPending(profileId, '联系人已切换，敏感信息确认已作废');
       }
@@ -4565,7 +4793,7 @@ ${peekThemeCss}
     const normalizeConversationText = (value) => (value || '').replace(/\\s+/g, ' ').trim();
     const textWithoutDfUi = (el) => {
       const clone = el.cloneNode(true);
-      for (const node of Array.from(clone.querySelectorAll('.df-chat-refresh-translation, .df-chat-translation, .df-translator-host, .df-composer-state'))) {
+      for (const node of Array.from(clone.querySelectorAll('.df-chat-refresh-translation, .df-chat-translation, .df-smart-reply-host, .df-smart-reply-panel, .df-translator-host, .df-composer-state'))) {
         node.remove();
       }
       return normalizeConversationText(clone.innerText || clone.textContent || '');
@@ -6389,6 +6617,9 @@ async function scanAndTranslateMessages(profileId: string) {
   if ((composerStatus.value[profileId] || '').startsWith('消息扫描失败：')) {
     setComposerStatus(profileId, '');
   }
+  if (appForPlatform(profile.platform) !== 'signal') {
+    await runtime.execute<boolean>(buildSmartReplyUiInstallScript(appForPlatform(profile.platform))).catch(() => false);
+  }
   await registerNonEnglishContactMarkers(profile, candidates);
   candidates = candidates.filter((candidate) => !candidate.nonEnglishContactMarker);
   if (candidates.length) {
@@ -6730,7 +6961,7 @@ function buildMessageScanScript(
   const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
   const textWithoutTranslatorUi = (el) => {
     const clone = el.cloneNode(true);
-    for (const node of Array.from(clone.querySelectorAll('.df-chat-refresh-translation, .df-chat-translation'))) {
+    for (const node of Array.from(clone.querySelectorAll('.df-chat-refresh-translation, .df-chat-translation, .df-smart-reply-host, .df-smart-reply-panel'))) {
       node.remove();
     }
     if (platformApp === 'telegram') {
@@ -7402,7 +7633,7 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
   };
   const textWithoutTranslatorUi = (el) => {
     const clone = el.cloneNode(true);
-    for (const node of Array.from(clone.querySelectorAll('.df-chat-refresh-translation, .df-chat-translation'))) {
+    for (const node of Array.from(clone.querySelectorAll('.df-chat-refresh-translation, .df-chat-translation, .df-smart-reply-host, .df-smart-reply-panel'))) {
       node.remove();
     }
     if (payload.app === 'telegram') {
@@ -7805,7 +8036,7 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
   const pendingRoots = new Set();
   const addPendingRoot = (root) => {
     if (!root || root.nodeType !== Node.ELEMENT_NODE || !root.isConnected) return;
-    if (root.matches?.('.df-chat-translation, .df-chat-refresh-translation') || root.closest?.('.df-chat-translation, .df-chat-refresh-translation')) return;
+    if (root.matches?.('.df-chat-translation, .df-chat-refresh-translation, .df-smart-reply-host, .df-smart-reply-panel') || root.closest?.('.df-chat-translation, .df-chat-refresh-translation, .df-smart-reply-host, .df-smart-reply-panel')) return;
     for (const existing of Array.from(pendingRoots)) {
       if (existing === root || existing.contains?.(root)) return;
       if (root.contains?.(existing)) pendingRoots.delete(existing);
@@ -7851,7 +8082,7 @@ function buildCachedTranslationRuntimeScript(app: RuntimeApp, entries: Array<{ s
     const addRoot = (node) => {
       const root = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
       if (!root || !root.isConnected) return;
-      if (root.matches?.('.df-chat-translation, .df-chat-refresh-translation') || root.closest?.('.df-chat-translation, .df-chat-refresh-translation')) return;
+      if (root.matches?.('.df-chat-translation, .df-chat-refresh-translation, .df-smart-reply-host, .df-smart-reply-panel') || root.closest?.('.df-chat-translation, .df-chat-refresh-translation, .df-smart-reply-host, .df-smart-reply-panel')) return;
       if (seenRoots.has(root)) return;
       seenRoots.add(root);
       roots.push(root);
@@ -7920,7 +8151,7 @@ function buildMessageTranslationInjectScript(key: string, translation: string, a
   const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
   const textWithoutTranslatorUi = (el) => {
     const clone = el.cloneNode(true);
-    for (const node of Array.from(clone.querySelectorAll('.df-chat-refresh-translation, .df-chat-translation'))) {
+    for (const node of Array.from(clone.querySelectorAll('.df-chat-refresh-translation, .df-chat-translation, .df-smart-reply-host, .df-smart-reply-panel'))) {
       node.remove();
     }
     if (payload.app === 'telegram') {
@@ -8302,6 +8533,7 @@ onMounted(() => {
     void nextTick(() => scheduleSignalWorkspaceSyncBurst());
   });
   void initializeClientAuthorization();
+  void initializeRemoteGuard();
   void refreshMemoryStatus();
   memoryStatusTimer = setInterval(() => {
     void refreshMemoryStatus();
@@ -8326,6 +8558,9 @@ onMounted(() => {
   }) ?? null;
   removeSignalWorkspaceSyncListener = window.chatTranslator?.onSignalWorkspaceSync?.(() => {
     scheduleSignalWorkspaceSyncBurst();
+  }) ?? null;
+  removeRemoteGuardStatusListener = window.chatTranslator?.onRemoteGuardStatus?.((status) => {
+    applyRemoteGuardStatus(status);
   }) ?? null;
 });
 
@@ -8371,6 +8606,7 @@ onUnmounted(() => {
   signalWorkspaceResizeObserver?.disconnect();
   removeSignalActivateProfileListener?.();
   removeSignalWorkspaceSyncListener?.();
+  removeRemoteGuardStatusListener?.();
   window.removeEventListener('resize', scheduleSignalWorkspaceSync);
   window.removeEventListener('pointerdown', handleLockActivity, true);
   window.removeEventListener('mousemove', handleLockActivity, true);
@@ -8595,6 +8831,17 @@ onUnmounted(() => {
       </div>
       <button
         type="button"
+        class="runtime-guard-button"
+        :class="`state-${remoteGuardVisualState}`"
+        :title="`御前侍卫：${remoteGuardStateLabel}`"
+        @click="openRemoteGuardPanel"
+      >
+        <span class="runtime-guard-icon" aria-hidden="true"><span class="runtime-guard-silhouette"></span><i></i></span>
+        <strong>御前侍卫</strong>
+        <small>{{ remoteGuardStateLabel }}</small>
+      </button>
+      <button
+        type="button"
         class="runtime-header-toggle"
         :aria-label="workspaceHeaderCollapsed ? '展开工作区顶部控制栏' : '折叠工作区顶部控制栏'"
         :aria-expanded="!workspaceHeaderCollapsed"
@@ -8815,6 +9062,51 @@ onUnmounted(() => {
   </div>
 
   <div
+    v-if="remoteGuardPanelVisible"
+    class="modal-mask remote-guard-panel-mask"
+    :class="themeClass"
+    @click.self="closeRemoteGuardPanel"
+  >
+    <section class="modal-card remote-guard-panel-card">
+      <div class="remote-guard-panel-heading">
+        <span class="runtime-guard-icon" :class="`state-${remoteGuardVisualState}`" aria-hidden="true"><span class="runtime-guard-silhouette"></span><i></i></span>
+        <div>
+          <small>WINDOWS REMOTE GUARD</small>
+          <h3>御前侍卫</h3>
+        </div>
+      </div>
+      <div class="remote-guard-summary" :class="`state-${remoteGuardVisualState}`">
+        <strong>{{ remoteGuardStateLabel }}</strong>
+        <span>每 {{ (remoteGuardStatus?.scanIntervalMs || 8000) / 1000 }} 秒巡查一次潜在远程连接</span>
+      </div>
+      <dl class="remote-guard-facts">
+        <div><dt>最近巡检</dt><dd>{{ remoteGuardLastCheckedText }}</dd></div>
+        <div><dt>本次用时</dt><dd>{{ remoteGuardStatus?.scanDurationMs || 0 }} ms</dd></div>
+        <div><dt>Windows 会话</dt><dd>{{ remoteGuardStatus?.coverage.windowsSessions ? '正常' : '不可用' }}</dd></div>
+        <div><dt>远控进程</dt><dd>{{ remoteGuardStatus?.coverage.processes ? '未发现' : '不可用' }}</dd></div>
+      </dl>
+      <p class="remote-guard-process-cycle">远控软件进程采用低频补充巡检，周期 {{ Math.round((remoteGuardStatus?.processScanIntervalMs || 300000) / 60000) }} 分钟。</p>
+      <ul v-if="remoteGuardStatus?.findings.length" class="remote-guard-findings">
+        <li v-for="finding in remoteGuardStatus.findings" :key="finding.code" :class="finding.severity">
+          <strong>{{ finding.severity === 'confirmed' ? '已确认' : '需留意' }}</strong>
+          <span>{{ finding.label }}</span>
+        </li>
+      </ul>
+      <p v-else class="remote-guard-empty">本轮没有发现已知远控迹象。</p>
+      <p v-if="remoteGuardStatus?.reason || remoteGuardMessage" class="remote-guard-reason">
+        {{ remoteGuardMessage || remoteGuardStatus?.reason }}
+      </p>
+      <p class="remote-guard-boundary">未知恶意程序可以伪装或使用其他通信方式；御前侍卫不能替代 Windows Defender 和防火墙。</p>
+      <div class="modal-actions">
+        <button type="button" :disabled="remoteGuardScanning" @click="closeRemoteGuardPanel">关闭</button>
+        <button type="button" :disabled="remoteGuardScanning" @click="scanRemoteGuardNow">
+          {{ remoteGuardScanning ? '巡查中' : '立即巡查' }}
+        </button>
+      </div>
+    </section>
+  </div>
+
+  <div
     v-if="lockSetupDialogStage"
     class="modal-mask lock-setup-mask"
     :class="themeClass"
@@ -8902,6 +9194,38 @@ onUnmounted(() => {
         @click="lockIsSettingPin ? confirmLockPinSetup() : confirmLockPinUnlock()"
       >
         {{ lockIsSettingPin ? '保存锁屏密码' : '解锁' }}
+      </button>
+    </section>
+  </div>
+
+  <div
+    v-if="remoteGuardStatus?.incidentLatched && !remoteGuardRecoveryPrompt"
+    class="remote-guard-alarm-screen"
+    :class="themeClass"
+    @keydown.capture.prevent.stop
+    @keyup.capture.prevent.stop
+    @pointerdown.self.prevent.stop
+    @click.stop
+  >
+    <section class="remote-guard-alarm-card">
+      <div class="remote-guard-alarm-crest">侍</div>
+      <span>WINDOWS SECURITY ALERT</span>
+      <h1>{{ remoteGuardStatus.threatActive ? '发现远程连接' : '远控迹象已消失' }}</h1>
+      <p v-if="remoteGuardStatus.threatActive">
+        Signal、WhatsApp、Telegram 已被遮罩并锁定。
+        <template v-if="remoteGuardLockCountdown">Windows 将在 {{ remoteGuardLockCountdown }} 秒后锁定。</template>
+        <template v-else-if="remoteGuardStatus.windowsLockState === 'requested'">正在请求 Windows 锁屏。</template>
+        <template v-else-if="remoteGuardStatus.windowsLockState === 'confirmed'">Windows 已进入锁定状态。</template>
+      </p>
+      <p v-else>聊天内容仍保持锁定。请确认远控来源已经断开，再进行本机安全验证。</p>
+      <ul v-if="remoteGuardStatus.findings.length">
+        <li v-for="finding in remoteGuardStatus.findings" :key="finding.code">{{ finding.label }}</li>
+      </ul>
+      <p v-if="remoteGuardStatus.reason || remoteGuardMessage" class="remote-guard-alarm-reason">
+        {{ remoteGuardMessage || remoteGuardStatus.reason }}
+      </p>
+      <button v-if="!remoteGuardStatus.threatActive" type="button" @click="beginRemoteGuardRecovery">
+        {{ lockScreenStatus?.enabled ? '验证锁屏密码并恢复' : '确认并恢复工作区' }}
       </button>
     </section>
   </div>

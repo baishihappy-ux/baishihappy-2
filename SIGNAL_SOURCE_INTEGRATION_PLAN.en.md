@@ -44,8 +44,8 @@ The next phase moves these integrations to controlled source boundaries. Its goa
 Isolated local archives:
 
 ```text
-D:\DF fanyiqi\reference-sources\Signal-Desktop-v8.17.0\Signal-Desktop-8.17.0
-D:\DF fanyiqi\reference-sources\Signal-Desktop-v8.18.0\Signal-Desktop-8.18.0
+C:\maoyi-workspace\reference-sources\Signal-Desktop-v8.17.0\Signal-Desktop-8.17.0
+C:\maoyi-workspace\reference-sources\Signal-Desktop-v8.18.0\Signal-Desktop-8.18.0
 ```
 
 Archive verification:

@@ -29,7 +29,7 @@ Hard verification rule:
 
 ## Current Goal
 
-Recreate and evolve the Look World-style chat translation workspace inside `D:\DF fanyiqi\chat-translator`.
+Recreate and evolve the Look World-style chat translation workspace inside `C:\maoyi-workspace\chat-translator`.
 
 ## Current Truth
 
@@ -46,7 +46,7 @@ Do not claim UI completion unless the actual app has been visually checked again
 ## Hard Constraints
 
 - Do not touch authorization or license logic.
-- Treat `D:\DF fanyiqi\look world` as read-only reference material.
+- Treat `C:\maoyi-workspace\look world` as read-only reference material.
 - Do not bypass, integrate with, or simulate authorization checks.
 - Do not push temporary screenshots, login state, runtime cache, customer data, enterprise configuration, or API keys to GitHub.
 
@@ -149,7 +149,7 @@ Latest offline-licensing rules:
 Codex collaboration skill:
 
 - A personal skill named `design-before-implementation` has been created to require explicit design, parameters, logic, and acceptance criteria before critical implementation work.
-- The personal skill lives at `C:\Users\admin\.codex\skills\design-before-implementation`.
+- The personal skill lives at `%USERPROFILE%\.codex\skills\design-before-implementation`.
 - The project-tracked copy lives at `chat-translator/codex-skills/design-before-implementation` so it can be uploaded with GitHub later.
 - Future edits to the personal skill must also update the project-tracked copy.
 

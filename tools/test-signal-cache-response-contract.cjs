@@ -38,6 +38,7 @@ const exposedFunctions = [
   'validateSignalVisibleMessageBatch',
   'validateSignalMessageAdded',
   'validateSignalTranslationRefreshRequest',
+  'validateSignalSmartReplyRequest',
   'validateSignalCacheResultBatch',
   'validateSignalCacheResultAppliedMessage',
   'normalizeSignalCacheSourceText',
@@ -135,6 +136,32 @@ function translationRefreshRequest(overrides = {}) {
   };
 }
 
+function canonicalSmartReplyMessage(index, text, direction, timestamp) {
+  return visibleMessage({
+    messageId: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    sourceHash: protocol.legacySignalSourceHash(text),
+    sourceText: text,
+    direction,
+    timestamp
+  });
+}
+
+function smartReplyRequest(overrides = {}) {
+  const messages = [
+    canonicalSmartReplyMessage(1, 'I am doing well', 'outgoing', 1),
+    canonicalSmartReplyMessage(2, 'What are you cooking tonight?', 'incoming', 2)
+  ];
+  return {
+    type: 'smartReply.request',
+    requestId,
+    contextVersion: 'df.signal.smart-reply-context.v1',
+    conversationId,
+    triggerMessageId: messages.at(-1).messageId,
+    messages,
+    ...overrides
+  };
+}
+
 function cacheResult(overrides = {}) {
   return {
     conversationId,
@@ -193,6 +220,34 @@ assert.deepEqual(
     ...visibleMessage()
   }
 );
+
+const validSmartReply = protocol.validateSignalSmartReplyRequest(smartReplyRequest());
+assert.equal(validSmartReply.messages.length, 2);
+assert.equal(validSmartReply.messages.at(-1).direction, 'incoming');
+for (const [request, label] of [
+  [smartReplyRequest({ contextVersion: 'df.signal.smart-reply-context.v2' }), 'unknown context version'],
+  [smartReplyRequest({ triggerMessageId: messageId }), 'trigger mismatch'],
+  [smartReplyRequest({
+    messages: [canonicalSmartReplyMessage(3, 'I will send it now', 'outgoing', 3)],
+    triggerMessageId: `00000000-0000-4000-8000-${String(3).padStart(12, '0')}`
+  }), 'outgoing latest message'],
+  [smartReplyRequest({
+    messages: [
+      canonicalSmartReplyMessage(4, 'Latest first', 'outgoing', 20),
+      canonicalSmartReplyMessage(5, 'Older second', 'incoming', 10)
+    ],
+    triggerMessageId: `00000000-0000-4000-8000-${String(5).padStart(12, '0')}`
+  }), 'noncanonical message order'],
+  [smartReplyRequest({ messages: Array.from({ length: 9 }, (_, index) =>
+    canonicalSmartReplyMessage(10 + index, `Message ${index}`, index === 8 ? 'incoming' : 'outgoing', index)
+  ) }), 'more than eight messages'],
+  [smartReplyRequest({ unexpected: true }), 'undeclared field']
+]) {
+  rejects(
+    () => protocol.validateSignalSmartReplyRequest(request),
+    `smartReply.request must reject ${label}`
+  );
+}
 rejects(
   () => protocol.validateSignalMessageAdded({
     type: 'message.added',

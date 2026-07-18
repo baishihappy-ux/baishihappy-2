@@ -5,7 +5,7 @@ const path = require('node:path');
 
 const projectRoot = path.resolve(__dirname, '..');
 const repositoryRoot = path.resolve(projectRoot, '..');
-const defaultBaselineVersion = '8.18.0';
+const defaultBaselineVersion = '8.17.0';
 const supportedBaselines = Object.freeze({
   '8.17.0': Object.freeze({
     manifestFile: 'v8.17.0.json',
@@ -15,7 +15,7 @@ const supportedBaselines = Object.freeze({
   '8.18.0': Object.freeze({
     manifestFile: 'v8.18.0.json',
     archiveSha256: 'A1FE955608134DAA81FC4EDDBEA35F8BA57E4CA54B43391B845364965D6C1A66',
-    patchSetSha256: 'E25AA0F8308BF5DB04A41D3ED12E4F717884AFCC118BA639786A3AE523C7D1D6'
+    patchSetSha256: 'BF482ACA5FEB79AFD4B0C418E56DF41BEA3C38F284EF8FBDB64C1BF17F5D2650'
   })
 });
 
@@ -180,7 +180,11 @@ for (const markerText of [
     'message.added',
     'message.visibleBatch',
     'translation.cacheResultBatch',
-    'module-message__maoyi-translation'
+    'module-message__maoyi-translation',
+    'smartReply.request',
+    'smartReply.result',
+    'smartReply.error',
+    'module-message__maoyi-smart-reply'
   ] : [])
 ]) {
   assert.ok(bundledSource.includes(markerText), `missing bundled source marker: ${markerText}`);

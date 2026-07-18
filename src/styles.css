@@ -17,7 +17,7 @@
   --mint: #101115;
   --lavender: #101115;
   --cream: #101115;
-  --brand-logo: none;
+  --brand-logo: url("./assets/black-gold.png");
 }
 
 * {
@@ -115,7 +115,7 @@ select:focus {
 .bg-setting {
   background:
     linear-gradient(rgba(255, 241, 246, 0.42), rgba(255, 241, 246, 0.86)),
-    linear-gradient(135deg, rgba(8, 9, 13, 0.96), rgba(16, 17, 21, 0.92)) center / cover no-repeat;
+    url("./assets/look-world/login-bg.png") center / cover no-repeat;
 }
 
 .bg-setting::before {
@@ -188,7 +188,7 @@ select:focus {
 
 .login_logo .logo-icon,
 .home_header_logo_box .logo-icon {
-  background: linear-gradient(145deg, #f2dc9d, #9b7337) no-repeat center center;
+  background: url("./assets/look-world/logo.png") no-repeat center center;
   background-size: cover;
 }
 
@@ -200,7 +200,7 @@ select:focus {
 
 .login_logo .name-icon,
 .home_header_logo_box .name-icon {
-  background: none no-repeat center center;
+  background: url("./assets/look-world/name.png") no-repeat center center;
   background-size: cover;
 }
 
@@ -806,24 +806,11 @@ select:focus {
 }
 
 .brand-mark {
-  display: grid;
   width: 111px;
   height: 111px;
-  place-items: center;
-  border: 2px solid color-mix(in srgb, var(--accent-bright) 72%, transparent);
   border-radius: 24px;
-  color: var(--bg);
-  background: linear-gradient(145deg, var(--accent-bright), var(--accent-deep));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.46);
+  background: var(--brand-logo) center / contain no-repeat;
   filter: drop-shadow(0 14px 30px rgba(255, 111, 168, 0.28));
-}
-
-.brand-mark::before {
-  content: "M";
-  font-family: "Segoe UI", Arial, sans-serif;
-  font-size: 46px;
-  font-weight: 800;
-  line-height: 1;
 }
 
 .brand-mark.large {
@@ -1648,7 +1635,7 @@ select:focus {
   grid-column: 1;
   grid-row: 2 / 4;
   display: grid;
-  grid-template-rows: 88px 88px 88px 74px 74px 74px minmax(0, 1fr);
+  grid-template-rows: 88px 88px 88px 88px 74px 74px 74px minmax(0, 1fr);
   align-items: center;
   justify-items: center;
   border-right: 1px solid rgba(216, 184, 111, 0.14);
@@ -1693,11 +1680,122 @@ select:focus {
   height: 100%;
 }
 
+.runtime-side .runtime-guard-button {
+  position: relative;
+  display: grid;
+  min-height: 0;
+  height: 100%;
+  grid-template-rows: auto auto auto;
+  align-content: center;
+  gap: 2px;
+  border-block: 1px solid transparent;
+  transform: translateY(2px);
+  transition: color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.runtime-side .runtime-guard-button:hover {
+  color: #fff1bd;
+  background: rgba(216, 184, 111, 0.11);
+  box-shadow: inset 3px 0 0 rgba(242, 220, 157, 0.72);
+}
+
+.runtime-side .runtime-guard-button strong {
+  color: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.runtime-side .runtime-guard-button small {
+  color: rgba(242, 220, 157, 0.62);
+  font-size: 10px;
+  line-height: 1.1;
+}
+
+.runtime-guard-icon {
+  position: relative;
+  display: grid;
+  width: 40px;
+  height: 40px;
+  margin: 0 auto 3px;
+  place-items: center;
+  color: #f2dc9d;
+  filter: drop-shadow(0 6px 7px rgba(216, 184, 111, 0.16));
+}
+
+.runtime-guard-silhouette {
+  display: block;
+  width: 36px;
+  height: 36px;
+  background: currentColor;
+  transform: scale(0.8);
+  transform-origin: center;
+  -webkit-mask-image: url("./assets/remote-guard-silhouette.png");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: 69.3px 52.9px;
+  mask-image: url("./assets/remote-guard-silhouette.png");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: 69.3px 52.9px;
+}
+
+.runtime-guard-icon i {
+  position: absolute;
+  right: -3px;
+  bottom: 0;
+  width: 11px;
+  height: 11px;
+  border: 2px solid #1f2333;
+  border-radius: 50%;
+  background: #d2a94f;
+  box-shadow: 0 0 10px rgba(210, 169, 79, 0.52);
+}
+
+.runtime-guard-button.state-guarding .runtime-guard-icon i,
+.runtime-guard-icon.state-guarding i {
+  background: #54d187;
+  box-shadow: 0 0 11px rgba(84, 209, 135, 0.66);
+}
+
+.runtime-guard-button.state-suspicious .runtime-guard-icon i,
+.runtime-guard-button.state-degraded .runtime-guard-icon i,
+.runtime-guard-icon.state-suspicious i,
+.runtime-guard-icon.state-degraded i {
+  background: #ffb347;
+  box-shadow: 0 0 12px rgba(255, 179, 71, 0.72);
+}
+
+.runtime-guard-button.state-alarm,
+.runtime-guard-button.state-recovery {
+  color: #ff7b83;
+  background: rgba(185, 23, 39, 0.16);
+  box-shadow: inset 3px 0 0 rgba(255, 82, 95, 0.82);
+}
+
+.runtime-guard-button.state-alarm .runtime-guard-icon,
+.runtime-guard-button.state-recovery .runtime-guard-icon {
+  color: #ff747e;
+  animation: remoteGuardSidebarPulse 0.86s ease-in-out infinite alternate;
+}
+
+.runtime-guard-button.state-alarm .runtime-guard-icon i,
+.runtime-guard-button.state-recovery .runtime-guard-icon i,
+.runtime-guard-icon.state-alarm i,
+.runtime-guard-icon.state-recovery i {
+  background: #ff3447;
+  box-shadow: 0 0 14px rgba(255, 52, 71, 0.82);
+}
+
+@keyframes remoteGuardSidebarPulse {
+  to { transform: scale(1.08); filter: drop-shadow(0 0 11px rgba(255, 52, 71, 0.62)); }
+}
+
 .runtime-side .runtime-header-toggle {
   min-height: 0;
   height: 100%;
   border-block: 1px solid transparent;
-  transform: translateY(5px);
+  transform: translateY(7px);
   transition: color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
 }
 
@@ -1921,6 +2019,7 @@ select:focus {
   min-height: 56px;
   border-radius: 8px;
   border: 2px solid transparent;
+  transform: translateY(2px);
   transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
 }
 
@@ -1934,7 +2033,7 @@ select:focus {
 .runtime-side .app-short.active {
   border-color: #f2dc9d;
   box-shadow: 0 0 0 4px rgba(242, 220, 157, 0.14), 0 12px 26px rgba(0, 0, 0, 0.28);
-  transform: translateY(-1px);
+  transform: translateY(1px);
 }
 
 .runtime-side .app-short.wa {
@@ -1989,19 +2088,19 @@ select:focus {
   0%,
   100% {
     box-shadow: 0 0 0 0 rgba(226, 59, 79, 0.16), 0 10px 20px rgba(0, 0, 0, 0.18);
-    transform: translateY(0);
+    transform: translateY(2px);
   }
   28% {
     box-shadow: 0 0 0 5px rgba(226, 59, 79, 0.18), 0 16px 28px rgba(0, 0, 0, 0.26);
-    transform: translateY(-4px);
+    transform: translateY(-2px);
   }
   52% {
     box-shadow: 0 0 0 3px rgba(226, 59, 79, 0.16), 0 10px 20px rgba(0, 0, 0, 0.2);
-    transform: translateY(2px);
+    transform: translateY(4px);
   }
   74% {
     box-shadow: 0 0 0 4px rgba(226, 59, 79, 0.17), 0 14px 24px rgba(0, 0, 0, 0.24);
-    transform: translateY(-2px);
+    transform: translateY(0);
   }
 }
 
@@ -2924,7 +3023,7 @@ select:focus {
   --mint: #2a0c1d;
   --lavender: #38122a;
   --cream: #f2b27f;
-  --brand-logo: none;
+  --brand-logo: url("./assets/macaron-glow-pink-logo.png");
 }
 
 .theme-pink::before {
@@ -3081,6 +3180,21 @@ select:focus {
 
 .theme-pink .runtime-lock-key {
   filter: drop-shadow(0 4px 8px rgba(255, 95, 157, 0.24));
+}
+
+.theme-pink .runtime-side .runtime-guard-button:hover {
+  color: #fff0f6;
+  background: rgba(213, 63, 122, 0.18);
+  box-shadow: inset 3px 0 0 rgba(255, 126, 173, 0.82);
+}
+
+.theme-pink .runtime-guard-icon {
+  color: #ff9abc;
+  filter: drop-shadow(0 6px 7px rgba(255, 95, 157, 0.2));
+}
+
+.theme-pink .runtime-guard-icon i {
+  border-color: #2a0b1d;
 }
 
 .theme-pink .runtime-side .runtime-header-toggle .runtime-header-toggle-icon {
@@ -3369,7 +3483,7 @@ select:focus {
   --mint: #101115;
   --lavender: #101115;
   --cream: #101115;
-  --brand-logo: none;
+  --brand-logo: url("./assets/black-gold.png");
 }
 
 .theme-black-gold::before {
@@ -3833,6 +3947,247 @@ select:focus {
   padding: 10px 12px;
   color: #ffd693;
   background: rgba(180, 91, 24, 0.12);
+}
+
+.remote-guard-panel-mask {
+  z-index: 1000003;
+}
+
+.remote-guard-panel-card {
+  width: min(560px, calc(100vw - 44px));
+  border-color: rgba(216, 184, 111, 0.42);
+}
+
+.remote-guard-panel-heading {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  margin-bottom: 18px;
+}
+
+.remote-guard-panel-heading .runtime-guard-icon {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.remote-guard-panel-heading small {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 1.8px;
+}
+
+.remote-guard-panel-heading h3 {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 22px;
+}
+
+.remote-guard-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid rgba(216, 184, 111, 0.26);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: rgba(216, 184, 111, 0.07);
+}
+
+.remote-guard-summary strong {
+  color: #64d792;
+  font-size: 16px;
+}
+
+.remote-guard-summary span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.remote-guard-summary.state-suspicious strong,
+.remote-guard-summary.state-degraded strong {
+  color: #ffbd62;
+}
+
+.remote-guard-summary.state-alarm strong,
+.remote-guard-summary.state-recovery strong {
+  color: #ff6d78;
+}
+
+.remote-guard-facts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.remote-guard-facts div {
+  display: flex;
+  justify-content: space-between;
+  border: 1px solid rgba(216, 184, 111, 0.14);
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.remote-guard-facts dt,
+.remote-guard-facts dd {
+  margin: 0;
+  font-size: 12px;
+}
+
+.remote-guard-facts dt { color: var(--muted); }
+.remote-guard-facts dd { color: var(--text); }
+
+.remote-guard-findings {
+  display: grid;
+  gap: 7px;
+  max-height: 190px;
+  margin: 0 0 13px;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.remote-guard-findings li {
+  display: grid;
+  grid-template-columns: 58px 1fr;
+  gap: 8px;
+  border-left: 3px solid #ffb347;
+  padding: 9px 11px;
+  color: var(--muted-strong);
+  background: rgba(255, 179, 71, 0.07);
+}
+
+.remote-guard-findings li.confirmed {
+  border-left-color: #ff4a5c;
+  background: rgba(255, 74, 92, 0.1);
+}
+
+.remote-guard-findings strong {
+  color: #ffbd62;
+  font-size: 12px;
+}
+
+.remote-guard-findings li.confirmed strong { color: #ff7882; }
+.remote-guard-findings span { font-size: 12px; line-height: 1.45; }
+
+.remote-guard-empty,
+.remote-guard-reason,
+.remote-guard-process-cycle,
+.remote-guard-boundary {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.remote-guard-empty { color: #77dda0; }
+.remote-guard-reason { color: #ffbe67; }
+.remote-guard-process-cycle { color: var(--muted-strong); }
+.remote-guard-boundary { color: var(--muted); }
+
+.theme-pink .remote-guard-panel-card {
+  border-color: rgba(242, 178, 127, 0.44);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.055), transparent 42%), #2a0b1d;
+}
+
+.theme-pink .remote-guard-summary,
+.theme-pink .remote-guard-facts div {
+  border-color: rgba(242, 178, 127, 0.2);
+  background: rgba(213, 63, 122, 0.08);
+}
+
+.remote-guard-alarm-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000010;
+  display: grid;
+  place-items: center;
+  padding: 30px;
+  color: #fff;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(255, 61, 77, 0.26), transparent 34%),
+    linear-gradient(145deg, #26040a, #090104 72%);
+}
+
+.remote-guard-alarm-card {
+  width: min(760px, calc(100vw - 60px));
+  border: 2px solid rgba(255, 99, 109, 0.88);
+  border-radius: 24px;
+  padding: 42px 46px;
+  text-align: center;
+  background: rgba(44, 4, 11, 0.94);
+  box-shadow: 0 0 0 10px rgba(255, 61, 76, 0.08), 0 32px 100px rgba(0, 0, 0, 0.72);
+  animation: remoteGuardAlarmPulse 0.9s ease-in-out infinite alternate;
+}
+
+.remote-guard-alarm-crest {
+  display: grid;
+  width: 92px;
+  height: 92px;
+  margin: 0 auto 20px;
+  place-items: center;
+  border: 4px solid #ff6570;
+  border-radius: 50%;
+  color: #fff2d0;
+  font-family: "STKaiti", "KaiTi", sans-serif;
+  font-size: 43px;
+  font-weight: 900;
+  box-shadow: 0 0 40px rgba(255, 68, 82, 0.54);
+}
+
+.remote-guard-alarm-card > span {
+  color: rgba(255, 221, 225, 0.68);
+  font-size: 11px;
+  letter-spacing: 2.4px;
+}
+
+.remote-guard-alarm-card h1 {
+  margin: 9px 0 18px;
+  color: #ff737c;
+  font-size: clamp(34px, 5vw, 52px);
+  letter-spacing: 5px;
+}
+
+.remote-guard-alarm-card p {
+  margin: 0 auto 15px;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 17px;
+  line-height: 1.8;
+}
+
+.remote-guard-alarm-card ul {
+  display: grid;
+  gap: 6px;
+  max-height: 150px;
+  margin: 16px auto;
+  padding: 0;
+  overflow: auto;
+  color: #ffd3d7;
+  font-size: 13px;
+  list-style: none;
+}
+
+.remote-guard-alarm-card .remote-guard-alarm-reason { color: #ffd28b; }
+
+.remote-guard-alarm-card button {
+  min-width: 230px;
+  margin-top: 8px;
+  border: 1px solid rgba(255, 194, 199, 0.78);
+  border-radius: 8px;
+  padding: 12px 20px;
+  color: #3a0710;
+  font-weight: 800;
+  background: linear-gradient(180deg, #ffd9dc, #ff7a85);
+  box-shadow: 0 12px 34px rgba(255, 61, 77, 0.28);
+}
+
+.theme-pink.remote-guard-alarm-screen {
+  background:
+    radial-gradient(circle at 50% 42%, rgba(255, 95, 157, 0.28), transparent 34%),
+    linear-gradient(145deg, #3a071f, #100107 72%);
+}
+
+@keyframes remoteGuardAlarmPulse {
+  to { transform: scale(1.006); box-shadow: 0 0 0 16px rgba(255, 61, 76, 0.13), 0 32px 110px rgba(126, 0, 18, 0.62); }
 }
 
 .client-lock-card .lock-input-instruction {

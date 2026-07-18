@@ -9,7 +9,7 @@
 参考目录：
 
 ```text
-D:\DF fanyiqi\look world\look-world-pro-embed\
+C:\maoyi-workspace\look world\look-world-pro-embed\
 ```
 
 关键结构：
@@ -20,14 +20,14 @@ look-world-pro-embed/
     Signal.exe
     resources/app.asar
     resources/app.asar.unpacked/
-  Signal-Zh1T4pyBHEc6NK3wDkpR_/
-  Signal-ux5d6dbL17c1vQCUsUDSG/
+  Signal-<INSTANCE_ID>/
+  Signal-<INSTANCE_ID>/
 ```
 
 其中：
 
 - `signal/` 是友商内置的一份 Signal Desktop 程序。
-- `Signal-Zh1T4pyBHEc6NK3wDkpR_` 和 `Signal-ux5d6dbL17c1vQCUsUDSG` 是两个独立 Signal 实例的数据目录。
+- `Signal-<INSTANCE_ID>` 和 `Signal-<INSTANCE_ID>` 是两个独立 Signal 实例的数据目录。
 - 每个实例目录内有完整的 Signal / Chromium 数据：
   - `sql/db.sqlite`
   - `config.json`
@@ -47,8 +47,8 @@ look-world-pro-embed/
 ```text
 Signal.exe
   --proxy=
-  --user-data-dir=D:\DF fanyiqi\look world\look-world-pro-embed\Signal-Zh1T4pyBHEc6NK3wDkpR_
-  --appId=Signal-Zh1T4pyBHEc6NK3wDkpR_
+  --user-data-dir=C:\maoyi-workspace\look world\look-world-pro-embed\Signal-<INSTANCE_ID>
+  --appId=Signal-<INSTANCE_ID>
   --wsPort=23510
   --title=Signal01
   --windowMode=embed
@@ -59,8 +59,8 @@ Signal.exe
 ```text
 Signal.exe
   --proxy=
-  --user-data-dir=D:\DF fanyiqi\look world\look-world-pro-embed\Signal-ux5d6dbL17c1vQCUsUDSG
-  --appId=Signal-ux5d6dbL17c1vQCUsUDSG
+  --user-data-dir=C:\maoyi-workspace\look world\look-world-pro-embed\Signal-<INSTANCE_ID>
+  --appId=Signal-<INSTANCE_ID>
   --wsPort=23510
   --title=Signal03
   --windowMode=embed
@@ -105,7 +105,7 @@ ws://localhost:${wsPort}?appId=${appId}
 3. 主程序生成随机实例 ID，例如：
 
    ```text
-   Signal-ux5d6dbL17c1vQCUsUDSG
+   Signal-<INSTANCE_ID>
    ```
 
 4. 主程序创建对应 userData 目录。

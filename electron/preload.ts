@@ -10,11 +10,13 @@ import type {
   SensitiveSendAuthorizeRequest,
   SensitiveSendPrepareRequest,
   SignalWorkspaceBounds,
+  SmartReplyRequest,
   TranslateRequest,
   TranslationCacheLoadRequest,
   TranslationCacheLookupRequest,
   TranslationCacheSetRequest,
   NonEnglishContactRequest,
+  RemoteGuardStatus,
   WindowControlApi
 } from './shared.js';
 
@@ -40,6 +42,7 @@ const api: ElectronApi = {
   executeSignalScript: (id: string, script: string) => ipcRenderer.invoke('signal:execute-script', id, script),
   appendSignalDebugLog: (event: Record<string, unknown>) => ipcRenderer.invoke('signal:debug-log', event),
   translate: (request: TranslateRequest) => ipcRenderer.invoke('translate', request),
+  generateSmartReplies: (request: SmartReplyRequest) => ipcRenderer.invoke('smart-reply:generate', request),
   authorizeTranslatedSend: (request: SendAuthorizationRequest) => ipcRenderer.invoke('send-integrity:authorize', request),
   prepareSensitiveSend: (request: SensitiveSendPrepareRequest) => ipcRenderer.invoke('send-integrity:prepare-sensitive', request),
   authorizeSensitiveSend: (request: SensitiveSendAuthorizeRequest) => ipcRenderer.invoke('send-integrity:authorize-sensitive', request),
@@ -54,6 +57,9 @@ const api: ElectronApi = {
   authorizeLockScreenPinChange: (mode) => ipcRenderer.invoke('lock-screen:authorize-pin-change', mode),
   setLockScreenPin: (pin: string, token: string) => ipcRenderer.invoke('lock-screen:set-pin', pin, token),
   unlockLockScreen: (pin: string) => ipcRenderer.invoke('lock-screen:unlock', pin),
+  getRemoteGuardStatus: () => ipcRenderer.invoke('remote-guard:status'),
+  scanRemoteGuardNow: () => ipcRenderer.invoke('remote-guard:scan-now'),
+  acknowledgeRemoteGuardIncident: () => ipcRenderer.invoke('remote-guard:acknowledge'),
   setWindowTheme: (theme: 'blackGold' | 'pink') => ipcRenderer.invoke('window:set-theme', theme),
   readClipboardText: () => ipcRenderer.invoke('clipboard:read-text'),
   writeClipboardText: (text: string) => ipcRenderer.invoke('clipboard:write-text', text),
@@ -66,6 +72,11 @@ const api: ElectronApi = {
     const listener = () => handler();
     ipcRenderer.on('signal:sync-workspace', listener);
     return () => ipcRenderer.removeListener('signal:sync-workspace', listener);
+  },
+  onRemoteGuardStatus: (handler: (status: RemoteGuardStatus) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: RemoteGuardStatus) => handler(status);
+    ipcRenderer.on('remote-guard:status-changed', listener);
+    return () => ipcRenderer.removeListener('remote-guard:status-changed', listener);
   }
 };
 

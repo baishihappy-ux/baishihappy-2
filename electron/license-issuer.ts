@@ -361,7 +361,7 @@ function createWindow() {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
     const image = await issuerWindow.webContents.capturePage();
     await writeFile(smokeCapturePath, image.toPNG());
-    if (process.env.MAOYI_SMOKE_TEST_EXIT === '1') setTimeout(() => app.quit(), 250);
+    if (process.env.MAOYI_SMOKE_TEST_EXIT === '1') setTimeout(() => app.exit(0), 250);
   });
   issuerWindow.loadURL('issuer-app://bundle/index.html');
 }

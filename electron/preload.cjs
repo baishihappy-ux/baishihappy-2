@@ -21,6 +21,7 @@ const api = {
   executeSignalScript: (id, script) => ipcRenderer.invoke('signal:execute-script', id, script),
   appendSignalDebugLog: (event) => ipcRenderer.invoke('signal:debug-log', event),
   translate: (request) => ipcRenderer.invoke('translate', request),
+  generateSmartReplies: (request) => ipcRenderer.invoke('smart-reply:generate', request),
   authorizeTranslatedSend: (request) => ipcRenderer.invoke('send-integrity:authorize', request),
   prepareSensitiveSend: (request) => ipcRenderer.invoke('send-integrity:prepare-sensitive', request),
   authorizeSensitiveSend: (request) => ipcRenderer.invoke('send-integrity:authorize-sensitive', request),
@@ -35,6 +36,9 @@ const api = {
   authorizeLockScreenPinChange: (mode) => ipcRenderer.invoke('lock-screen:authorize-pin-change', mode),
   setLockScreenPin: (pin, token) => ipcRenderer.invoke('lock-screen:set-pin', pin, token),
   unlockLockScreen: (pin) => ipcRenderer.invoke('lock-screen:unlock', pin),
+  getRemoteGuardStatus: () => ipcRenderer.invoke('remote-guard:status'),
+  scanRemoteGuardNow: () => ipcRenderer.invoke('remote-guard:scan-now'),
+  acknowledgeRemoteGuardIncident: () => ipcRenderer.invoke('remote-guard:acknowledge'),
   setWindowTheme: (theme) => ipcRenderer.invoke('window:set-theme', theme),
   readClipboardText: () => ipcRenderer.invoke('clipboard:read-text'),
   writeClipboardText: (text) => ipcRenderer.invoke('clipboard:write-text', text),
@@ -47,6 +51,11 @@ const api = {
     const listener = () => handler();
     ipcRenderer.on('signal:sync-workspace', listener);
     return () => ipcRenderer.removeListener('signal:sync-workspace', listener);
+  },
+  onRemoteGuardStatus: (handler) => {
+    const listener = (_event, status) => handler(status);
+    ipcRenderer.on('remote-guard:status-changed', listener);
+    return () => ipcRenderer.removeListener('remote-guard:status-changed', listener);
   }
 };
 

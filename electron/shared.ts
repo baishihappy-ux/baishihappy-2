@@ -219,7 +219,7 @@ export function buildSignalSourceOnlyAcceptanceDiagnostic(
     schemaVersion: 1,
     type: 'source-only-acceptance-summary',
     baseline: '8.18.0',
-    patchSetSha256: 'E25AA0F8308BF5DB04A41D3ED12E4F717884AFCC118BA639786A3AE523C7D1D6',
+    patchSetSha256: 'BF482ACA5FEB79AFD4B0C418E56DF41BEA3C38F284EF8FBDB64C1BF17F5D2650',
     mode: 'source-only',
     legacyBubbleEnabled: false,
     composerEnabled: true,
@@ -261,6 +261,36 @@ export type TranslateRequest = {
   contactTitle?: string;
   direction?: 'incoming' | 'outgoing' | 'unknown';
   messagePart?: 'body' | 'quote';
+};
+
+export type SmartReplySpeaker = 'self' | 'other';
+
+export type SmartReplyMessage = {
+  speaker: SmartReplySpeaker;
+  text: string;
+};
+
+export type SmartReplyRequest = {
+  requestId?: string;
+  userId?: string;
+  profileId?: string;
+  platform?: Platform;
+  messages: SmartReplyMessage[];
+  latestSpeaker: 'other';
+  replyCount: 3;
+  outputLanguage: 'en-US';
+  allowSensitiveEcho: false;
+};
+
+export type SmartReplySuggestion = {
+  id: 'reply_1' | 'reply_2' | 'reply_3';
+  english: string;
+  chinese: string;
+};
+
+export type SmartReplyResult = {
+  schema_version: 'df.smart_reply.output.v1';
+  replies: SmartReplySuggestion[];
 };
 
 export type SendAuthorizationRequest = {
@@ -398,6 +428,53 @@ export type LockScreenUnlockResult = {
   status: LockScreenStatus;
 };
 
+export type RemoteGuardState =
+  | 'starting'
+  | 'guarding'
+  | 'suspicious'
+  | 'alarm'
+  | 'recovery'
+  | 'degraded';
+
+export type RemoteGuardFinding = {
+  code: string;
+  label: string;
+  severity: 'suspicious' | 'confirmed';
+  processName?: string;
+};
+
+export type RemoteGuardCoverage = {
+  windowsSessions: boolean;
+  processes: boolean;
+  connections: 'available' | 'not-needed' | 'unavailable';
+};
+
+export type RemoteGuardStatus = {
+  enabled: boolean;
+  state: RemoteGuardState;
+  checkedAt: number;
+  nextScanAt: number;
+  scanDurationMs: number;
+  scanIntervalMs: number;
+  processScanIntervalMs: number;
+  windowsLockDelayMs: number;
+  threatActive: boolean;
+  incidentLatched: boolean;
+  windowsSessionLocked: boolean;
+  windowsLockState: 'idle' | 'scheduled' | 'requested' | 'confirmed' | 'failed';
+  windowsLockScheduledAt?: number;
+  windowsLockAttemptedAt?: number;
+  findings: RemoteGuardFinding[];
+  coverage: RemoteGuardCoverage;
+  reason?: string;
+};
+
+export type RemoteGuardActionResult = {
+  ok: boolean;
+  status: RemoteGuardStatus;
+  reason?: string;
+};
+
 export function sanitizeComposerEnglishTranslation(value: string) {
   return value
     .replace(/^["'“”‘’]+|["'“”‘’]+$/g, '')
@@ -509,6 +586,7 @@ export type ElectronApi = {
   executeSignalScript: <T = unknown>(id: string, script: string) => Promise<T>;
   appendSignalDebugLog: (event: Record<string, unknown>) => Promise<void>;
   translate: (request: TranslateRequest) => Promise<string>;
+  generateSmartReplies: (request: SmartReplyRequest) => Promise<SmartReplyResult>;
   authorizeTranslatedSend: (request: SendAuthorizationRequest) => Promise<SendAuthorizationResult>;
   prepareSensitiveSend: (request: SensitiveSendPrepareRequest) => Promise<SensitiveSendPrepareResult>;
   authorizeSensitiveSend: (request: SensitiveSendAuthorizeRequest) => Promise<SendAuthorizationResult>;
@@ -523,11 +601,15 @@ export type ElectronApi = {
   authorizeLockScreenPinChange: (mode: LockScreenPinChangeMode) => Promise<LockScreenPinChangeAuthorizationResult>;
   setLockScreenPin: (pin: string, token: string) => Promise<LockScreenSetPinResult>;
   unlockLockScreen: (pin: string) => Promise<LockScreenUnlockResult>;
+  getRemoteGuardStatus: () => Promise<RemoteGuardStatus>;
+  scanRemoteGuardNow: () => Promise<RemoteGuardStatus>;
+  acknowledgeRemoteGuardIncident: () => Promise<RemoteGuardActionResult>;
   setWindowTheme: (theme: 'blackGold' | 'pink') => Promise<void>;
   readClipboardText: () => Promise<string>;
   writeClipboardText: (text: string) => Promise<void>;
   onSignalActivateProfile: (handler: (profileId: string) => void) => () => void;
   onSignalWorkspaceSync: (handler: () => void) => () => void;
+  onRemoteGuardStatus: (handler: (status: RemoteGuardStatus) => void) => () => void;
 };
 
 export type WindowControlApi = {

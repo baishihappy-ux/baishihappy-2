@@ -5,11 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 
 const projectRoot = path.resolve(__dirname, '..');
-const colocatedReferenceSources = path.join(projectRoot, 'reference-sources');
-const repositoryRoot = fs.existsSync(colocatedReferenceSources)
-  ? projectRoot
-  : path.resolve(projectRoot, '..');
-const defaultBaselineVersion = '8.18.0';
+const repositoryRoot = path.resolve(projectRoot, '..');
+const defaultBaselineVersion = '8.17.0';
 const supportedBaselines = Object.freeze({
   '8.17.0': Object.freeze({
     manifestFile: 'v8.17.0.json',
@@ -19,7 +16,7 @@ const supportedBaselines = Object.freeze({
   '8.18.0': Object.freeze({
     manifestFile: 'v8.18.0.json',
     archiveSha256: 'A1FE955608134DAA81FC4EDDBEA35F8BA57E4CA54B43391B845364965D6C1A66',
-    patchSetSha256: 'E25AA0F8308BF5DB04A41D3ED12E4F717884AFCC118BA639786A3AE523C7D1D6'
+    patchSetSha256: 'BF482ACA5FEB79AFD4B0C418E56DF41BEA3C38F284EF8FBDB64C1BF17F5D2650'
   })
 });
 
@@ -239,12 +236,12 @@ async function verifyBaseline(manifest, paths) {
   if (archiveHash !== manifest.archive.sha256) {
     fail(`Signal source archive SHA-256 mismatch: expected ${manifest.archive.sha256}, got ${archiveHash}`);
   }
-  const referenceSourceAvailable = fs.existsSync(paths.referenceSourcePath);
-  if (referenceSourceAvailable) {
-    verifyPackage(paths.referenceSourcePath, manifest, 'Reference source');
+  if (!fs.existsSync(paths.referenceSourcePath)) {
+    fail(`Extracted Signal reference source is missing: ${paths.referenceSourcePath}`);
   }
+  verifyPackage(paths.referenceSourcePath, manifest, 'Reference source');
   const patchSet = loadPatchSet(manifest, paths);
-  return { archiveHash, patchSet, referenceSourceAvailable };
+  return { archiveHash, patchSet };
 }
 
 function formatBytes(bytes) {
@@ -624,11 +621,7 @@ async function runCheck(manifest, paths) {
   console.log(`Signal ${manifest.version} baseline verified`);
   console.log(`Archive SHA-256: ${baseline.archiveHash}`);
   console.log(`Patch set SHA-256: ${baseline.patchSet.patchSetSha256} (${baseline.patchSet.patches.length} patches)`);
-  console.log(
-    baseline.referenceSourceAvailable
-      ? `Reference source: ${paths.referenceSourcePath}`
-      : 'Reference source: verified archive retained; extracted copy is not required for recovery checks'
-  );
+  console.log(`Reference source: ${paths.referenceSourcePath}`);
 }
 
 async function runPreflight(manifest, paths) {
@@ -885,7 +878,13 @@ function verifyReleasePackagingInputs(manifest, paths) {
       path.join(paths.experimentSourcePath, 'bundles', 'preload', 'main.js'),
       'utf8'
     );
-    for (const marker of ['translation.refresh.request', 'translation.cacheResultBatch']) {
+    for (const marker of [
+      'translation.refresh.request',
+      'translation.cacheResultBatch',
+      'smartReply.request',
+      'smartReply.result',
+      'smartReply.error'
+    ]) {
       if (!mainBundle.includes(marker) && !preloadBundle.includes(marker)) {
         fail(`Signal release packaging input is stale; missing marker: ${marker}`);
       }
